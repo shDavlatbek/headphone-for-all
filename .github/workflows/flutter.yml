@@ -137,18 +137,36 @@ jobs:
           retention-days: 14
 
   # The AppImage does not bundle glibc, so it runs only on distributions at least as new as the
-  # build machine: it is built on the oldest supported runner (Ubuntu 22.04, glibc 2.35,
-  # libpipewire 0.3.48), as packaging/README.md specifies. The job does nothing until
-  # packaging/linux (feat/desktop) is on the branch; `hashFiles` is not available in a job-level
-  # `if`, hence the check step.
+  # build machine: it is built in an Ubuntu 22.04 container (glibc 2.35, libpipewire 0.3.48), the
+  # oldest supported baseline that packaging/README.md specifies. A container and not the
+  # ubuntu-22.04 runner label: GitHub is retiring the Ubuntu 22.04 runner images
+  # (actions/runner-images#14254), while the ubuntu:22.04 image keeps the baseline independent of
+  # the host. The container runs as root and has none of the runner image's tools, so the first
+  # step installs what checkout, flutter-action (curl, jq, unzip, xz), rustup (curl) and the builds
+  # need. build-appimage.sh sets APPIMAGE_EXTRACT_AND_RUN=1, so FUSE is not needed. The job does
+  # nothing until packaging/linux (feat/desktop) is on the branch; `hashFiles` is not available in
+  # a job-level `if`, hence the check step.
   linux-appimage:
-    name: Linux AppImage (Ubuntu 22.04)
-    runs-on: ubuntu-22.04
+    name: Linux AppImage (Ubuntu 22.04 container)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
     timeout-minutes: 60
+    env:
+      DEBIAN_FRONTEND: noninteractive
     defaults:
       run:
+        shell: bash
         working-directory: app
     steps:
+      - name: Install the base tools of the container
+        working-directory: /
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git jq unzip xz-utils zip \
+            file build-essential
+          # The checkout (runner uid) and the Flutter SDK are owned by other users than root.
+          git config --global --add safe.directory '*'
       - uses: actions/checkout@v7
       - name: Is the packaging script present?
         id: script
@@ -163,8 +181,10 @@ jobs:
       - name: Install Linux build dependencies
         if: steps.script.outputs.present == 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }} ${{ env.LINUX_FLUTTER_DEPS }}
+          apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }} ${{ env.LINUX_FLUTTER_DEPS }}
+          # The baseline this AppImage promises (packaging/README.md).
+          ldd --version | head -n 1
+          pkg-config --modversion libpipewire-0.3
       - uses: dtolnay/rust-toolchain@stable
         if: steps.script.outputs.present == 'true'
       - uses: subosito/flutter-action@v2

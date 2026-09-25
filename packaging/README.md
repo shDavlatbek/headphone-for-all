@@ -8,7 +8,7 @@ from `flutter build` and the `app/android` / `app/ios` projects; see `docs/BUILD
 |---|---|---|---|
 | App icon rasters | `icon/generate.py` | any (committed) | see [Icon](#icon) |
 | Windows installer | `windows/build-installer.ps1` + `windows/hfa.iss` (Inno Setup) | `windows-latest` | `Headphone_for_All-<ver>-windows-x64-setup.exe` |
-| Linux AppImage | `linux/build-appimage.sh` (appimagetool) | `ubuntu-22.04` | `Headphone_for_All-<ver>-x86_64.AppImage` |
+| Linux AppImage | `linux/build-appimage.sh` (appimagetool) | `ubuntu:22.04` container | `Headphone_for_All-<ver>-x86_64.AppImage` |
 | Linux Flatpak bundle | `linux/build-flatpak.sh` + `linux/io.github.shdavlatbek.hfa.yml` | `ubuntu-latest` | `Headphone_for_All-<ver>-x86_64.flatpak` |
 | macOS disk image | `macos/build-dmg.sh` (create-dmg / hdiutil) | `macos-latest` | `Headphone_for_All-<ver>-macos.dmg` |
 
@@ -144,7 +144,8 @@ refuses a bundled libpipewire, downloads `appimagetool` (continuous build from
 github.com/AppImage/appimagetool, cached in `~/.cache/hfa-packaging`) unless `$APPIMAGETOOL` or `PATH`
 provides one, and always runs it with `APPIMAGE_EXTRACT_AND_RUN=1` (no FUSE needed).
 `APPIMAGE_UPDATE_INFO` embeds update information (e.g. `gh-releases-zsync|…`). glibc is not bundled, so
-build on the oldest distribution to support (CI: Ubuntu 22.04). The bundle is not passed through
+build on the oldest distribution to support (CI: an `ubuntu:22.04` container on an `ubuntu-latest`
+runner, since GitHub is retiring its Ubuntu 22.04 runner images). The bundle is not passed through
 `linuxdeploy` on purpose: GTK and libpipewire must come from the host, and the rest of the bundle is
 self-contained already.
 

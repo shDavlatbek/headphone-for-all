@@ -354,8 +354,9 @@ version from `app/pubspec.yaml`.
 
 The Linux packages do not bundle GTK 3 or **libpipewire-0.3**: they come from the host, so that the
 library matches the running PipeWire daemon. glibc is not bundled either, so build the AppImage on the
-oldest distribution you want to support. CI builds it on `ubuntu-22.04` (glibc 2.35, libpipewire
-0.3.48), so the AppImage runs on Ubuntu 22.04, Debian 12 and newer.
+oldest distribution you want to support. CI builds it in an `ubuntu:22.04` container (glibc 2.35,
+libpipewire 0.3.48) on an `ubuntu-latest` runner, so the AppImage runs on Ubuntu 22.04, Debian 12 and
+newer.
 
 ## Continuous integration
 
@@ -381,7 +382,7 @@ the same branch cancels the older run (except on `main`). Workflows have read-on
 | analyze + test | ubuntu-latest | `flutter analyze`, `flutter test` | — |
 | flutter_rust_bridge drift check | ubuntu-latest | `flutter_rust_bridge_codegen generate`, then `git status` must be clean | — |
 | Linux build | ubuntu-latest | integration test under `xvfb-run`, `flutter build linux --release` | `headphone_for_all-linux-x64` (tar.gz) |
-| Linux AppImage | ubuntu-22.04 | its own `flutter build linux --release` on the oldest supported glibc, then `packaging/linux/build-appimage.sh`; does nothing until that script is on the branch | `headphone_for_all-linux-appimage` |
+| Linux AppImage | ubuntu-latest, `ubuntu:22.04` container | its own `flutter build linux --release` on the oldest supported glibc, then `packaging/linux/build-appimage.sh`; does nothing until that script is on the branch | `headphone_for_all-linux-appimage` |
 | Android APK | ubuntu-latest | JDK 17, SDK 36 + NDK 29.0.14206865, `flutter build apk --release`, Kotlin unit tests + lint if present | `headphone_for_all-android-apk` |
 | Windows build | windows-latest | `flutter build windows --release`, Inno Setup installer if `packaging/windows/build-installer.ps1` exists | `headphone_for_all-windows-x64` (zip), `…-windows-x64-setup` |
 | macOS build | macos-latest | `flutter build macos --release`, DMG if `packaging/macos/build-dmg.sh` exists | `headphone_for_all-macos` (zipped .app), `…-macos-dmg` |
