@@ -19,7 +19,12 @@ android {
         applicationId = "io.github.shdavlatbek.hfa"
         // Android 10: AudioPlaybackCapture (system audio capture) needs API 29.
         minSdk = 29
-        targetSdk = flutter.targetSdkVersion
+        // Pinned, not flutter.targetSdkVersion: targeting API 37 (Android 17) makes local-network
+        // protection mandatory (runtime permission ACCESS_LOCAL_NETWORK for mDNS, multicast, and
+        // UDP/TCP to LAN addresses), which would break discovery, pairing, streaming and the hub.
+        // Before raising it, declare ACCESS_LOCAL_NETWORK and request it before discovery, hub
+        // start and sender start (docs/CONTRACTS.md §8.8.1).
+        targetSdk = 36
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
         // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`

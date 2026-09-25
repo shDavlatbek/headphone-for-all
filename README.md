@@ -35,8 +35,11 @@ The headphone sees one normal source, so no firmware hacks and no special headph
 | Windows 10 2004+ / 11 | ✅ M1 | ✅ M1 | WASAPI loopback / process loopback |
 | macOS 14.2+ | ✅ M1 | ✅ M1 | Core Audio process taps |
 | Linux (PipeWire) | ✅ M0 | ✅ M0 | PipeWire monitor source |
-| Android 10+ | ✅ M2 ⚠️ some apps block capture | ✅ M4 | AudioPlaybackCapture + MediaProjection |
+| Android 10+ | ✅ M2 ⚠️ some apps block capture; on Android 15 QPR1+ locking the screen stops it¹ | ✅ M4 | AudioPlaybackCapture + MediaProjection |
 | iOS 15+ | ⚠️ M3 via screen-broadcast extension, DRM audio is silent | ✅ M4 | ReplayKit Broadcast Upload Extension |
+
+¹ Android 15 QPR1 and newer end every screen/audio capture (MediaProjection) when the screen locks, including the
+screen-off timeout. Keep the phone unlocked while it streams; after a lock, unlock it and tap Start again.
 
 Any device can be the hub. The first hub builds are desktop; the mobile hub comes in M4.
 

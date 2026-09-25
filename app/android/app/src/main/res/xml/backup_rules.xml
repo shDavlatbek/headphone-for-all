@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 10 and 11 (API 29-30), Auto Backup: same rule as data_extraction_rules.xml.
+     allowBackup="false" already turns backup off there; this keeps the exclusion if it is
+     ever turned back on. -->
+<full-backup-content>
+    <exclude domain="file" path="hfa" />
+</full-backup-content>

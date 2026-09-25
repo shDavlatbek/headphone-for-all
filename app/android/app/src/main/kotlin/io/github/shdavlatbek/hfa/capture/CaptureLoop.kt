@@ -21,30 +21,46 @@ object HfaCode {
 /**
  * Decides what the capture loop does with each push result.
  *
- * - [HfaCode.OK] resets the error count.
- * - [HfaCode.UNKNOWN_FEED] drops the audio: no sender reads the feed right now.
+ * - [HfaCode.OK] resets both counters.
+ * - [HfaCode.UNKNOWN_FEED] drops the audio: no sender reads the feed right now. Dart registers
+ *   the feed (`sender_start`) before it starts the capture, so the feed is only missing after
+ *   the sender was stopped (`sender_stop` unregisters it). [maxUnknownFeed] of them in a row end
+ *   the capture with [LoopExit.NoSender]: a capture nobody reads (for example after the Flutter
+ *   UI was recreated and lost track of it) must not keep the MediaProjection alive.
  * - [HfaCode.INVALID_ARGUMENT] fails at once: the format was rejected and will not change.
  * - Any other code counts as a transient error; [maxConsecutiveErrors] of them in a row fail.
  */
-class PushPolicy(private val maxConsecutiveErrors: Int = DEFAULT_MAX_CONSECUTIVE_ERRORS) {
+class PushPolicy(
+    private val maxConsecutiveErrors: Int = DEFAULT_MAX_CONSECUTIVE_ERRORS,
+    private val maxUnknownFeed: Int = DEFAULT_MAX_UNKNOWN_FEED,
+) {
     init {
         require(maxConsecutiveErrors > 0) { "maxConsecutiveErrors must be positive" }
+        require(maxUnknownFeed > 0) { "maxUnknownFeed must be positive" }
     }
 
     private var consecutiveErrors = 0
+    private var consecutiveUnknownFeed = 0
 
-    /** Returns `null` to keep going, or the reason to stop capturing. */
-    fun onResult(code: Int): String? {
+    /** Returns `null` to keep going, or why the capture ends. */
+    fun onResult(code: Int): LoopExit? {
         when (code) {
-            HfaCode.OK, HfaCode.UNKNOWN_FEED -> {
+            HfaCode.OK -> {
                 consecutiveErrors = 0
+                consecutiveUnknownFeed = 0
                 return null
             }
-            HfaCode.INVALID_ARGUMENT -> return "the audio engine rejected the PCM format"
+            HfaCode.UNKNOWN_FEED -> {
+                consecutiveErrors = 0
+                consecutiveUnknownFeed++
+                return if (consecutiveUnknownFeed >= maxUnknownFeed) LoopExit.NoSender else null
+            }
+            HfaCode.INVALID_ARGUMENT -> return LoopExit.PushFailed("the audio engine rejected the PCM format")
         }
+        consecutiveUnknownFeed = 0
         consecutiveErrors++
         return if (consecutiveErrors >= maxConsecutiveErrors) {
-            "the audio engine failed $consecutiveErrors times in a row (code $code)"
+            LoopExit.PushFailed("the audio engine failed $consecutiveErrors times in a row (code $code)")
         } else {
             null
         }
@@ -53,6 +69,9 @@ class PushPolicy(private val maxConsecutiveErrors: Int = DEFAULT_MAX_CONSECUTIVE
     companion object {
         /** 50 pushes of 10 ms: half a second of continuous failures. */
         const val DEFAULT_MAX_CONSECUTIVE_ERRORS: Int = 50
+
+        /** 200 pushes of 10 ms: two seconds without a sender reading the feed. */
+        const val DEFAULT_MAX_UNKNOWN_FEED: Int = 200
     }
 }
 
@@ -85,6 +104,9 @@ sealed interface LoopExit {
 
     /** The engine kept refusing the audio; [reason] comes from [PushPolicy]. */
     data class PushFailed(val reason: String) : LoopExit
+
+    /** No sender has read the feed for a while (see [PushPolicy.DEFAULT_MAX_UNKNOWN_FEED]). */
+    data object NoSender : LoopExit
 }
 
 /**
@@ -101,8 +123,8 @@ class CaptureLoop(private val pipe: PcmPipe, private val policy: PushPolicy = Pu
             if (samples < 0) return LoopExit.ReadFailed(samples)
             val frames = PcmFormat.wholeFrames(samples, pipe.channels)
             if (frames == 0) continue
-            val reason = policy.onResult(pipe.push(frames))
-            if (reason != null) return LoopExit.PushFailed(reason)
+            val exit = policy.onResult(pipe.push(frames))
+            if (exit != null) return exit
         }
         return LoopExit.Stopped
     }

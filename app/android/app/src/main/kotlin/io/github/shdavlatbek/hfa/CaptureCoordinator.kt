@@ -8,6 +8,7 @@ import android.os.Looper
 import android.util.Log
 import io.flutter.plugin.common.MethodChannel
 import io.github.shdavlatbek.hfa.capture.CaptureEffect
+import io.github.shdavlatbek.hfa.capture.CapturePhase
 import io.github.shdavlatbek.hfa.capture.CaptureRequest
 import io.github.shdavlatbek.hfa.capture.CaptureStateMachine
 
@@ -25,6 +26,9 @@ object CaptureCoordinator {
 
     /** How long the service may take to report that it records. */
     private const val START_TIMEOUT_MS = 10_000L
+
+    /** `PlatformException` code of a `startSystemCapture` refused for lack of RECORD_AUDIO. */
+    private const val ERROR_PERMISSION_DENIED = "permissionDenied"
 
     /** The activity that shows the dialogs. */
     interface Host {
@@ -64,11 +68,19 @@ object CaptureCoordinator {
             return
         }
         pendingResult = result
+        PlatformEvents.clearUnheardCaptureEnd()
         execute(context, effects)
     }
 
     /** `stopSystemCapture`. */
     fun stop(context: Context) = execute(context, machine.stop())
+
+    /**
+     * `captureStatus`: whether a capture service records right now. A Flutter UI created while
+     * the service kept running (the activity was destroyed, the process lived on) asks this to
+     * take over the capture it did not start.
+     */
+    fun isRunning(): Boolean = machine.phase == CapturePhase.RUNNING
 
     /** The permission dialog ended; [granted]: RECORD_AUDIO is granted. */
     fun onPermissions(context: Context, granted: Boolean) = execute(context, machine.onPermissions(granted))
@@ -108,11 +120,20 @@ object CaptureCoordinator {
                     pendingResult?.success(effect.started)
                     pendingResult = null
                 }
+                CaptureEffect.ReplyPermissionDenied -> {
+                    pendingResult?.error(
+                        ERROR_PERMISSION_DENIED,
+                        context.getString(R.string.capture_error_permission),
+                        null,
+                    )
+                    pendingResult = null
+                }
                 is CaptureEffect.Emit -> PlatformEvents.emit(effect.event)
                 CaptureEffect.RequestPermissions -> {
                     val current = host
                     if (current == null) {
-                        execute(context, machine.onPermissions(false))
+                        // No activity to ask: the start cannot complete (not a refusal).
+                        execute(context, machine.onHostLost())
                     } else {
                         current.requestCapturePermissions()
                     }

@@ -1298,6 +1298,7 @@ Desktop Windows/Linux don't register the channel, so Dart must treat `MissingPlu
 | `acquireMulticastLock` / `releaseMulticastLock` | – | `null` | `WifiManager.MulticastLock` | no-op | no-op |
 | `writeBroadcastConfig` | `{hubHost, hubPort, hubDeviceId, hubKey, label}` | `null` | – | writes `broadcast_config.json` into the App Group container for the extension | – |
 | `captureSupport` | – | `{supported:bool, reason:String}` | API ≥ 29 | `{supported:true, reason:"broadcast"}` | – |
+| `captureStatus` | – | `{running:bool, endedWhileAway:String?}` | capture service state (§8.8.1) | – (`notImplemented`) | – |
 
 iOS also registers the platform view `hfa/broadcast_picker`, which wraps an `RPSystemBroadcastPickerView`
 whose `preferredExtension` is the broadcast extension's bundle id.
@@ -1682,6 +1683,51 @@ mipmaps were removed, minSdk 29 needs no bitmap fallback; `drawable-v21/launch_b
 Status-bar icon `drawable/ic_stat_headphone`.
 `app/build.gradle.kts` adds only `testImplementation("junit:junit:4.13.2")`; AGP / Kotlin / Gradle versions are
 unchanged.
+
+### 8.8.1 Refinements made by `fix/android` (the code in `app/android` is authoritative; overrides §8.8 where they differ)
+
+- **Capture outliving the Flutter UI.** The capture service, `CaptureCoordinator` and the Rust `EngineManager` live as
+  long as the process; the Flutter UI does not (swiping the app out of Recents destroys the activity and engine while the
+  `mediaProjection` service keeps the process alive).
+  - Push results: `-4` (unknown feed) is still dropped, but **200 in a row (2 s)** end the capture as
+    `captureStopped` ("No sender is streaming this audio any more"): `sender_stop` unregisters the feed, so a capture no
+    UI knows about can no longer hold the MediaProjection, `AudioRecord`, locks and notification forever. Dart
+    registers the feed (`sender_start`) before `startSystemCapture`, so a normal start never sees `-4`.
+  - New method **`captureStatus`** → `{running: bool, endedWhileAway: String?}`. `running`: the coordinator's phase is
+    RUNNING. `endedWhileAway`: the message (`""` when none) of the last `captureStopped` / `captureError` that was
+    emitted while **no Dart listener** existed, else `null`; reading it clears it, and a new `startSystemCapture`
+    clears it too (`capture/UnheardCaptureEnd`). Dart's `NativeChannel.captureStatus()` returns `null` where the
+    method is missing.
+  - `SenderController.build()` on Android asks `captureStatus` (skipped while a start is in progress): a running
+    capture with a live sender is adopted (`_nativeCapture = true`, so Stop and capture events work); a running
+    capture whose sender is no longer live is stopped; an unheard end while the sender is still live stops the sender
+    with the error "Capture stopped while the app was closed: …". `stop()` on Android with the device-audio source
+    always calls `stopSystemCapture` (idempotent) even when this UI did not start the capture.
+- **`startSystemCapture` refused RECORD_AUDIO** now fails with `PlatformException` code **`permissionDenied`** (message
+  names the audio recording permission and App info) instead of answering `false`; `false` now means the consent
+  was refused or the start was cancelled / timed out / refused as concurrent. A start that cannot show the dialogs
+  because the activity is gone still answers `false`. When Android shows no dialog at all (rationale `false` before and
+  after the request: denied for good), the activity also offers to open App info
+  (`Settings.ACTION_APPLICATION_DETAILS_SETTINGS`). Dart stops the sender on any `PlatformException` from
+  `startSystemCapture` and shows its message.
+- **Screen lock (Android 15 QPR1+)** ends every MediaProjection; on API 35+ `onStop` reports "Android stopped the audio
+  capture (the screen was locked, or the capture was ended from the status bar). …". README's platform table says so.
+- **No self-capture:** `AudioPlaybackCaptureConfiguration` adds `excludeUid(Process.myUid())`, so a phone that is also a
+  hub (cpal/AAudio plays the mix as `USAGE_MEDIA`) never captures its own output or UI sounds. The manifest does not
+  set `allowAudioPlaybackCapture="false"`, so other apps (screen recorders) may still record the hub mix.
+- **`CaptureService` holds a non-reference-counted `MulticastLock`** (`hfa:capture-multicast`) next to its Wi-Fi lock
+  while it records, released on every teardown: a sender that targets a hub by device id (`HubAddress::Discover`)
+  browses mDNS again on each reconnect, when the activity's discovery lock is usually gone.
+- **`startHubService` on API 33+** also launches a non-blocking POST_NOTIFICATIONS request when it is not granted; the
+  hub starts whatever the answer, so a hub-only phone gets a visible notification.
+- **Backup:** `<application android:allowBackup="false" android:fullBackupContent="@xml/backup_rules"
+  android:dataExtractionRules="@xml/data_extraction_rules">`. Both rule files exclude `domain="file" path="hfa"`
+  (cloud backup and device-to-device transfer): `filesDir/hfa` holds the Noise private key (`identity.json`), the
+  pairings (`trusted.json`) and settings, and a copy on a second phone would share the device id and pairings.
+- **`targetSdk = 36`** is pinned in `app/build.gradle.kts` (no longer `flutter.targetSdkVersion`): targeting API 37
+  makes Android 17's local-network protection mandatory (runtime permission `ACCESS_LOCAL_NETWORK` for mDNS, multicast
+  and LAN UDP/TCP). Before raising it, declare that permission and request it before discovery, hub start and sender
+  start.
 
 ### 8.9 Refinements made by `feat/apple` (the code in `app/ios` and `app/macos` is authoritative)
 

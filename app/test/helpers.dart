@@ -59,6 +59,14 @@ class RecordingNativeChannel extends NativeChannel {
   @override
   Future<void> stopSystemCapture() async => calls.add('stopSystemCapture');
 
+  /// What [captureStatus] answers (not recorded in [calls]).
+  NativeCaptureStatus captureStatusAnswer = const NativeCaptureStatus(
+    running: false,
+  );
+
+  @override
+  Future<NativeCaptureStatus?> captureStatus() async => captureStatusAnswer;
+
   @override
   Future<void> startHubService() async => calls.add('startHubService');
 

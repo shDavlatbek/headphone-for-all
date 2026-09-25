@@ -11,6 +11,10 @@ data class PlatformEvent(val type: String, val message: String? = null) {
     fun toMap(): Map<String, String> =
         if (message == null) mapOf("type" to type) else mapOf("type" to type, "message" to message)
 
+    /** Whether this event reports the end of a capture ([CAPTURE_STOPPED] or [CAPTURE_ERROR]). */
+    val isCaptureEnd: Boolean
+        get() = type == CAPTURE_STOPPED || type == CAPTURE_ERROR
+
     companion object {
         /** Event type: capture ended without Dart asking (notification action, system, screen lock). */
         const val CAPTURE_STOPPED: String = "captureStopped"

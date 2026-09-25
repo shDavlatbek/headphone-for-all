@@ -47,9 +47,31 @@ class CaptureLoopTest {
 
     @Test
     fun unknownFeedIsDroppedSilently() {
-        val pipe = FakePipe(channels = 2, reads = List(200) { 960 }, codes = List(200) { HfaCode.UNKNOWN_FEED })
+        val pipe = FakePipe(channels = 2, reads = List(199) { 960 }, codes = List(199) { HfaCode.UNKNOWN_FEED })
         assertEquals(LoopExit.Stopped, pipe.runUntilExhausted())
-        assertEquals(200, pipe.pushed.size)
+        assertEquals(199, pipe.pushed.size)
+    }
+
+    @Test
+    fun captureEndsWhenNoSenderReadsTheFeedForTwoSeconds() {
+        // Regression: after `sender_stop` every push answers UNKNOWN_FEED; the capture (and its
+        // MediaProjection) must end instead of running forever.
+        val pipe = FakePipe(channels = 2, reads = List(300) { 960 }, codes = List(300) { HfaCode.UNKNOWN_FEED })
+        assertEquals(LoopExit.NoSender, pipe.runUntilExhausted())
+        assertEquals(PushPolicy.DEFAULT_MAX_UNKNOWN_FEED, pipe.pushed.size)
+    }
+
+    @Test
+    fun acceptedPushResetsTheUnknownFeedCount() {
+        val policy = PushPolicy(maxUnknownFeed = 3)
+        assertNull(policy.onResult(HfaCode.UNKNOWN_FEED))
+        assertNull(policy.onResult(HfaCode.UNKNOWN_FEED))
+        assertNull(policy.onResult(HfaCode.OK))
+        assertNull(policy.onResult(HfaCode.UNKNOWN_FEED))
+        assertNull(policy.onResult(HfaCode.ENGINE)) // a transient error also breaks the run
+        assertNull(policy.onResult(HfaCode.UNKNOWN_FEED))
+        assertNull(policy.onResult(HfaCode.UNKNOWN_FEED))
+        assertEquals(LoopExit.NoSender, policy.onResult(HfaCode.UNKNOWN_FEED))
     }
 
     @Test
@@ -93,8 +115,8 @@ class CaptureLoopTest {
         assertNull(policy.onResult(HfaCode.OK)) // resets
         assertNull(policy.onResult(HfaCode.ENGINE))
         assertNull(policy.onResult(HfaCode.ENGINE))
-        val reason = policy.onResult(HfaCode.ENGINE)
-        assertTrue(reason, reason!!.contains("3 times"))
+        val exit = policy.onResult(HfaCode.ENGINE)
+        assertTrue("$exit", exit is LoopExit.PushFailed && exit.reason.contains("3 times"))
     }
 
     @Test

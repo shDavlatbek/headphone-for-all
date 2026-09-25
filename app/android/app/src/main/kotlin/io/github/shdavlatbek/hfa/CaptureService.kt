@@ -34,13 +34,15 @@ import io.github.shdavlatbek.hfa.capture.SampleEncoding
  *
  * Start: `startForeground` first (Android 14 requires it before `getMediaProjection`), then
  * `MediaProjection` from the consent result → `AudioPlaybackCaptureConfiguration` (usages MEDIA,
- * GAME, UNKNOWN) → `AudioRecord` (float when supported, else 16-bit; the format the feed was
+ * GAME, UNKNOWN; this app's own UID excluded, so a phone that is also a hub never re-captures
+ * the mix it plays) → `AudioRecord` (float when supported, else 16-bit; the format the feed was
  * registered with) → a capture thread that reads 10 ms chunks into one reused buffer and calls
  * [NativeBridge]. Results go to [CaptureCoordinator] with the session number of the start.
  *
  * Every end — Dart's stop, the notification's Stop action, `MediaProjection.Callback.onStop`
  * (the user or the system ended the projection, for example on screen lock), a recording or
- * engine failure, `onDestroy` — goes through [teardown], which is idempotent. All state is
+ * engine failure, no sender reading the feed any more, `onDestroy` — goes through [teardown],
+ * which is idempotent. All state is
  * touched on the main thread only; the capture thread reports through [mainHandler].
  */
 class CaptureService : Service() {
@@ -50,6 +52,13 @@ class CaptureService : Service() {
     private var lastStartId = 0
     private var active: ActiveCapture? = null
     private var wifiLock: WifiManager.WifiLock? = null
+
+    /**
+     * Lets mDNS replies in while capturing: a sender that targets a hub by device id browses for
+     * it again on every reconnect, and the activity's discovery lock is gone once the user left
+     * the app.
+     */
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -81,8 +90,9 @@ class CaptureService : Service() {
         endActive { session ->
             CaptureCoordinator.onServiceStopped(this, session, getString(R.string.capture_stopped_by_system))
         }
-        SystemLocks.release(wifiLock)
+        releaseLocks()
         wifiLock = null
+        multicastLock = null
         mainHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -157,6 +167,8 @@ class CaptureService : Service() {
             }
             if (wifiLock == null) wifiLock = SystemLocks.wifiLowLatency(this, "hfa:capture")
             SystemLocks.acquire(wifiLock)
+            if (multicastLock == null) multicastLock = SystemLocks.multicast(this, "hfa:capture-multicast")
+            SystemLocks.acquire(multicastLock)
             // Last: once the thread runs, it owns the release of the recorder.
             capture.startThread()
             Log.i(
@@ -165,7 +177,7 @@ class CaptureService : Service() {
             )
             return capture
         } catch (e: RuntimeException) {
-            SystemLocks.release(wifiLock)
+            releaseLocks()
             recorder?.record?.release()
             projection.unregisterCallback(callback)
             projection.stop()
@@ -183,6 +195,9 @@ class CaptureService : Service() {
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(AudioAttributes.USAGE_GAME)
             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+            // Never capture ourselves: the hub's mix (cpal/AAudio plays as USAGE_MEDIA in this
+            // process) would be sent back to a hub, echoing or looping.
+            .excludeUid(Process.myUid())
             .build()
         val channelMask = if (request.channels == 1) AudioFormat.CHANNEL_IN_MONO else AudioFormat.CHANNEL_IN_STEREO
         val chunkFrames = PcmFormat.chunkFrames(request.sampleRate)
@@ -246,7 +261,12 @@ class CaptureService : Service() {
         val capture = active ?: return
         active = null
         capture.close()
+        releaseLocks()
+    }
+
+    private fun releaseLocks() {
         SystemLocks.release(wifiLock)
+        SystemLocks.release(multicastLock)
     }
 
     /** Leaves the foreground and stops, unless a newer start command is pending. */
@@ -260,6 +280,15 @@ class CaptureService : Service() {
         if (active !== capture) return
         val message = when (exit) {
             LoopExit.Stopped -> return
+            LoopExit.NoSender -> {
+                // The sender was stopped (for example by a Flutter UI that did not know about
+                // this capture): end the capture as if stopped, not as a failure.
+                Log.i(TAG, "capture session ${capture.session}: no sender reads the audio; stopping")
+                teardown()
+                CaptureCoordinator.onServiceStopped(this, capture.session, getString(R.string.capture_stopped_no_sender))
+                finish()
+                return
+            }
             is LoopExit.ReadFailed -> getString(R.string.capture_error_record, "AudioRecord.read = ${exit.code}")
             is LoopExit.PushFailed -> exit.reason
         }
@@ -290,6 +319,17 @@ class CaptureService : Service() {
         )
     }
 
+    /**
+     * Why the projection ended by itself. Since Android 15 QPR1 locking the screen (also by the
+     * screen-off timeout) ends every MediaProjection, so on API 35+ the message names it.
+     */
+    private fun projectionStoppedMessage(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            R.string.capture_stopped_by_system_or_lock
+        } else {
+            R.string.capture_stopped_by_system
+        }
+
     @Suppress("DEPRECATION") // getParcelableExtra(String) is the only variant before API 33.
     private fun consentData(intent: Intent): Intent? =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -304,11 +344,7 @@ class CaptureService : Service() {
             val capture = active
             if (capture == null || capture.session != session) return
             endActive {
-                CaptureCoordinator.onServiceStopped(
-                    this@CaptureService,
-                    it,
-                    getString(R.string.capture_stopped_by_system),
-                )
+                CaptureCoordinator.onServiceStopped(this@CaptureService, it, getString(projectionStoppedMessage()))
             }
         }
     }

@@ -80,6 +80,21 @@ class CaptureSupport {
   final String reason;
 }
 
+/// Result of [NativeChannel.captureStatus] (Android).
+@immutable
+class NativeCaptureStatus {
+  /// Creates a result.
+  const NativeCaptureStatus({required this.running, this.endedWhileAway});
+
+  /// The capture service records right now (it may have been started by an
+  /// earlier Flutter UI of this process).
+  final bool running;
+
+  /// The message ('' when none) of a capture end that no Dart listener
+  /// received, or `null`. Reported once.
+  final String? endedWhileAway;
+}
+
 /// The hub target handed to the iOS broadcast extension.
 @immutable
 class BroadcastConfig {
@@ -191,6 +206,18 @@ class NativeChannel {
 
   /// Android: stops the capture service.
   Future<void> stopSystemCapture() => _invoke<void>('stopSystemCapture');
+
+  /// Android: whether the capture service runs, and the end of a capture no
+  /// listener heard. `null` where the platform does not implement it.
+  Future<NativeCaptureStatus?> captureStatus() async {
+    final raw = await _invoke<Map<Object?, Object?>>('captureStatus');
+    if (raw == null) return null;
+    final ended = raw['endedWhileAway'];
+    return NativeCaptureStatus(
+      running: raw['running'] == true,
+      endedWhileAway: ended is String ? ended : null,
+    );
+  }
 
   /// Android: foreground hub service + multicast lock; iOS: audio session.
   Future<void> startHubService() => _invoke<void>('startHubService');

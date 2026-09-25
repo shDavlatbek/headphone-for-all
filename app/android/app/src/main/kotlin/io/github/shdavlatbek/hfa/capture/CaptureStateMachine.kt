@@ -23,6 +23,12 @@ sealed interface CaptureEffect {
     /** Answer the pending `startSystemCapture` call with [started]. */
     data class Reply(val started: Boolean) : CaptureEffect
 
+    /**
+     * Fail the pending `startSystemCapture` call with `PlatformException` code
+     * `permissionDenied`: RECORD_AUDIO was refused, so no consent dialog was shown.
+     */
+    data object ReplyPermissionDenied : CaptureEffect
+
     /** Send [event] to Dart. */
     data class Emit(val event: PlatformEvent) : CaptureEffect
 
@@ -86,10 +92,14 @@ class CaptureStateMachine {
         }
     }
 
-    /** The permission dialog ended; [granted] is true when RECORD_AUDIO is granted. */
+    /**
+     * The permission dialog ended; [granted] is true when RECORD_AUDIO is granted. A refusal is
+     * answered with [CaptureEffect.ReplyPermissionDenied] (not `false`, which means the consent
+     * was refused), so Dart can tell the user which permission is missing.
+     */
     fun onPermissions(granted: Boolean): List<CaptureEffect> {
         if (phase != CapturePhase.AWAITING_PERMISSION) return emptyList()
-        if (!granted) return finish(CaptureEffect.Reply(false))
+        if (!granted) return finish(CaptureEffect.ReplyPermissionDenied)
         phase = CapturePhase.AWAITING_CONSENT
         return listOf(CaptureEffect.RequestConsent)
     }
