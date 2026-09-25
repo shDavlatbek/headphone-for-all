@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 headphone-for-all contributors -->
+<component type="desktop-application">
+  <id>io.github.shdavlatbek.hfa</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+
+  <name>Headphone for All</name>
+  <summary>Hear every device in one headphone at the same time</summary>
+  <developer id="io.github.shdavlatbek">
+    <name>headphone-for-all contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      A Bluetooth headphone plays audio from only one device at a time. Headphone for All mixes
+      them in software: the headphone stays paired to one device, the hub, and every other device
+      streams its own audio to the hub over the local network. The hub mixes all streams and plays
+      the mix in the headphone.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Hub mode: receive, mix and play the audio of several computers and phones at once</li>
+      <li>Sender mode: stream this computer's system audio (PipeWire) to a hub</li>
+      <li>Per-source volume, mute and priority, with live loss and latency figures</li>
+      <li>Hubs are found automatically on the local network</li>
+      <li>Pairing with a PIN or QR code; every stream is end-to-end encrypted</li>
+      <li>Low latency Opus audio with jitter buffering and clock-drift correction</li>
+    </ul>
+    <p>
+      Sender and hub apps are available for Linux, Windows, macOS, Android and iOS.
+      Capturing audio on Linux needs a PipeWire session.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.shdavlatbek.hfa.desktop</launchable>
+  <provides>
+    <binary>headphone_for_all</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/shDavlatbek/headphone-for-all</url>
+  <url type="bugtracker">https://github.com/shDavlatbek/headphone-for-all/issues</url>
+  <url type="vcs-browser">https://github.com/shDavlatbek/headphone-for-all</url>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Mixer</category>
+  </categories>
+  <keywords>
+    <keyword>headphone</keyword>
+    <keyword>bluetooth</keyword>
+    <keyword>audio</keyword>
+    <keyword>stream</keyword>
+    <keyword>mixer</keyword>
+  </keywords>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#C5CAE9</color>
+    <color type="primary" scheme_preference="dark">#303F9F</color>
+  </branding>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="1.0.0" date="2026-09-25">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

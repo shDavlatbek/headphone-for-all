@@ -15,6 +15,12 @@ class FlutterWindow : public Win32Window {
   explicit FlutterWindow(const flutter::DartProject& project);
   virtual ~FlutterWindow();
 
+  // Whether the window is shown once Flutter has drawn its first frame
+  // (default true). False keeps it hidden until something shows it: the tray
+  // icon (window_manager), or a second launch (the activate message). Call it
+  // before |Create|.
+  void SetShowOnFirstFrame(bool show) { show_on_first_frame_ = show; }
+
  protected:
   // Win32Window:
   bool OnCreate() override;
@@ -25,6 +31,9 @@ class FlutterWindow : public Win32Window {
  private:
   // The project to run.
   flutter::DartProject project_;
+
+  // Whether the first frame shows the window.
+  bool show_on_first_frame_ = true;
 
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;

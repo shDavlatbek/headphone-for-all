@@ -3,6 +3,9 @@
 #include <dwmapi.h>
 #include <flutter_windows.h>
 
+#include <algorithm>
+
+#include "app_identity.h"
 #include "resource.h"
 
 namespace {
@@ -16,7 +19,7 @@ namespace {
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
-constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
+constexpr const wchar_t* kWindowClassName = kAppWindowClassName;
 
 /// Registry key for app theme preference.
 ///
@@ -134,14 +137,37 @@ bool Win32Window::Create(const std::wstring& title,
   UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
   double scale_factor = dpi / 96.0;
 
-  HWND window = CreateWindow(
-      window_class, title.c_str(), WS_OVERLAPPEDWINDOW,
-      Scale(origin.x, scale_factor), Scale(origin.y, scale_factor),
-      Scale(size.width, scale_factor), Scale(size.height, scale_factor),
-      nullptr, nullptr, GetModuleHandle(nullptr), this);
+  int width = Scale(size.width, scale_factor);
+  int height = Scale(size.height, scale_factor);
+  int x = Scale(origin.x, scale_factor);
+  int y = Scale(origin.y, scale_factor);
+  MONITORINFO monitor_info{};
+  monitor_info.cbSize = sizeof(monitor_info);
+  if (GetMonitorInfo(monitor, &monitor_info)) {
+    const RECT& work = monitor_info.rcWork;
+    const int work_width = static_cast<int>(work.right - work.left);
+    const int work_height = static_cast<int>(work.bottom - work.top);
+    width = (std::min)(width, work_width);
+    height = (std::min)(height, work_height);
+    x = static_cast<int>(work.left) + (work_width - width) / 2;
+    y = static_cast<int>(work.top) + (work_height - height) / 2;
+  }
+
+  HWND window = CreateWindow(window_class, title.c_str(), WS_OVERLAPPEDWINDOW,
+                             x, y, width, height, nullptr, nullptr,
+                             GetModuleHandle(nullptr), this);
 
   if (!window) {
     return false;
+  }
+
+  if (activate_message_ != 0) {
+    // User Interface Privilege Isolation drops messages posted to a window of
+    // a higher integrity level. Without this, launching the app normally
+    // while an elevated instance runs would silently do nothing. Failure only
+    // loses that case (the second instance then reports it).
+    ChangeWindowMessageFilterEx(window, activate_message_, MSGFLT_ALLOW,
+                                nullptr);
   }
 
   UpdateTheme(window);
@@ -178,7 +204,30 @@ Win32Window::MessageHandler(HWND hwnd,
                             UINT const message,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
+  if (activate_message_ != 0 && message == activate_message_) {
+    BringToFront();
+    return 0;
+  }
+  if (quit_message_ != 0 && message == quit_message_) {
+    QuitApplication();
+    return 0;
+  }
+
   switch (message) {
+    case WM_ENDSESSION:
+      // The session ends, or Restart Manager (an installer's "close the
+      // applications", ENDSESSION_CLOSEAPP) asks the app to exit. Returning
+      // without exiting would keep the app, and its files, alive while it
+      // sits in the tray.
+      if (wparam != FALSE) {
+        QuitApplication();
+      }
+      return 0;
+
+    case WM_GETMINMAXINFO:
+      ApplyMinimumSize(hwnd, lparam);
+      return 0;
+
     case WM_DESTROY:
       window_handle_ = nullptr;
       Destroy();
@@ -261,6 +310,54 @@ HWND Win32Window::GetHandle() {
 
 void Win32Window::SetQuitOnClose(bool quit_on_close) {
   quit_on_close_ = quit_on_close;
+}
+
+void Win32Window::SetMinimumSize(const Size& size) {
+  minimum_size_ = size;
+}
+
+void Win32Window::SetActivateMessage(UINT message) {
+  activate_message_ = message;
+}
+
+void Win32Window::SetQuitMessage(UINT message) {
+  quit_message_ = message;
+}
+
+void Win32Window::QuitApplication() {
+  quit_on_close_ = true;
+  if (window_handle_ != nullptr) {
+    // WM_DESTROY releases Flutter and posts WM_QUIT.
+    DestroyWindow(window_handle_);
+  } else {
+    PostQuitMessage(0);
+  }
+}
+
+void Win32Window::BringToFront() {
+  if (window_handle_ == nullptr) {
+    return;
+  }
+  if (IsIconic(window_handle_)) {
+    ShowWindow(window_handle_, SW_RESTORE);
+  } else if (!IsWindowVisible(window_handle_)) {
+    ShowWindow(window_handle_, SW_SHOW);
+  }
+  SetForegroundWindow(window_handle_);
+}
+
+void Win32Window::ApplyMinimumSize(HWND window, LPARAM const lparam) const {
+  if (lparam == 0) {
+    return;
+  }
+  auto info = reinterpret_cast<MINMAXINFO*>(lparam);
+  const double scale_factor = FlutterDesktopGetDpiForHWND(window) / 96.0;
+  if (minimum_size_.width > 0) {
+    info->ptMinTrackSize.x = Scale(minimum_size_.width, scale_factor);
+  }
+  if (minimum_size_.height > 0) {
+    info->ptMinTrackSize.y = Scale(minimum_size_.height, scale_factor);
+  }
 }
 
 bool Win32Window::OnCreate() {

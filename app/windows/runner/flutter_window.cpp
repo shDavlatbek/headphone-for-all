@@ -27,14 +27,17 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
-  flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
-  });
+  if (show_on_first_frame_) {
+    flutter_controller_->engine()->SetNextFrameCallback([&]() {
+      this->Show();
+    });
 
-  // Flutter can complete the first frame before the "show window" callback is
-  // registered. The following call ensures a frame is pending to ensure the
-  // window is shown. It is a no-op if the first frame hasn't completed yet.
-  flutter_controller_->ForceRedraw();
+    // Flutter can complete the first frame before the "show window" callback
+    // is registered. The following call ensures a frame is pending to ensure
+    // the window is shown. It is a no-op if the first frame hasn't completed
+    // yet.
+    flutter_controller_->ForceRedraw();
+  }
 
   return true;
 }
@@ -51,6 +54,13 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  // Plugins (window_manager) answer WM_GETMINMAXINFO themselves and only
+  // override the limits the Dart side set, so write the runner's minimum size
+  // first; it survives unless Dart sets its own.
+  if (message == WM_GETMINMAXINFO) {
+    ApplyMinimumSize(hwnd, lparam);
+  }
+
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =

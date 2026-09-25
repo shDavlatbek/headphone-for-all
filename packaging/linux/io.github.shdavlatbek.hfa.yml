@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Flatpak manifest for Headphone for All.
+#
+# It packages a prebuilt Flutter release bundle (Flutter and cargo need the
+# network, which flatpak-builder denies during builds). build-flatpak.sh
+# stages that bundle into _flatpak/bundle next to this file and runs
+# flatpak-builder; see packaging/README.md.
+#
+# Runtime libraries: GTK 3, GLib, libepoxy, fontconfig, X11 and libpipewire-0.3
+# (linked dynamically by hfa-capture) all come from org.freedesktop.Platform.
+# libopus is linked statically into libhfa_ffi.so.
+app-id: io.github.shdavlatbek.hfa
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+command: headphone_for_all
+
+finish-args:
+  # Hub and sender traffic: UDP media, TCP control, mDNS discovery (mdns-sd
+  # uses its own multicast sockets, Avahi is not involved).
+  - --share=network
+  - --share=ipc
+  # Window: Wayland, X11 only as a fallback; GPU for Flutter's renderer.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Audio: playback of the mix goes through PulseAudio (pipewire-pulse);
+  # capture uses the native PipeWire socket.
+  - --socket=pulseaudio
+  - --filesystem=xdg-run/pipewire-0
+  # Tray icon: a StatusNotifierItem that owns the bus name
+  # org.kde.StatusNotifierItem-<pid>-<n> and registers with the watcher.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --own-name=org.kde.*
+
+modules:
+  - name: headphone-for-all
+    buildsystem: simple
+    build-commands:
+      - install -d /app/lib/headphone-for-all /app/bin
+      - cp -a bundle/. /app/lib/headphone-for-all/
+      # The runner finds lib/ and data/ next to the real executable
+      # (/proc/self/exe), so a symlink in /app/bin is enough.
+      - ln -s ../lib/headphone-for-all/headphone_for_all /app/bin/headphone_for_all
+      - install -Dm644 io.github.shdavlatbek.hfa.desktop -t /app/share/applications
+      - install -Dm644 io.github.shdavlatbek.hfa.metainfo.xml -t /app/share/metainfo
+      - install -d /app/share/icons
+      - cp -a icons/hicolor /app/share/icons/
+    sources:
+      - type: dir
+        path: _flatpak/bundle
+        dest: bundle
+      - type: dir
+        path: ../../app/linux/icons
+        dest: icons
+      - type: file
+        path: io.github.shdavlatbek.hfa.desktop
+      - type: file
+        path: io.github.shdavlatbek.hfa.metainfo.xml
