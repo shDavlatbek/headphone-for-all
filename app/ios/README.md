@@ -36,15 +36,19 @@ Events: `{type: "broadcastStarted"}` and `{type: "broadcastFinished", message?}`
 notifications `io.github.shdavlatbek.hfa.broadcast.started` / `.finished` that the extension posts.
 Darwin notifications carry no payload, so the extension first writes
 `<container>/broadcast_status.json` (`{state, message?, timestamp}`); `message` is the reason a
-broadcast could not start (not paired, hub unreachable, ...).
+broadcast could not start: no App Group, no or invalid `broadcast_config.json`, hub not paired, or an
+invalid hub key. An unreachable hub is **not** such a reason: the Rust sender connects in the
+background after `hfa_ext_sender_start` returned (see Known limitations).
 
 ## Broadcast extension `HfaBroadcast`
 
 - Bundle id `io.github.shdavlatbek.hfa.broadcast`, iOS 15, principal class `SampleHandler`,
   `RPBroadcastProcessMode = RPBroadcastProcessModeSampleBuffer`, App Group entitlement.
-- `broadcastStarted` reads `broadcast_config.json` and calls `hfa_ext_sender_start(json)` (the file
-  already has the C ABI keys). On failure it calls `finishBroadcastWithError` with an `NSError`
-  whose description tells the user what to do (open the app and pair, check the hub).
+- `broadcastStarted` reads `broadcast_config.json` (the C ABI keys), replaces its `data_dir` with
+  `<container>/hfa` resolved in the extension's own process (a stored absolute container path can be
+  stale after a restore or a device migration) and calls `hfa_ext_sender_start(json)`. On failure it
+  calls `finishBroadcastWithError` with an `NSError` whose description tells the user what to do
+  (open the app, pair this iPhone and choose the hub).
 - `processSampleBuffer(.audioApp)` converts each buffer (format read from the buffer's
   `AudioStreamBasicDescription`, samples from `CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer`)
   into reused storage and calls `hfa_ext_push_pcm` with the buffer's rate and channel count (Rust
@@ -129,11 +133,18 @@ Only on a real iPhone (ReplayKit broadcasts do not run in the Simulator): everyt
    headphones. DRM audio (Apple Music, Netflix) is silent by design of ReplayKit.
 6. Stop the broadcast (red indicator → Stop): the app receives `broadcastFinished`, the source
    disappears from the hub.
-7. Failure path: forget the hub on the hub side or stop it, start the broadcast again: iOS shows
-   the extension's error text; the app receives `broadcastFinished` with that message.
-8. Memory: in Xcode attach to `HfaBroadcast` (Debug → Attach to Process) and watch the memory
+7. Start failure: on a fresh install (or after deleting the app's data) start the broadcast before
+   pairing any hub, so there is no `broadcast_config.json`. iOS shows the extension's error text
+   ("Open Headphone for All, pair this iPhone with your headphone hub ...") and the app receives
+   `broadcastFinished` with that message.
+8. Hub gone (known limitation, not a failure path): stop the hub, or make it forget the iPhone, then
+   start the broadcast. It **starts anyway**: the app receives `broadcastStarted`, the hub shows
+   nothing, and no error reaches the app while the extension keeps reconnecting in the background
+   (the C ABI has no status query). If you only stopped the hub, start it again: the source appears
+   within a few seconds.
+9. Memory: in Xcode attach to `HfaBroadcast` (Debug → Attach to Process) and watch the memory
    gauge while streaming for several minutes; it must stay well below 50 MB.
-9. Hub mode: start the hub in the app, lock the phone: playback continues (background audio,
+10. Hub mode: start the hub in the app, lock the phone: playback continues (background audio,
    `.mixWithOthers` lets other apps keep playing).
 
 Logs: `log stream --predicate 'subsystem BEGINSWITH "io.github.shdavlatbek.hfa"'` on a Mac with the

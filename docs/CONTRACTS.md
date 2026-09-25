@@ -1044,9 +1044,12 @@ scripts (xcodeproj gem): `app/ios/scripts/add_broadcast_extension.rb` (+ `verify
 **App Group container** (`group.io.github.shdavlatbek.hfa`, entitlement of both iOS targets):
 - `<container>/hfa/` — the Rust `data_dir` (`getDataDir` on iOS; the app's `init_app` and the extension use
   it, so the extension sees the app's identity, settings and trusted hubs).
-- `<container>/broadcast_config.json` — written by `writeBroadcastConfig`; **its content is exactly the C ABI
+- `<container>/broadcast_config.json` — written by `writeBroadcastConfig`; **its content is the C ABI
   configuration** (`hub_host`, `hub_port`, `hub_device_id`, `hub_key`, `label`, `data_dir`; missing
-  optionals are `null`), passed unchanged to `hfa_ext_sender_start`.
+  optionals are `null`). The extension decodes it and **replaces `data_dir`** with `<container>/hfa` as
+  resolved in its own process (the recorded absolute path can be stale after a restore or a device
+  migration) before passing it to `hfa_ext_sender_start`; an unreadable or invalid file counts as "no
+  configuration" (the user is told to pair and choose a hub in the app).
 - `<container>/broadcast_status.json` — `{state: "started"|"finished", message?: String, timestamp: seconds}`,
   written by the extension before each Darwin notification (Darwin notifications carry no payload).
 
@@ -1062,6 +1065,10 @@ scripts (xcodeproj gem): `app/ios/scripts/add_broadcast_extension.rb` (+ `verify
 - Events: the Darwin notifications `io.github.shdavlatbek.hfa.broadcast.started` / `.finished` become
   `{type: "broadcastStarted"}` / `{type: "broadcastFinished", message?}`; `message` (from
   `broadcast_status.json`) is set when the broadcast could not start (the same text iOS shows the user).
+  Only local problems make it fail to start (no App Group, no or invalid configuration, hub not paired,
+  storage errors): `hfa_ext_sender_start` returns once the engine runs and connects in the background,
+  so an unreachable hub, or a hub that no longer trusts the phone, is not reported (no status query in
+  `hfa_ext.h`).
 - `hfa/broadcast_picker` ignores creation parameters (it accepts the standard codec Dart sends).
 
 **Channel details (macOS).** Only the method channel is registered (no event channel). `getDataDir` →

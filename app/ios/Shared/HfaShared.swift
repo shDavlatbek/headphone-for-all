@@ -63,8 +63,9 @@ enum HfaShared {
 }
 
 /// `broadcast_config.json`: the hub the extension streams to. Keys are the snake_case keys of the
-/// Rust C ABI configuration (`hfa_ext_sender_start`, docs/CONTRACTS.md §8.5), so the file content
-/// is passed to Rust unchanged.
+/// Rust C ABI configuration (`hfa_ext_sender_start`, docs/CONTRACTS.md §8.5). The extension
+/// decodes the file and replaces `data_dir` with the directory it computes itself
+/// (`forSender(fileData:dataDir:)`) before passing the JSON to Rust.
 struct BroadcastConfig: Codable, Equatable {
   /// Hub host name or address; empty = find `hubDeviceId` over mDNS.
   var hubHost: String
@@ -86,6 +87,20 @@ struct BroadcastConfig: Codable, Equatable {
     case hubKey = "hub_key"
     case label
     case dataDir = "data_dir"
+  }
+
+  /// Decodes a stored `broadcast_config.json` and points it at `dataDir`, the shared data
+  /// directory resolved in the current process.
+  ///
+  /// The stored `data_dir` is an absolute path recorded when the app wrote the file. Apple does
+  /// not guarantee that the App Group container keeps its path (a restore or a migration to a new
+  /// device brings the file back with the old container UUID), so it is never trusted.
+  ///
+  /// - Throws: `DecodingError` when the file is not a valid configuration.
+  static func forSender(fileData: Data, dataDir: URL) throws -> BroadcastConfig {
+    var config = try JSONDecoder().decode(BroadcastConfig.self, from: fileData)
+    config.dataDir = dataDir.path
+    return config
   }
 
   /// Encodes the configuration as JSON (`null` for missing optional values, as Rust expects).

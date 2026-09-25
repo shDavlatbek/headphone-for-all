@@ -35,6 +35,29 @@ final class BroadcastConfigTests: XCTestCase {
     XCTAssertEqual(decoded, config)
   }
 
+  func testSenderConfigIgnoresTheStoredDataDir() throws {
+    // A file restored from a backup still names the old container UUID.
+    let stored = Data(
+      #"{"data_dir":"/private/var/mobile/Containers/Shared/AppGroup/OLD-UUID/hfa","hub_device_id":"ab12-cd34","hub_host":"10.0.0.2","hub_key":null,"hub_port":47810,"label":"iPhone"}"#
+        .utf8)
+    let current = URL(fileURLWithPath: "/private/var/mobile/Containers/Shared/AppGroup/NEW-UUID/hfa")
+    let config = try BroadcastConfig.forSender(fileData: stored, dataDir: current)
+    XCTAssertEqual(
+      config,
+      BroadcastConfig(
+        hubHost: "10.0.0.2", hubPort: 47_810, hubDeviceId: "ab12-cd34", hubKey: nil,
+        label: "iPhone", dataDir: current.path))
+    let object = try JSONSerialization.jsonObject(with: config.jsonData())
+    let json = try XCTUnwrap(object as? [String: Any])
+    XCTAssertEqual(json["data_dir"] as? String, current.path)
+  }
+
+  func testSenderConfigRejectsAnInvalidFile() {
+    let dir = URL(fileURLWithPath: "/d")
+    XCTAssertThrowsError(try BroadcastConfig.forSender(fileData: Data("{}".utf8), dataDir: dir))
+    XCTAssertThrowsError(try BroadcastConfig.forSender(fileData: Data("not json".utf8), dataDir: dir))
+  }
+
   func testStatusRoundTrips() throws {
     let status = BroadcastStatus(state: "finished", message: "hub not paired", timestamp: 12.5)
     let data = try JSONEncoder().encode(status)

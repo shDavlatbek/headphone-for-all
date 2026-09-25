@@ -94,16 +94,24 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
   /// Reads the configuration written by the app and starts the Rust sender.
   private func startSender() -> Result<OpaquePointer, NSError> {
-    guard HfaShared.appGroupContainer() != nil else {
-      return .failure(
-        Self.error(
-          .noAppGroup,
-          "Headphone for All cannot reach its shared storage (App Group \(HfaShared.appGroupId)). Reinstall the app."
-        ))
+    let noAppGroup = Self.error(
+      .noAppGroup,
+      "Headphone for All cannot reach its shared storage (App Group \(HfaShared.appGroupId)). Reinstall the app."
+    )
+    // The data directory is resolved here, never taken from the file: the container path the
+    // app recorded can be stale after a restore or a device migration.
+    let dataDir: URL
+    do {
+      guard let dir = try HfaShared.sharedDataDir() else { return .failure(noAppGroup) }
+      dataDir = dir
+    } catch {
+      Self.log.error("cannot create the data directory: \(error.localizedDescription, privacy: .public)")
+      return .failure(noAppGroup)
     }
     guard let url = HfaShared.containerFile(HfaShared.broadcastConfigFileName),
       let data = try? Data(contentsOf: url),
-      let json = String(data: data, encoding: .utf8)
+      let config = try? BroadcastConfig.forSender(fileData: data, dataDir: dataDir),
+      let configJSON = try? config.jsonData()
     else {
       return .failure(
         Self.error(
@@ -111,14 +119,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
           "Open Headphone for All, pair this iPhone with your headphone hub and choose it as the target, then start the broadcast again."
         ))
     }
-    // The file already uses the keys of the C ABI configuration (see BroadcastConfig).
+    let json = String(decoding: configJSON, as: UTF8.self)
     let handle = json.withCString { hfa_ext_sender_start($0) }
     guard let handle else {
+      // Only local problems fail here (config, pairing, storage): the connection to the hub is
+      // made in the background, so an unreachable hub does not stop the broadcast.
       let reason = Self.lastRustError() ?? "unknown error"
       return .failure(
         Self.error(
           .senderFailed,
-          "Could not start sending audio to the headphone hub: \(reason). Check that the hub is running and paired in the Headphone for All app."
+          "Could not start sending audio to the headphone hub: \(reason). Pair this iPhone with the hub again in the Headphone for All app."
         ))
     }
     return .success(handle)
