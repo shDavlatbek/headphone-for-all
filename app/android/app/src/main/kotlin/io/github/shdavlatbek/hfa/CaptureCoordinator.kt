@@ -27,6 +27,9 @@ object CaptureCoordinator {
     /** How long the service may take to report that it records. */
     private const val START_TIMEOUT_MS = 10_000L
 
+    /** `PlatformException` code of a `startSystemCapture` refused for lack of RECORD_AUDIO. */
+    private const val ERROR_PERMISSION_DENIED = "permissionDenied"
+
     /** The activity that shows the dialogs. */
     interface Host {
         /** Asks for the capture permissions; answers with [onPermissions]. */
@@ -117,11 +120,20 @@ object CaptureCoordinator {
                     pendingResult?.success(effect.started)
                     pendingResult = null
                 }
+                CaptureEffect.ReplyPermissionDenied -> {
+                    pendingResult?.error(
+                        ERROR_PERMISSION_DENIED,
+                        context.getString(R.string.capture_error_permission),
+                        null,
+                    )
+                    pendingResult = null
+                }
                 is CaptureEffect.Emit -> PlatformEvents.emit(effect.event)
                 CaptureEffect.RequestPermissions -> {
                     val current = host
                     if (current == null) {
-                        execute(context, machine.onPermissions(false))
+                        // No activity to ask: the start cannot complete (not a refusal).
+                        execute(context, machine.onHostLost())
                     } else {
                         current.requestCapturePermissions()
                     }

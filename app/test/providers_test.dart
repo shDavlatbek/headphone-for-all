@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
@@ -582,6 +583,22 @@ void main() {
       });
     });
 
+    test('Android: a refused recording permission stops the sender', () async {
+      final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+      final native = _PermissionDeniedNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.discovered(trustedHub));
+      await sender.start();
+      await settle();
+      final state = c.read(senderControllerProvider);
+      expect(fake.calls, containsAllInOrder(['senderStart', 'senderStop']));
+      expect(state.isLive, isFalse);
+      expect(state.busy, isFalse);
+      expect(state.error, contains('audio recording permission'));
+    });
+
     test(
       'iOS: pairs through the app, then writes the broadcast config',
       () async {
@@ -851,6 +868,24 @@ class _ConsentNativeChannel extends RecordingNativeChannel {
   }) {
     calls.add('startSystemCapture');
     return consent.future;
+  }
+}
+
+/// A native channel whose RECORD_AUDIO permission is refused.
+class _PermissionDeniedNativeChannel extends RecordingNativeChannel {
+  @override
+  Future<bool> startSystemCapture({
+    required int feedId,
+    required int sampleRate,
+    required int channels,
+  }) async {
+    calls.add('startSystemCapture');
+    throw PlatformException(
+      code: 'permissionDenied',
+      message:
+          'Capturing this device\'s audio needs the audio recording '
+          'permission.',
+    );
   }
 }
 

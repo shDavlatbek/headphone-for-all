@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/hfa_api.dart';
@@ -267,11 +268,18 @@ class SenderController extends Notifier<SenderState> {
     );
     // The consent dialog can stay open for a while; the sender may fail
     // meanwhile (wrong PIN, pairing required, key mismatch).
-    final started = await _native.startSystemCapture(
-      feedId: androidFeedId,
-      sampleRate: nativeSampleRate,
-      channels: nativeChannels,
-    );
+    final bool started;
+    try {
+      started = await _native.startSystemCapture(
+        feedId: androidFeedId,
+        sampleRate: nativeSampleRate,
+        channels: nativeChannels,
+      );
+    } on PlatformException catch (e) {
+      // `permissionDenied` (RECORD_AUDIO refused) or `invalidArgument`.
+      await _quietly(_api.senderStop);
+      throw HfaApiException(e.message ?? 'Audio capture failed (${e.code}).');
+    }
     if (!started) {
       await _quietly(_api.senderStop);
       throw const HfaApiException(

@@ -41,9 +41,9 @@ class CaptureStateMachineTest {
     }
 
     @Test
-    fun deniedPermissionRepliesFalse() {
+    fun deniedPermissionRepliesPermissionDenied() {
         machine.start(request)
-        assertEquals(listOf(Reply(false)), machine.onPermissions(false))
+        assertEquals(listOf(CaptureEffect.ReplyPermissionDenied), machine.onPermissions(false))
         assertEquals(CapturePhase.IDLE, machine.phase)
     }
 

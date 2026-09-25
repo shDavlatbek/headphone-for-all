@@ -2,16 +2,20 @@ package io.github.shdavlatbek.hfa
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.result.contract.ActivityResultContracts
 import io.flutter.embedding.android.FlutterFragmentActivity
@@ -36,11 +40,33 @@ class MainActivity : FlutterFragmentActivity(), CaptureCoordinator.Host {
     /** Multicast lock for discovery (`acquireMulticastLock`); the hub service has its own. */
     private var multicastLock: WifiManager.MulticastLock? = null
 
+    /**
+     * `shouldShowRequestPermissionRationale(RECORD_AUDIO)` just before the capture permission
+     * request, or `null` when RECORD_AUDIO was not part of it.
+     */
+    private var recordRationaleBefore: Boolean? = null
+
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
             val granted = grants[Manifest.permission.RECORD_AUDIO] ?: hasPermission(Manifest.permission.RECORD_AUDIO)
+            val rationaleBefore = recordRationaleBefore
+            recordRationaleBefore = null
             if (!granted) Log.w(TAG, "RECORD_AUDIO denied: system audio cannot be captured")
             CaptureCoordinator.onPermissions(this, granted)
+            // Neither before nor after the request would Android explain the permission: it is
+            // denied for good and no dialog was shown, so only App info can grant it.
+            if (!granted &&
+                rationaleBefore == false &&
+                !shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)
+            ) {
+                offerAppSettings()
+            }
+        }
+
+    /** POST_NOTIFICATIONS for the hub's notification; the hub runs whatever the answer. */
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) Log.i(TAG, "POST_NOTIFICATIONS denied: the hub notification stays hidden")
         }
 
     private val consentLauncher =
@@ -81,6 +107,7 @@ class MainActivity : FlutterFragmentActivity(), CaptureCoordinator.Host {
                 result.success(null)
             }
             "startHubService" -> try {
+                requestNotificationPermission()
                 HubService.start(this)
                 result.success(null)
             } catch (e: RuntimeException) {
@@ -141,6 +168,11 @@ class MainActivity : FlutterFragmentActivity(), CaptureCoordinator.Host {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) add(Manifest.permission.POST_NOTIFICATIONS)
         }
         val missing = wanted.filterNot(::hasPermission)
+        recordRationaleBefore = if (Manifest.permission.RECORD_AUDIO in missing) {
+            shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)
+        } else {
+            null
+        }
         if (missing.isEmpty()) {
             // Answer asynchronously, like the dialog would (no re-entrant state machine calls).
             mainHandler.post { CaptureCoordinator.onPermissions(this, true) }
@@ -166,6 +198,47 @@ class MainActivity : FlutterFragmentActivity(), CaptureCoordinator.Host {
         } catch (e: ActivityNotFoundException) {
             Log.e(TAG, "no MediaProjection consent activity", e)
             mainHandler.post { CaptureCoordinator.onConsent(this, Activity.RESULT_CANCELED, null) }
+        }
+    }
+
+    /**
+     * Android 13+: asks for POST_NOTIFICATIONS without waiting for the answer, so a phone used
+     * only as a hub shows the hub's ongoing notification (with a way back into the app).
+     */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (hasPermission(Manifest.permission.POST_NOTIFICATIONS)) return
+        try {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "notification permission not requested", e)
+        }
+    }
+
+    /** RECORD_AUDIO is denied for good: offers to open this app's App info page. */
+    private fun offerAppSettings() {
+        if (isFinishing || isDestroyed) return
+        val night = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
+            Configuration.UI_MODE_NIGHT_YES
+        val theme = if (night) {
+            android.R.style.Theme_DeviceDefault_Dialog_Alert
+        } else {
+            android.R.style.Theme_DeviceDefault_Light_Dialog_Alert
+        }
+        AlertDialog.Builder(this, theme)
+            .setTitle(R.string.permission_record_title)
+            .setMessage(R.string.permission_record_settings)
+            .setPositiveButton(R.string.action_open_settings) { _, _ -> openAppSettings() }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun openAppSettings() {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null))
+        try {
+            startActivity(intent)
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "no App info screen", e)
         }
     }
 
