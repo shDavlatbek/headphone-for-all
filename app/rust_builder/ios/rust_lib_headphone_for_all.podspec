@@ -26,6 +26,14 @@ A new Flutter FFI plugin project.
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386' }
   s.swift_version = '5.0'
 
+  # headphone-for-all: a Rust staticlib does not carry the `#[link(kind = "framework")]`
+  # directives of its dependencies (objc2-* crates used by hfa-capture / cpal), and the
+  # -force_load below pulls in every object, so the pod must link these system frameworks
+  # (and libobjc) itself. Keep in sync with `native-static-libs` of hfa_ffi for this target
+  # (docs/CONTRACTS.md §8.5).
+  s.frameworks = ['CoreAudio', 'AudioToolbox', 'AVFAudio', 'CoreFoundation', 'Foundation']
+  s.libraries = ['objc']
+
   s.script_phase = {
     :name => 'Build Rust library',
     # First argument is the relative path to the Rust crate (core/hfa-ffi), second is the name

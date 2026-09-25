@@ -163,6 +163,13 @@ class AndroidEnvironment {
       '_CARGOKIT_NDK_LINK_TARGET': targetArg,
       '_CARGOKIT_NDK_LINK_CLANG': ccValue,
       'CARGOKIT_TOOL_TEMP_DIR': toolTempDir,
+      // headphone-for-all: CMake-based build scripts (opusic-sys builds the bundled libopus)
+      // only use the NDK toolchain when ANDROID_NDK_HOME is set. Point them at the NDK
+      // Gradle chose (android.ndkVersion) and the app's minSdk, so that no manual export is
+      // needed and C code is built with the same NDK as the Rust code and the linker.
+      'ANDROID_NDK_HOME': ndkPath,
+      'ANDROID_NDK_ROOT': ndkPath,
+      'ANDROID_PLATFORM': 'android-$minSdkVersion',
     };
   }
 

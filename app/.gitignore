@@ -55,6 +55,8 @@ app.*.map.json
 /rust_builder/cargokit/build_tool/bin/*.dill
 # Gradle / Xcode build outputs not covered by the per-platform .gitignore files.
 /android/.gradle/
+/android/.kotlin/
+/rust_builder/android/.kotlin/
 /android/app/.cxx/
 /ios/build/
 /macos/build/
