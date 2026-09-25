@@ -22,7 +22,7 @@
 //! }
 //! message Hello { uint32 protocol_version = 1; string device_id = 2; string device_name = 3;
 //!                 string platform = 4; string app_version = 5; Role role = 6;
-//!                 bool pairing_required = 7; }
+//!                 bool pairing_required = 7; }  // sender: "I don't trust you"; hub: "pair now"
 //! message PairStart   { PairMethod method = 1; }
 //! message PairSpake   { bytes msg = 1; }
 //! message PairConfirm { bytes mac = 1; }
@@ -100,9 +100,14 @@ pub struct Hello {
     /// [`Role`] as `i32` (use [`Hello::role()`] / [`Hello::set_role`]).
     #[prost(enumeration = "Role", tag = "6")]
     pub role: i32,
-    /// Hub → sender only: `true` if the hub does not trust the sender's static key and the
-    /// sender must pair before anything else. Senders send `false`; hubs ignore it. A sender
-    /// that does not trust the hub pairs regardless of this flag (see `hfa-core` `control`).
+    /// Pairing request, meaningful in both directions:
+    /// - sender → hub: `true` iff the sender does **not** trust the hub's static key (it
+    ///   knows it after the Noise handshake), so the sender will pair next;
+    /// - hub → sender: `true` iff the hub does not trust the sender's key **or** the
+    ///   sender's `Hello` set this flag, so both sides agree whether pairing follows.
+    ///
+    /// A sender that does not trust the hub pairs regardless of the hub's flag. See the
+    /// `hfa-core` `control` module for the full procedure.
     #[prost(bool, tag = "7")]
     pub pairing_required: bool,
 }
