@@ -1032,6 +1032,70 @@ flutter build windows | macos | ios   # on the matching OS (CI)
 Clean up after local builds: `rm -rf app/build app/.dart_tool/flutter_build app/android/.gradle app/android/app/build`
 (cargokit puts its own Rust target directory under `app/build`).
 
+### 8.9 Refinements made by `feat/apple` (the code in `app/ios` and `app/macos` is authoritative)
+
+**Layout.** The broadcast upload extension is the Xcode target **`HfaBroadcast`** with its sources in
+`app/ios/HfaBroadcast/` (ARCHITECTURE.md and the `c_api.rs` docs still say `app/ios/BroadcastExtension`).
+`app/ios/Shared/HfaShared.swift` is compiled into Runner and HfaBroadcast (App Group id, file names,
+notification names, JSON types). The Xcode projects are changed only by committed, idempotent Ruby
+scripts (xcodeproj gem): `app/ios/scripts/add_broadcast_extension.rb` (+ `verify_xcodeproj.rb`) and
+`app/macos/scripts/configure_xcodeproj.rb`. See `app/ios/README.md`, `app/macos/README.md`.
+
+**App Group container** (`group.io.github.shdavlatbek.hfa`, entitlement of both iOS targets):
+- `<container>/hfa/` — the Rust `data_dir` (`getDataDir` on iOS; the app's `init_app` and the extension use
+  it, so the extension sees the app's identity, settings and trusted hubs).
+- `<container>/broadcast_config.json` — written by `writeBroadcastConfig`; **its content is exactly the C ABI
+  configuration** (`hub_host`, `hub_port`, `hub_device_id`, `hub_key`, `label`, `data_dir`; missing
+  optionals are `null`), passed unchanged to `hfa_ext_sender_start`.
+- `<container>/broadcast_status.json` — `{state: "started"|"finished", message?: String, timestamp: seconds}`,
+  written by the extension before each Darwin notification (Darwin notifications carry no payload).
+
+**Channel details (iOS).**
+- `getDataDir`: `<container>/hfa` (created); without the App Group (unsigned build) Application Support
+  `/hfa` with a logged warning (the extension then cannot share the pairing). Error `DATA_DIR`.
+- `writeBroadcastConfig {hubHost, hubPort, hubDeviceId?, hubKey?, label}`: trims host/id/key, empty id/key
+  → `null`; `hubPort` must be 0..=65535 and `hubHost` or `hubDeviceId` non-empty (`BAD_ARGS`); `NO_APP_GROUP`
+  without the container; `WRITE_FAILED` on I/O errors. Returns `null`.
+- `startHubService` / `stopHubService`: `AVAudioSession` `.playback` + `.mixWithOthers`, `setActive(true)` /
+  `setActive(false, .notifyOthersOnDeactivation)`; failures → `FlutterError("AUDIO_SESSION")`.
+- `stopSystemCapture`, `acquireMulticastLock`, `releaseMulticastLock`: no-op (`null`).
+- Events: the Darwin notifications `io.github.shdavlatbek.hfa.broadcast.started` / `.finished` become
+  `{type: "broadcastStarted"}` / `{type: "broadcastFinished", message?}`; `message` (from
+  `broadcast_status.json`) is set when the broadcast could not start (the same text iOS shows the user).
+- `hfa/broadcast_picker` ignores creation parameters (it accepts the standard codec Dart sends).
+
+**Channel details (macOS).** Only the method channel is registered (no event channel). `getDataDir` →
+`~/Library/Application Support/<bundle id>/hfa` (= path_provider's `getApplicationSupportDirectory()` +
+`/hfa`, inside the sandbox container). `captureSupport` → `{supported: true, reason: "processTap"}` on macOS
+14.2+, else `{supported: false, reason: <explanation>}`. `startSystemCapture` → `false`; every other §8.3
+method → `null`.
+
+**Extension ↔ Rust.**
+- `HfaBroadcast`'s first build phase runs `app/ios/scripts/build_rust_ext.sh`: `cargo rustc -p hfa-ffi --lib
+  --crate-type staticlib --no-default-features --features bundled-opus` (C ABI only, no flutter_rust_bridge)
+  for `aarch64-apple-ios` / `aarch64-apple-ios-sim` / `x86_64-apple-ios` (from `PLATFORM_NAME`/`ARCHS`; Debug →
+  dev profile, else `--release`), own cargo target dir, output **`$BUILT_PRODUCTS_DIR/libhfa_ext.a`**, linked
+  with `-lhfa_ext -lobjc -liconv` and the frameworks AVFAudio, AudioToolbox, CoreAudio, CoreFoundation,
+  Foundation (= `native-static-libs` of that build) plus CoreMedia, ReplayKit. The app keeps linking its own
+  `libhfa_ffi.a` through cargokit; no binary links both.
+- `SampleHandler` serializes `hfa_ext_push_pcm` and `hfa_ext_sender_stop` with a lock (§8.5: a handle must not
+  be used concurrently). `.audioApp` buffers (Int16/Int32/Float32/Float64, either byte order, interleaved or
+  not) are converted to interleaved Float32 in reused storage and pushed with their own rate/channels; buffers
+  outside 1..=8 channels / 8000..=192000 Hz are dropped (logged once). `.video` / `.audioMic` are ignored.
+
+**macOS entitlements.** The App Sandbox stays **on** (Core Audio taps work sandboxed; insidegui/AudioCap
+ships sandboxed) with `network.client`, `network.server` and `device.audio-input`; Info.plist has
+`NSAudioCaptureUsageDescription`, a defensive `NSMicrophoneUsageDescription`, `NSLocalNetworkUsageDescription`
+and `NSBonjourServices = [_hfa._tcp]`. Fallback if manual tests show sandbox-only failures: set
+`app-sandbox` to `false` (Developer ID build). `MACOSX_DEPLOYMENT_TARGET` stays 12.0.
+
+**Open.** (1) The C ABI has no status query, so the app does not learn about a sender failure after the start
+(a future `hfa_ext_sender_status` would be read by the extension and forwarded via `broadcast_status.json`).
+(2) Rust logs of the extension are not forwarded to os_log (the console logger needs the `flutter` feature);
+the Swift side logs failures with `os.Logger`. (3) `mdns-sd` on iOS needs the restricted
+`com.apple.developer.networking.multicast` entitlement, so iOS should pass an explicit `hubHost` (and a
+native `NWBrowser` discovery remains to be done, ARCHITECTURE.md).
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |
