@@ -111,10 +111,16 @@ fn parse_identity_file(file: IdentityFile) -> Result<StaticKeypair> {
             "identity file holds an all-zero key".into(),
         ));
     }
-    Ok(StaticKeypair {
-        private: *private,
-        public,
-    })
+    // The Noise handshake uses the key derived from the private key, while the device id
+    // (and the hub's pairing URI / mDNS id) comes from the stored public key: a mismatch
+    // would load fine and then fail every connection with a confusing key error.
+    let keypair = StaticKeypair::from_private(&private)?;
+    if keypair.public != public {
+        return Err(CoreError::Config(
+            "identity file: public key does not match private key".into(),
+        ));
+    }
+    Ok(keypair)
 }
 
 /// Generates a keypair and stores it at `path` without ever overwriting an existing file.
@@ -417,9 +423,11 @@ mod tests {
                 public_key: public.into(),
             })
         };
-        let k = B64.encode([5u8; 32]);
-        assert!(ok(&k, &k).is_ok());
-        assert!(matches!(ok("!!", &k), Err(CoreError::Config(_))));
+        let kp = StaticKeypair::generate().expect("keypair");
+        let k = B64.encode(kp.private);
+        let public = B64.encode(kp.public);
+        assert_eq!(ok(&k, &public).expect("valid"), kp);
+        assert!(matches!(ok("!!", &public), Err(CoreError::Config(_))));
         assert!(matches!(
             ok(&B64.encode([5u8; 31]), &k),
             Err(CoreError::Config(_))
@@ -431,9 +439,29 @@ mod tests {
         let bad_version = parse_identity_file(IdentityFile {
             version: 9,
             private_key: k.clone(),
-            public_key: k,
+            public_key: public,
         });
         assert!(matches!(bad_version, Err(CoreError::Config(_))));
+        // A valid private key next to a public key that is not its own.
+        assert!(matches!(
+            ok(&k, &B64.encode([9u8; 32])),
+            Err(CoreError::Config(e)) if e.contains("does not match")
+        ));
+    }
+
+    #[test]
+    fn identity_with_a_mismatched_public_key_is_rejected_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let created = Identity::load_or_create(dir.path(), "Desk").expect("create");
+        let path = dir.path().join(IDENTITY_FILE);
+        let text = std::fs::read_to_string(&path).expect("read");
+        let edited = text.replace(&B64.encode(created.keypair.public), &B64.encode([9u8; 32]));
+        assert_ne!(text, edited);
+        std::fs::write(&path, edited).expect("write");
+        assert!(matches!(
+            Identity::load_or_create(dir.path(), "Desk"),
+            Err(CoreError::Config(_))
+        ));
     }
 
     #[test]
