@@ -1114,6 +1114,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "directories",
+ "fs4",
  "hfa-audio",
  "hfa-capture",
  "hfa-proto",

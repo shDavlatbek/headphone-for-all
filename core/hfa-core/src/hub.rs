@@ -68,7 +68,7 @@ use crate::config::{Settings, FRAME_MS_CHOICES};
 use crate::control::{ControlChannel, PeerInfo};
 use crate::discovery::Advertiser;
 use crate::hub_mixer::{Controls, MixStream, MixerCommand, StreamShared};
-use crate::identity::{Identity, TrustStore};
+use crate::identity::{Identity, PeerRole, TrustStore};
 use crate::media::MediaDemux;
 use crate::pairing::{PairingInfo, PairingManager, DEFAULT_PAIRING_TTL};
 use crate::sender::{load_identity, wait_stop};
@@ -836,6 +836,9 @@ async fn connection(
         });
     }
     let (tx, mut rx) = mpsc::unbounded_channel();
+    // A sender removed from the trusted devices (e.g. "forget" in the app) is disconnected
+    // right away, not only when it reconnects.
+    let mut trust_changes = shared.trust.subscribe();
     let mut owned: Vec<u32> = Vec::new();
     // A connection without a stream is closed after NO_STREAM_TIMEOUT (it only holds a slot).
     let mut no_stream_deadline = tokio::time::Instant::now() + NO_STREAM_TIMEOUT;
@@ -870,6 +873,12 @@ async fn connection(
             _ = tokio::time::sleep_until(no_stream_deadline), if owned.is_empty() => {
                 tracing::debug!(conn, "no stream on this connection; closing it");
                 break Some(format!("no stream started for {} s", NO_STREAM_TIMEOUT.as_secs()));
+            }
+            Ok(()) = trust_changes.changed() => {
+                if !shared.trust.is_trusted_as(&peer.public_key, PeerRole::Sender) {
+                    tracing::info!(conn, device = %peer.device_id, "sender is no longer trusted; disconnecting it");
+                    break Some("device removed from the trusted devices".to_owned());
+                }
             }
             _ = wait_stop(&mut shutdown) => break Some("hub stopping".to_owned()),
         }

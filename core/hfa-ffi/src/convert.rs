@@ -655,6 +655,7 @@ mod tests {
             name: "Phone".into(),
             public_key: [1; 32],
             paired_at: 1_700_000_000,
+            roles: hfa_core::PeerRoles::BOTH,
         };
         assert_eq!(
             trusted_peer_dto(&peer),

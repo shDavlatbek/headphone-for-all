@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hfa_core::control::{ControlChannel, PeerInfo};
 use hfa_core::pairing::{PairingManager, DEFAULT_PAIRING_TTL, MAX_FAILED_ATTEMPTS};
-use hfa_core::{CoreError, Identity, TrustStore, TrustedPeer};
+use hfa_core::{CoreError, Identity, PeerRole, TrustStore, TrustedPeer};
 use hfa_proto::control::{
     Body, Bye, Hello, PairMethod, Ping, Pong, Role, StreamAccepted, StreamStart,
 };
@@ -254,6 +254,45 @@ async fn expected_hub_key_mismatch_is_detected_first() {
                 .expect("full budget left"),
         );
     }
+}
+
+#[tokio::test]
+async fn pairing_trusts_only_one_direction() {
+    // A device that paired as a sender with a hub trusts that hub as a hub only: when it
+    // runs a hub itself, the other device must pair before it can stream into it.
+    let hub = hub().await;
+    let laptop = device("Laptop");
+    let info = hub.pairing.start(DEFAULT_PAIRING_TTL);
+    let (connected, accepted) = attempt(&hub, &laptop, Some(&info.pin)).await;
+    connected.expect("sender side");
+    accepted.expect("hub side");
+    let hub_key = hub.dev.identity.public_key();
+    assert!(laptop.trust.is_trusted_as(&hub_key, PeerRole::Hub));
+    assert!(!laptop.trust.is_trusted_as(&hub_key, PeerRole::Sender));
+    assert!(hub
+        .dev
+        .trust
+        .is_trusted_as(&laptop.identity.public_key(), PeerRole::Sender));
+
+    // Roles reversed: the laptop is the hub now, the former hub connects as a sender.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let laptop_pairing = PairingManager::new(laptop.identity.public_key(), "Laptop".into(), 1);
+    let identity = laptop.identity.clone();
+    let trust = laptop.trust.clone();
+    let laptop_hub = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        ControlChannel::accept(stream, &identity, &trust, &laptop_pairing).await
+    });
+    let reverse = connect(&hub.dev, addr, None, None).await;
+    assert!(
+        matches!(reverse, Err(CoreError::PairingRequired)),
+        "{reverse:?}"
+    );
+    assert!(matches!(
+        laptop_hub.await.expect("join"),
+        Err(CoreError::PairingRequired)
+    ));
 }
 
 #[tokio::test]

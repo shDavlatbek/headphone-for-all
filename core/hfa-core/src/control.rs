@@ -117,7 +117,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use zeroize::Zeroizing;
 
-use crate::identity::{Identity, TrustStore, TrustedPeer};
+use crate::identity::{Identity, PeerRole, TrustStore, TrustedPeer};
 use crate::pairing::{method_for_secret, PairingManager};
 use crate::{CoreError, Result};
 
@@ -563,8 +563,11 @@ async fn connect_procedure(
     )
     .await?;
     if paired {
-        if let Err(e) =
-            add_trusted(trust, TrustedPeer::new(peer.public_key, peer.name.clone())).await
+        if let Err(e) = add_trusted(
+            trust,
+            TrustedPeer::paired_as(peer.public_key, peer.name.clone(), PeerRole::Hub),
+        )
+        .await
         {
             let _ = within(after_save_deadline(deadline), addr, async {
                 ch.send_bye("the sender could not save the pairing").await;
@@ -605,8 +608,11 @@ async fn accept_procedure(
     )
     .await?;
     if let Some(key) = paired {
-        if let Err(e) =
-            add_trusted(trust, TrustedPeer::new(peer.public_key, peer.name.clone())).await
+        if let Err(e) = add_trusted(
+            trust,
+            TrustedPeer::paired_as(peer.public_key, peer.name.clone(), PeerRole::Sender),
+        )
+        .await
         {
             let _ = within(after_save_deadline(deadline), addr, async {
                 ch.send_pair_failure("the hub could not save the pairing")
@@ -658,7 +664,7 @@ async fn connect_inner(
     io.write_record(&hs.write_message(&[])?).await?;
     let mut ch = ControlChannel::new(io, hs.into_transport()?, peer_addr);
 
-    let trusts_hub = trust.is_trusted(&hub_key);
+    let trusts_hub = trust.is_trusted_as(&hub_key, PeerRole::Hub);
     ch.send(&hello(identity, Role::Sender, !trusts_hub)).await?;
     let hub_hello = match check_hello(ch.recv().await?, Role::Hub, &hub_key) {
         Ok(h) => h,
@@ -708,7 +714,8 @@ async fn accept_inner(
         }
     };
     let peer = peer_info(&sender_hello, sender_key, addr);
-    let needs_pairing = !trust.is_trusted(&sender_key) || sender_hello.pairing_required;
+    let needs_pairing =
+        !trust.is_trusted_as(&sender_key, PeerRole::Sender) || sender_hello.pairing_required;
     ch.send(&hello(identity, Role::Hub, needs_pairing)).await?;
 
     if needs_pairing {

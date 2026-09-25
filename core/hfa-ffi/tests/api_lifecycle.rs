@@ -48,6 +48,7 @@ fn api_lifecycle_with_real_engines() {
                 name: name.into(),
                 public_key: key,
                 paired_at: 1_700_000_000,
+                roles: hfa_core::PeerRoles::BOTH,
             })
             .expect("add peer");
     }

@@ -45,7 +45,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Settings;
 use crate::control::{ControlChannel, PeerInfo};
-use crate::identity::{Identity, TrustStore};
+use crate::identity::{Identity, PeerRole, TrustStore};
 use crate::media::MediaSender;
 use crate::sender_adapt::Adapter;
 use crate::sender_encoder::{EncoderCommand, EncoderEvent, EncoderParams, EncoderShared};
@@ -574,7 +574,9 @@ impl Control {
     async fn connect_phase(&mut self) -> Result<(ControlChannel, PeerInfo)> {
         let (addr, discovered_key, required_id) = self.resolve().await?;
         let key = self.pinned.or(self.expected_hub_key).or(discovered_key);
-        if self.secret.is_some() && !key.is_some_and(|k| self.trust.is_trusted(&k)) {
+        if self.secret.is_some()
+            && !key.is_some_and(|k| self.trust.is_trusted_as(&k, PeerRole::Hub))
+        {
             self.set_state(SenderState::Pairing);
         }
         let secret = self.secret.as_ref().map(|s| s.as_str().to_owned());

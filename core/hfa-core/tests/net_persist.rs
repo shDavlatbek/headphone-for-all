@@ -2,8 +2,8 @@
 
 use hfa_capture::OutputTarget;
 use hfa_core::config::{Settings, SETTINGS_FILE};
-use hfa_core::identity::{IDENTITY_FILE, TRUST_FILE};
-use hfa_core::{CoreError, Identity, TrustStore, TrustedPeer};
+use hfa_core::identity::{IDENTITY_FILE, TRUST_FILE, TRUST_RELOAD_INTERVAL};
+use hfa_core::{CoreError, Identity, PeerRole, PeerRoles, TrustStore, TrustedPeer};
 
 /// No temporary files are left behind by atomic writes.
 fn assert_no_temp_files(dir: &std::path::Path) {
@@ -229,4 +229,167 @@ fn trust_store_drops_tampered_entries_on_load() {
         TrustStore::load(tmp.path()),
         Err(CoreError::Config(_))
     ));
+}
+
+/// Writes `trusted.json` the way another process would (atomically, new inode).
+fn write_trust_file_externally(dir: &std::path::Path, peers: &[TrustedPeer]) {
+    let json = serde_json::json!({ "version": 1, "peers": peers });
+    let tmp = dir.join("external.json.part");
+    std::fs::write(&tmp, json.to_string()).expect("write");
+    std::fs::rename(&tmp, dir.join(TRUST_FILE)).expect("rename");
+}
+
+fn ids(store: &TrustStore) -> Vec<String> {
+    let mut ids: Vec<String> = store.peers().into_iter().map(|p| p.device_id).collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn separately_loaded_stores_of_one_dir_share_changes() {
+    // Regression: every `load` used to create an independent copy, so the hub engine, the
+    // sender engine and the app's settings overwrote each other's pairings, and a peer
+    // forgotten through one copy came back with the next pairing saved through another.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let hub_store = TrustStore::load(tmp.path()).expect("hub");
+    // Another spelling of the same directory still reaches the same store.
+    let sender_store = TrustStore::load(&tmp.path().join(".")).expect("sender");
+    let mut changes = hub_store.subscribe();
+
+    let x = TrustedPeer::paired_as([1; 32], "X", PeerRole::Hub);
+    let y = TrustedPeer::paired_as([2; 32], "Y", PeerRole::Sender);
+    sender_store.add(x.clone()).expect("sender pairs with X");
+    hub_store.add(y.clone()).expect("hub pairs with Y");
+    assert!(changes.has_changed().expect("sender alive"));
+    changes.mark_unchanged();
+    let on_disk = TrustStore::load(tmp.path()).expect("reload");
+    assert_eq!(ids(&on_disk), {
+        let mut v = vec![x.device_id.clone(), y.device_id.clone()];
+        v.sort();
+        v
+    });
+
+    // The app forgets Y through a third handle: the running engines see it at once.
+    let settings_store = TrustStore::load(tmp.path()).expect("settings");
+    assert!(settings_store.remove(&y.device_id).expect("forget"));
+    assert!(changes.has_changed().expect("sender alive"));
+    assert!(!hub_store.is_trusted(&[2; 32]));
+    assert!(!sender_store.is_trusted(&[2; 32]));
+
+    // The next pairing does not bring Y back.
+    hub_store
+        .add(TrustedPeer::paired_as([3; 32], "Z", PeerRole::Sender))
+        .expect("pair Z");
+    drop((hub_store, sender_store, settings_store, on_disk));
+    let fresh = TrustStore::load(tmp.path()).expect("fresh");
+    assert!(
+        fresh.get(&y.device_id).is_none(),
+        "forgotten peer resurrected"
+    );
+    assert_eq!(fresh.peers().len(), 2);
+}
+
+#[test]
+fn writers_merge_with_changes_made_by_another_process() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = TrustStore::load(tmp.path()).expect("load");
+    let a = TrustedPeer::new([1; 32], "A");
+    let b = TrustedPeer::new([2; 32], "B");
+    store.add(a.clone()).expect("add a");
+    store.add(b.clone()).expect("add b");
+
+    // Another process (e.g. `hfa trust remove`) removes A and adds C.
+    let c = TrustedPeer::new([3; 32], "C");
+    write_trust_file_externally(tmp.path(), &[b.clone(), c.clone()]);
+
+    // A save through the stale in-memory copy keeps both changes.
+    let d = TrustedPeer::new([4; 32], "D");
+    store.add(d.clone()).expect("add d");
+    let mut expected = vec![b.device_id, c.device_id, d.device_id];
+    expected.sort();
+    assert_eq!(ids(&store), expected);
+    drop(store);
+    assert_eq!(
+        ids(&TrustStore::load(tmp.path()).expect("reload")),
+        expected
+    );
+    assert!(tmp.path().join("trusted.json.lock").exists());
+    assert_no_temp_files(tmp.path());
+}
+
+#[test]
+fn readers_pick_up_changes_made_by_another_process() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = TrustStore::load(tmp.path()).expect("load");
+    let a = TrustedPeer::new([1; 32], "A");
+    store.add(a.clone()).expect("add");
+    let mut changes = store.subscribe();
+
+    write_trust_file_externally(tmp.path(), &[]);
+    // Explicitly...
+    assert!(store.reload().expect("reload"));
+    assert!(!store.is_trusted(&[1; 32]));
+    assert!(changes.has_changed().expect("alive"));
+    changes.mark_unchanged();
+    assert!(!store.reload().expect("unchanged"), "nothing new on disk");
+
+    // ...and lazily by a reader once the reload interval passed.
+    write_trust_file_externally(tmp.path(), std::slice::from_ref(&a));
+    std::thread::sleep(TRUST_RELOAD_INTERVAL + std::time::Duration::from_millis(100));
+    assert!(store.is_trusted(&[1; 32]));
+    assert!(changes.has_changed().expect("alive"));
+
+    // A file that cannot be parsed keeps the loaded list for readers, fails writers and
+    // is never overwritten.
+    std::fs::write(tmp.path().join(TRUST_FILE), "{ not json").expect("corrupt");
+    std::thread::sleep(TRUST_RELOAD_INTERVAL + std::time::Duration::from_millis(100));
+    assert!(store.is_trusted(&[1; 32]));
+    assert!(matches!(
+        store.add(TrustedPeer::new([2; 32], "B")),
+        Err(CoreError::Json(_))
+    ));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(TRUST_FILE)).expect("read"),
+        "{ not json"
+    );
+}
+
+#[test]
+fn trust_roles_are_directional_and_merge() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = TrustStore::load(tmp.path()).expect("load");
+    let key = [5u8; 32];
+    store
+        .add(TrustedPeer::paired_as(key, "Friend's hub", PeerRole::Hub))
+        .expect("paired as sender with a hub");
+    assert!(store.is_trusted_as(&key, PeerRole::Hub));
+    assert!(
+        !store.is_trusted_as(&key, PeerRole::Sender),
+        "a hub we sent to must not stream into our hub"
+    );
+    assert!(store.is_trusted(&key));
+
+    // Pairing in the other direction later adds the role.
+    store
+        .add(TrustedPeer::paired_as(key, "Friend", PeerRole::Sender))
+        .expect("paired as hub");
+    let peer = store.get(&hfa_proto::fingerprint(&key)).expect("peer");
+    assert_eq!(peer.roles, PeerRoles::BOTH);
+    assert_eq!(peer.name, "Friend");
+
+    // Entries written before roles existed are trusted in both directions.
+    let legacy = serde_json::json!({
+        "version": 1,
+        "peers": [{
+            "device_id": hfa_proto::fingerprint(&[6; 32]),
+            "name": "Old",
+            "public_key": serde_json::to_value(TrustedPeer::new([6; 32], "x")).expect("json")["public_key"],
+            "paired_at": 1
+        }]
+    });
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join(TRUST_FILE), legacy.to_string()).expect("write");
+    let old = TrustStore::load(dir.path()).expect("legacy");
+    assert!(old.is_trusted_as(&[6; 32], PeerRole::Hub));
+    assert!(old.is_trusted_as(&[6; 32], PeerRole::Sender));
 }
