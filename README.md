@@ -26,9 +26,24 @@ The headphone sees one normal source, so no firmware hacks and no special headph
 
 ## Status
 
-📐 **Planning.** Research and architecture are done. Implementation starts with milestone M0 (see the roadmap).
+🧪 **Implemented, not yet released.** The Rust engines (capture, Opus, encrypted UDP transport, jitter buffer,
+drift correction, mixer, pairing, mDNS), the `hfa` command-line tool and the Flutter app for all five platforms
+are in this repository, and CI builds every platform. What has been exercised where:
 
-## Planned platform support
+- **Rust core:** unit and loopback tests run in CI on Linux, Windows and macOS, plus a lossy end-to-end
+  `hfa selftest` and live PipeWire capture tests on Linux.
+- **Desktop app:** built in CI for Linux (with an integration test), Windows and macOS.
+- **Android:** the APK is built and the Kotlin unit tests run in CI; capture and hub playback need a real device
+  for a full check.
+- **macOS, iOS:** built in CI, with the XCTest unit tests on the iOS simulator and macOS. Core Audio process taps
+  (macOS) and the ReplayKit broadcast extension (iOS) still need a test on real devices: see the manual test steps
+  in [`app/macos/README.md`](app/macos/README.md) and [`app/ios/README.md`](app/ios/README.md).
+
+Known limitations: iOS cannot find hubs on the network by itself yet (no native Bonjour; add a hub by address or
+QR code), and DRM-protected audio is silent in an iOS broadcast. Building from source:
+[`docs/BUILDING.md`](docs/BUILDING.md); milestones: [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+## Platform support
 
 | Platform | Send its audio (sender) | Headphone connected here (hub) | How the audio is captured |
 |---|---|---|---|
