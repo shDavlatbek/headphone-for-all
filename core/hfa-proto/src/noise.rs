@@ -30,6 +30,10 @@ pub const NOISE_TAG_LEN: usize = 16;
 /// Largest plaintext one [`NoiseTransport`] message can carry.
 pub const NOISE_MAX_PLAINTEXT: usize = NOISE_MAX_MESSAGE - NOISE_TAG_LEN;
 
+// A control frame of the maximum size always fits into one transport message.
+const _: () =
+    assert!(crate::MAX_CONTROL_FRAME + crate::control::FRAME_PREFIX_LEN <= NOISE_MAX_PLAINTEXT);
+
 /// X25519 public keys of small order (and their encodings with the ignored top bit set).
 /// Their shared secret with any private key is all zeros. Same list as libsodium.
 const SMALL_ORDER_KEYS: [[u8; 32]; 7] = [
@@ -472,8 +476,6 @@ mod tests {
                 got: 15
             })
         );
-        // A control frame of the maximum size always fits into one transport message.
-        assert!(crate::MAX_CONTROL_FRAME + crate::control::FRAME_PREFIX_LEN <= NOISE_MAX_PLAINTEXT);
     }
 
     #[test]
