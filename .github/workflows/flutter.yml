@@ -5,7 +5,7 @@ name: Flutter
 
 on:
   push:
-    branches: [main, "claude/**", "feat/**"]
+    branches: [main, "claude/**"]
     paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
   pull_request:
     paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
