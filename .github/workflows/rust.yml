@@ -21,6 +21,11 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
+  # The Rust release every job lints and tests with. Pinned (not `stable`) so a new Rust release
+  # cannot turn CI red through new clippy lints under -D warnings; bumped on purpose together with
+  # the dev containers (docs/BUILDING.md "Rust toolchain", CONTRACTS.md section 12). Keep it equal to
+  # RUST_TOOLCHAIN in flutter.yml.
+  RUST_TOOLCHAIN: "1.94.1"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
@@ -36,8 +41,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --manifest-path "$MANIFEST" --all -- --check
 
@@ -58,8 +64,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ${{ env.LINUX_DEPS }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -80,8 +87,9 @@ jobs:
       ANDROID_PLATFORM: android-29
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: aarch64-linux-android
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -109,8 +117,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: aarch64-apple-ios
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -133,7 +142,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ${{ env.LINUX_DEPS }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core
@@ -154,7 +165,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ${{ env.LINUX_DEPS }} \
             pipewire pipewire-bin wireplumber dbus-daemon dbus-user-session
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core

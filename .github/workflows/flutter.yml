@@ -22,6 +22,11 @@ env:
   FLUTTER_VERSION: 3.47.5
   # Must equal the flutter_rust_bridge versions in core/Cargo.toml and app/pubspec.yaml.
   FRB_VERSION: 2.13.0
+  # The pinned Rust release of the codegen drift check (cargo-expand and rustfmt shape the
+  # generated code). Keep it equal to RUST_TOOLCHAIN in rust.yml. The build jobs install `stable`
+  # instead: cargokit always builds hfa-ffi with rustup's stable channel (it only knows
+  # stable/beta/nightly).
+  RUST_TOOLCHAIN: "1.94.1"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   # Rust build dependencies on Linux (hfa-capture: PipeWire via bindgen, cpal: ALSA; libopus: CMake).
@@ -59,7 +64,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }}
-      - uses: dtolnay/rust-toolchain@stable
+      # The codegen formats frb_generated.rs by running rustfmt; without it the output stays
+      # unformatted and the check below reports stale bindings. The minimal profile of this action
+      # does not include rustfmt, so it is requested explicitly.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core
@@ -74,6 +85,7 @@ jobs:
         with:
           tool: flutter_rust_bridge_codegen@${{ env.FRB_VERSION }},cargo-expand
       - run: flutter_rust_bridge_codegen --version
+      - run: rustfmt --version
       - name: flutter pub get
         working-directory: app
         run: flutter pub get
@@ -123,14 +135,55 @@ jobs:
           path: ${{ runner.temp }}/headphone_for_all-linux-x64.tar.gz
           if-no-files-found: error
           retention-days: 14
-      # Packaging (packaging/linux, feat/desktop) when it is present on this branch.
+
+  # The AppImage does not bundle glibc, so it runs only on distributions at least as new as the
+  # build machine: it is built on the oldest supported runner (Ubuntu 22.04, glibc 2.35,
+  # libpipewire 0.3.48), as packaging/README.md specifies. The job does nothing until
+  # packaging/linux (feat/desktop) is on the branch; `hashFiles` is not available in a job-level
+  # `if`, hence the check step.
+  linux-appimage:
+    name: Linux AppImage (Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - name: Is the packaging script present?
+        id: script
+        working-directory: .
+        run: |
+          if [ -f packaging/linux/build-appimage.sh ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::packaging/linux/build-appimage.sh is not on this branch; no AppImage."
+          fi
+      - name: Install Linux build dependencies
+        if: steps.script.outputs.present == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }} ${{ env.LINUX_FLUTTER_DEPS }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.script.outputs.present == 'true'
+      - uses: subosito/flutter-action@v2
+        if: steps.script.outputs.present == 'true'
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - name: Build (release)
+        if: steps.script.outputs.present == 'true'
+        run: |
+          flutter pub get
+          flutter build linux --release
       - name: AppImage
-        id: appimage
-        if: hashFiles('packaging/linux/build-appimage.sh') != ''
+        if: steps.script.outputs.present == 'true'
         working-directory: .
         run: bash packaging/linux/build-appimage.sh
       - uses: actions/upload-artifact@v7
-        if: steps.appimage.outcome == 'success'
+        if: steps.script.outputs.present == 'true'
         with:
           name: headphone_for_all-linux-appimage
           path: packaging/dist/*.AppImage
@@ -314,15 +367,24 @@ jobs:
       # runs the Runner scheme's RunnerTests (on iOS also the broadcast extension's PCM converter).
       - name: Build for the iOS simulator
         run: flutter build ios --simulator --debug
+      - name: Unit tests of the simulator picker
+        working-directory: .
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s .github/scripts
+      # CoreSimulator lists the runtimes of every installed Xcode, and runner images often carry
+      # runtimes newer than the selected Xcode's SDK supports. The script picks an iPhone of the
+      # newest iOS runtime whose version is <= the active iphonesimulator SDK (compared as version
+      # tuples).
       - name: iOS RunnerTests
         run: |
-          udid="$(xcrun simctl list devices available --json | python3 -c '
-          import json, sys
-          devices = json.load(sys.stdin)["devices"]
-          ids = [d["udid"] for runtime, ds in sorted(devices.items(), reverse=True)
-                 if ".iOS-" in runtime for d in ds if d["name"].startswith("iPhone")]
-          print(ids[0] if ids else "")')"
-          test -n "$udid" || { echo "::error::no available iPhone simulator"; exit 1; }
+          sdk="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          echo "iphonesimulator SDK $sdk"
+          xcrun simctl list runtimes available --json > "$RUNNER_TEMP/runtimes.json"
+          xcrun simctl list devices available --json > "$RUNNER_TEMP/devices.json"
+          udid="$(python3 "$GITHUB_WORKSPACE/.github/scripts/pick_ios_simulator.py" "$sdk" \
+            "$RUNNER_TEMP/runtimes.json" "$RUNNER_TEMP/devices.json")"
+          test -n "$udid" || { echo "::error::no available iPhone simulator for iOS SDK $sdk"; exit 1; }
           xcodebuild test -workspace ios/Runner.xcworkspace -scheme Runner \
             -destination "id=$udid" -quiet CODE_SIGNING_ALLOWED=NO
       - name: Build for macOS

@@ -25,13 +25,22 @@ this file is only about building.
 
 | Tool | Version | Where it is pinned |
 |---|---|---|
-| Rust | latest stable (MSRV **1.87**, needed by `rubato` 5) | `core/Cargo.toml` `rust-version` |
+| Rust | CI lints and tests with **1.94.1** (MSRV **1.87**, needed by `rubato` 5); any newer stable builds | `RUST_TOOLCHAIN` in `.github/workflows/rust.yml` and `flutter.yml`; MSRV: `core/Cargo.toml` `rust-version` |
 | Flutter / Dart | **3.47.5** stable (Dart 3.13) | `.github/workflows/flutter.yml` `FLUTTER_VERSION`; `app/pubspec.yaml` `sdk: ^3.13.4` |
 | flutter_rust_bridge | **2.13.0 exactly**: Rust crate, Dart package and `flutter_rust_bridge_codegen` | `core/Cargo.toml` (`=2.13.0`), `app/pubspec.yaml`, `flutter.yml` `FRB_VERSION` |
 | Android | compile SDK 36, build-tools 36, **NDK 29.0.14206865**, `minSdk` 29, JDK 17+ | `app/android/app/build.gradle.kts` |
 | Android Gradle Plugin / Gradle / Kotlin | 9.1.0 / 9.3.1 / 2.4.0 | `app/android/settings.gradle.kts`, `gradle-wrapper.properties` |
 | CMake | 3.16+ (builds the bundled libopus 1.6.1 on every target) | — |
 | Xcode | a current release (CI: the default Xcode of `macos-latest`) | — |
+
+**The Rust release of CI.** The Rust workflow and the codegen drift check use the pinned
+`RUST_TOOLCHAIN` (not `stable`), so a new Rust release cannot turn CI red through new clippy lints
+under `-D warnings` or a changed rustfmt output in the generated bindings. Run the local gates with the
+same release (`rustup toolchain install 1.94.1`, then `cargo +1.94.1 clippy …`, or make it your
+default). Bump it on purpose: install the new release locally, run the fmt/clippy/test gates (including
+the Windows cross-check) and `flutter_rust_bridge_codegen generate`, fix what they report, and change
+`RUST_TOOLCHAIN` in both workflows in the same commit. The Flutter build jobs install `stable`, because
+cargokit always builds `hfa-ffi` with rustup's `stable` channel; they do not lint.
 
 ## Prerequisites per OS
 
@@ -137,8 +146,8 @@ ANDROID_PLATFORM=android-29 CC_aarch64_linux_android=$TC/aarch64-linux-android29
 | Test | Needs | Command |
 |---|---|---|
 | `hfa-capture` `live_*` (Linux) | a PipeWire + WirePlumber session with a default sink named `hfa-test-sink` | see below |
-| `hfa-capture` macOS tap test | a Mac with the System Audio Recording permission for the terminal | `cargo test -p hfa-capture -- --ignored` |
-| `hfa-ffi` `api_lifecycle` | the real `hfa-core` engines | `cargo test -p hfa-ffi --test api_lifecycle -- --ignored` |
+| `hfa-capture` macOS tap test | a Mac with the System Audio Recording permission for the terminal | `cargo test --manifest-path core/Cargo.toml -p hfa-capture -- --ignored` |
+| `hfa-ffi` `api_lifecycle` | the real `hfa-core` engines | `cargo test --manifest-path core/Cargo.toml -p hfa-ffi --test api_lifecycle -- --ignored` |
 
 The PipeWire live tests in a headless machine or container (CI does exactly this):
 
@@ -159,8 +168,9 @@ cargo test --manifest-path core/Cargo.toml -p hfa-capture -- --ignored --test-th
 ## The `hfa` CLI and the selftest
 
 `hfa` (crate `hfa-cli`) runs a hub or a sender without the app: handy on a headless machine and for
-testing. Build it with `cargo build --release -p hfa-cli` (the binary is `core/target/release/hfa`, or
-`hfa.exe`) or run it through `cargo run --release -p hfa-cli -- <args>`.
+testing. Build it from the repository root with `cargo build --manifest-path core/Cargo.toml --release -p hfa-cli`
+(the binary is `core/target/release/hfa`, or `hfa.exe`) or run it through
+`cargo run --manifest-path core/Cargo.toml --release -p hfa-cli -- <args>`.
 
 ```sh
 hfa hub --pair                                   # run a hub, open a pairing window, print PIN + URI
@@ -345,7 +355,8 @@ version from `app/pubspec.yaml`.
 
 The Linux packages do not bundle GTK 3 or **libpipewire-0.3**: they come from the host, so that the
 library matches the running PipeWire daemon. glibc is not bundled either, so build the AppImage on the
-oldest distribution you want to support.
+oldest distribution you want to support. CI builds it on `ubuntu-22.04` (glibc 2.35, libpipewire
+0.3.48), so the AppImage runs on Ubuntu 22.04, Debian 12 and newer.
 
 ## Continuous integration
 
@@ -357,7 +368,7 @@ the same branch cancels the older run (except on `main`). Workflows have read-on
 
 | Job | Runner | What |
 |---|---|---|
-| rustfmt | ubuntu-latest | `cargo fmt --check` |
+| rustfmt | ubuntu-latest | `cargo fmt --check` (every Rust job uses `RUST_TOOLCHAIN`, see [Toolchain versions](#toolchain-versions)) |
 | clippy + test | ubuntu, windows, macos (-latest) | `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` (the first real run of the WASAPI and Core Audio backends' unit tests) |
 | Android | ubuntu-latest | `cargo ndk -t arm64-v8a clippy -p hfa-ffi` with the runner's newest NDK |
 | iOS | macos-latest | `cargo check` + `clippy -p hfa-ffi --target aarch64-apple-ios` (default features: bundled libopus + frb) |
@@ -370,12 +381,13 @@ the same branch cancels the older run (except on `main`). Workflows have read-on
 |---|---|---|---|
 | analyze + test | ubuntu-latest | `flutter analyze`, `flutter test` | — |
 | flutter_rust_bridge drift check | ubuntu-latest | `flutter_rust_bridge_codegen generate`, then `git status` must be clean | — |
-| Linux build | ubuntu-latest | integration test under `xvfb-run`, `flutter build linux --release`, AppImage if `packaging/linux/build-appimage.sh` exists | `headphone_for_all-linux-x64` (tar.gz), `…-linux-appimage` |
+| Linux build | ubuntu-latest | integration test under `xvfb-run`, `flutter build linux --release` | `headphone_for_all-linux-x64` (tar.gz) |
+| Linux AppImage | ubuntu-22.04 | its own `flutter build linux --release` on the oldest supported glibc, then `packaging/linux/build-appimage.sh`; does nothing until that script is on the branch | `headphone_for_all-linux-appimage` |
 | Android APK | ubuntu-latest | JDK 17, SDK 36 + NDK 29.0.14206865, `flutter build apk --release`, Kotlin unit tests + lint if present | `headphone_for_all-android-apk` |
 | Windows build | windows-latest | `flutter build windows --release`, Inno Setup installer if `packaging/windows/build-installer.ps1` exists | `headphone_for_all-windows-x64` (zip), `…-windows-x64-setup` |
 | macOS build | macos-latest | `flutter build macos --release`, DMG if `packaging/macos/build-dmg.sh` exists | `headphone_for_all-macos` (zipped .app), `…-macos-dmg` |
 | iOS build | macos-latest | `flutter build ios --release --no-codesign` (Runner + broadcast extension) | — |
-| XCTest | macos-latest | `RunnerTests` on an iOS simulator and on macOS | — |
+| XCTest | macos-latest | `RunnerTests` on an iOS simulator and on macOS; the simulator is an iPhone of the newest iOS runtime the selected Xcode's SDK supports (`.github/scripts/pick_ios_simulator.py`, unit-tested in the same job) | — |
 
 Artifacts are kept for 14 days (Actions → the run → Artifacts). The builds are unsigned (the APK is
 debug-signed): for testing, not for distribution.
@@ -401,6 +413,8 @@ python3 -c "import yaml,glob; [yaml.safe_load(open(f)) for f in glob.glob('.gith
 | `Neither the NDK or a standalone toolchain was found` (opusic-sys / CMake, Android) | Set `ANDROID_NDK_HOME` and `ANDROID_PLATFORM=android-29` for cargo / cargo-ndk builds. Flutter builds set them through cargokit; if one fails anyway, check that `ndk;29.0.14206865` is installed. |
 | `could not find Cargo.toml` from `cargo ndk --manifest-path …` | cargo-ndk reads the workspace from the current directory: `cd core` first. |
 | `Content hash on Dart side is different from Rust side` at start-up, or Dart compile errors in `lib/src/rust/` | The bindings are stale or were generated with another frb version: run `flutter_rust_bridge_codegen generate` (2.13.0) and rebuild. |
+| The codegen drift check reports stale bindings although nothing changed, or frb warns `Fail to format` | flutter_rust_bridge_codegen formats `frb_generated.rs` with `rustfmt` and only warns when that fails; install it (`rustup component add rustfmt`) and generate with the `RUST_TOOLCHAIN` release, since another rustfmt can format differently. |
+| CI clippy fails on code that passes locally | CI uses `RUST_TOOLCHAIN` (see [Toolchain versions](#toolchain-versions)); lint with the same release: `cargo +1.94.1 clippy …`. |
 | `cargo expand returned empty output` from the codegen | `hfa-ffi` does not compile (see the command output), or cargo-expand is missing / too new for the toolchain: `cargo install cargo-expand --locked`. |
 | Linux build: `Package 'x11'` / `'xi'` / `'gtk+-3.0'` not found | Install `libgtk-3-dev libx11-dev libxi-dev` (tray_manager's `cnativeapi` compiles native code on every platform). |
 | macOS / iOS link errors such as `Undefined symbols … _AudioObjectGetPropertyData` or `_objc_msgSend` | A framework is missing from the target that links the Rust library; compare with `--print native-static-libs` (see iOS notes). |
