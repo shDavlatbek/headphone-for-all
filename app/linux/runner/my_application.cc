@@ -7,9 +7,59 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
+namespace {
+
+// Title of the main window.
+constexpr char kWindowTitle[] = "Headphone for All";
+
+// Initial and minimum window sizes in logical pixels.
+constexpr int kInitialWidth = 960;
+constexpr int kInitialHeight = 680;
+constexpr int kMinimumWidth = 380;
+constexpr int kMinimumHeight = 520;
+
+// Window icon sizes installed into the bundle (data/icons/hicolor, see
+// linux/CMakeLists.txt and packaging/icon/generate.py).
+constexpr int kIconSizes[] = {16, 24, 32, 48, 64, 128, 256};
+
+// Sets the window icon. The icons of the relocatable bundle
+// (<exe dir>/data/icons/hicolor/<N>x<N>/apps/<app id>.png) are used when they
+// are present, so the icon also shows when the app is not installed; the
+// themed icon named after the application id (installed by the AppImage /
+// Flatpak / distribution package) is the fallback. On Wayland the compositor
+// takes the icon from the .desktop file matching the application id instead.
+void set_window_icon(GtkWindow* window) {
+  g_autofree gchar* exe = g_file_read_link("/proc/self/exe", nullptr);
+  GList* icons = nullptr;
+  if (exe != nullptr) {
+    g_autofree gchar* exe_dir = g_path_get_dirname(exe);
+    for (int size : kIconSizes) {
+      g_autofree gchar* size_dir = g_strdup_printf("%dx%d", size, size);
+      g_autofree gchar* path =
+          g_build_filename(exe_dir, "data", "icons", "hicolor", size_dir,
+                           "apps", APPLICATION_ID ".png", nullptr);
+      GdkPixbuf* pixbuf = gdk_pixbuf_new_from_file(path, nullptr);
+      if (pixbuf != nullptr) {
+        icons = g_list_append(icons, pixbuf);
+      }
+    }
+  }
+  if (icons != nullptr) {
+    gtk_window_set_icon_list(window, icons);
+    g_list_free_full(icons, g_object_unref);
+  } else {
+    gtk_window_set_icon_name(window, APPLICATION_ID);
+  }
+}
+
+}  // namespace
+
 struct _MyApplication {
   GtkApplication parent_instance;
   char** dart_entrypoint_arguments;
+  // The main window once it was created (owned by GTK; cleared when it is
+  // destroyed).
+  GtkWindow* window;
 };
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
@@ -20,10 +70,22 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
 }
 
 // Implements GApplication::activate.
+//
+// The application is unique per session (D-Bus name = application id): a
+// second launch only activates this primary instance and exits. The existing
+// window is then shown and raised, also when it was hidden to the tray.
 static void my_application_activate(GApplication* application) {
   MyApplication* self = MY_APPLICATION(application);
+  if (self->window != nullptr) {
+    gtk_window_present(self->window);
+    return;
+  }
+
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
+  self->window = window;
+  g_object_add_weak_pointer(G_OBJECT(window),
+                            reinterpret_cast<gpointer*>(&self->window));
 
   // Use a header bar when running in GNOME as this is the common style used
   // by applications and is the setup most users will be using (e.g. Ubuntu
@@ -45,14 +107,20 @@ static void my_application_activate(GApplication* application) {
   if (use_header_bar) {
     GtkHeaderBar* header_bar = GTK_HEADER_BAR(gtk_header_bar_new());
     gtk_widget_show(GTK_WIDGET(header_bar));
-    gtk_header_bar_set_title(header_bar, "Headphone for All");
+    gtk_header_bar_set_title(header_bar, kWindowTitle);
     gtk_header_bar_set_show_close_button(header_bar, TRUE);
     gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));
   } else {
-    gtk_window_set_title(window, "Headphone for All");
+    gtk_window_set_title(window, kWindowTitle);
   }
 
-  gtk_window_set_default_size(window, 1280, 720);
+  gtk_window_set_default_size(window, kInitialWidth, kInitialHeight);
+  GdkGeometry geometry = {};
+  geometry.min_width = kMinimumWidth;
+  geometry.min_height = kMinimumHeight;
+  gtk_window_set_geometry_hints(window, nullptr, &geometry, GDK_HINT_MIN_SIZE);
+  gtk_window_set_position(window, GTK_WIN_POS_CENTER);
+  set_window_icon(window);
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(
@@ -120,6 +188,11 @@ static void my_application_shutdown(GApplication* application) {
 // Implements GObject::dispose.
 static void my_application_dispose(GObject* object) {
   MyApplication* self = MY_APPLICATION(object);
+  if (self->window != nullptr) {
+    g_object_remove_weak_pointer(G_OBJECT(self->window),
+                                 reinterpret_cast<gpointer*>(&self->window));
+    self->window = nullptr;
+  }
   g_clear_pointer(&self->dart_entrypoint_arguments, g_strfreev);
   G_OBJECT_CLASS(my_application_parent_class)->dispose(object);
 }
@@ -142,7 +215,16 @@ MyApplication* my_application_new() {
   // the application to be recognized beyond its binary name.
   g_set_prgname(APPLICATION_ID);
 
+  // Unique (not G_APPLICATION_NON_UNIQUE like the Flutter template): one
+  // instance per session, a second launch raises the first one's window (see
+  // my_application_activate). Without a D-Bus session bus GLib falls back to
+  // a non-unique instance, so the app still starts.
+#if GLIB_CHECK_VERSION(2, 74, 0)
+  constexpr GApplicationFlags kFlags = G_APPLICATION_DEFAULT_FLAGS;
+#else
+  constexpr GApplicationFlags kFlags = G_APPLICATION_FLAGS_NONE;
+#endif
   return MY_APPLICATION(g_object_new(my_application_get_type(),
                                      "application-id", APPLICATION_ID, "flags",
-                                     G_APPLICATION_NON_UNIQUE, nullptr));
+                                     kFlags, nullptr));
 }
