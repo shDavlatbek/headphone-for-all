@@ -953,6 +953,12 @@ Modules:
   handshake limit compares `IpAddr::to_canonical()` (an IPv4 peer shows up as `::ffff:a.b.c.d`). **Sender:**
   `Direct` hosts and discovered hubs are tried address by address (IPv4 first) until one connects (only I/O and
   timeout errors move on to the next address).
+- **Loop protection (`control.rs`, ARCHITECTURE §1 "never to itself").** New **`CoreError::SelfConnection`** ("this is
+  this device's own hub; a device cannot stream to itself"): `ControlChannel::connect` fails with it right after
+  the Noise handshake reveals that the hub's static key is the device's own; `ControlChannel::accept` answers a
+  sender with the hub's own key with `Bye("own device")` and fails with it (nothing is paired, the pairing window
+  is not used). The sender treats it as final (`Failed`), like `KeyMismatch`. (The UI-side defaults — not
+  preselecting "everything this device plays" while this device's hub runs — belong to the app.)
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

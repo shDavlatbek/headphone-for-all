@@ -22,7 +22,8 @@
 //!   backoff ([`INITIAL_BACKOFF`] doubling up to [`MAX_BACKOFF`], back to the start after a
 //!   session that streamed) and starts a **new** stream (new `stream_id` and key). Pairing
 //!   and key errors ([`crate::CoreError::PairingRequired`], [`crate::CoreError::PairingFailed`],
-//!   [`crate::CoreError::KeyMismatch`]) are final: the state becomes [`SenderState::Failed`].
+//!   [`crate::CoreError::KeyMismatch`]) and [`crate::CoreError::SelfConnection`] (the hub is
+//!   this very device) are final: the state becomes [`SenderState::Failed`].
 //!   After the first connection the hub's key is pinned for every reconnect, and a pairing
 //!   secret is used at most once.
 //! - [`SenderHandle::stop`] sends `StreamStop` + `Bye`, stops the encoder thread and the
@@ -443,9 +444,10 @@ enum SessionEnd {
 
 fn end_with(error: CoreError, streamed: bool) -> SessionEnd {
     match error {
-        CoreError::PairingRequired | CoreError::PairingFailed(_) | CoreError::KeyMismatch(_) => {
-            SessionEnd::Fatal(error)
-        }
+        CoreError::PairingRequired
+        | CoreError::PairingFailed(_)
+        | CoreError::KeyMismatch(_)
+        | CoreError::SelfConnection => SessionEnd::Fatal(error),
         other => SessionEnd::Retry {
             reason: other.to_string(),
             streamed,
@@ -987,6 +989,10 @@ mod tests {
         ));
         assert!(matches!(
             end_with(CoreError::KeyMismatch("x".into()), false),
+            SessionEnd::Fatal(_)
+        ));
+        assert!(matches!(
+            end_with(CoreError::SelfConnection, false),
             SessionEnd::Fatal(_)
         ));
         for e in [

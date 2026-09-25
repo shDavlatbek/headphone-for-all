@@ -38,6 +38,10 @@ pub enum CoreError {
     /// The peer's static key does not match the pinned key (possible impersonation).
     #[error("peer key mismatch for {0}")]
     KeyMismatch(String),
+    /// The hub is this device itself (same identity): a device never streams to its own hub
+    /// (loop protection).
+    #[error("this is this device's own hub; a device cannot stream to itself")]
+    SelfConnection,
     /// The peer violated the control protocol (unexpected message, bad version...).
     #[error("protocol error: {0}")]
     Protocol(String),
