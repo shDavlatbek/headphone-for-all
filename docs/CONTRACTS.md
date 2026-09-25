@@ -972,6 +972,15 @@ Modules:
   `PairingRequired` (`Failed("pairing required")`). This resolves the §8.5 "Known limit" (a running engine's own
   copy) without a `TrustStore` field in `HubConfig`/`SenderConfig`; the app's hub restart after a forget (§8.7) is
   no longer needed, but harmless.
+- **Capture failure (cross-crate addition to `hfa-capture`, made by `fix/core-engine`).** New default method
+  **`CaptureSource::error(&self) -> Option<String>`** (default `None`; backward compatible): `Some(reason)` once a
+  started capture failed for good and delivers nothing any more. Implemented by WASAPI (the worker thread gave up:
+  repeated failures or a re-opened endpoint with another format), PipeWire (the capture thread ended: connection
+  lost) and external feeds (unregistered/replaced); the macOS tap has no such signal yet (`None`). The sender's
+  encoder thread polls it every 100 ms; on `Some` the control task sends `StreamStop`, closes the connection and the
+  sender ends in **`Failed("the audio capture stopped: <reason>")`** (also emitted as `SenderEvent::Error`), also
+  while it is waiting to reconnect — instead of treating a dead capture as silence (DTX keep-alives forever while
+  `Streaming`).
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

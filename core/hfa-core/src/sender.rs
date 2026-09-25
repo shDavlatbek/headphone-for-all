@@ -26,6 +26,10 @@
 //!   this very device) are final: the state becomes [`SenderState::Failed`].
 //!   After the first connection the hub's key is pinned for every reconnect, and a pairing
 //!   secret is used at most once.
+//! - **Capture failure:** a capture that fails for good ([`CaptureSource::error`], polled by
+//!   the encoder thread) stops the stream (`StreamStop`) and the sender with
+//!   [`SenderState::Failed`]`("the audio capture stopped: <reason>")`, instead of passing for
+//!   silence (DTX keep-alives while showing `Streaming`).
 //! - [`SenderHandle::stop`] sends `StreamStop` + `Bye`, stops the encoder thread and the
 //!   capture, and waits for everything.
 
@@ -442,6 +446,8 @@ enum SessionEnd {
     },
     /// Give up (pairing or key errors).
     Fatal(CoreError),
+    /// The capture failed for good: give up with this reason.
+    CaptureFailed(String),
 }
 
 fn end_with(error: CoreError, streamed: bool) -> SessionEnd {
@@ -499,6 +505,7 @@ impl Control {
                     self.emit(SenderEvent::Error(message.clone()));
                     break SenderState::Failed(message);
                 }
+                SessionEnd::CaptureFailed(reason) => break self.capture_failed(reason),
                 SessionEnd::Retry { reason, streamed } => {
                     self.command(EncoderCommand::Clear);
                     if streamed {
@@ -510,10 +517,8 @@ impl Control {
                         backoff.as_secs()
                     )));
                     self.set_state(SenderState::Reconnecting);
-                    let mut stop = self.stop.clone();
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
-                        _ = wait_stop(&mut stop) => break SenderState::Stopped,
+                    if let Some(end) = self.wait_backoff(backoff).await {
+                        break end;
                     }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
@@ -533,6 +538,39 @@ impl Control {
 
     fn emit(&self, event: SenderEvent) {
         let _ = self.events.send(event);
+    }
+
+    /// Waits `backoff` before a reconnect; returns the final state if the sender was stopped
+    /// or its capture failed for good meanwhile.
+    async fn wait_backoff(&mut self, backoff: Duration) -> Option<SenderState> {
+        let mut stop = self.stop.clone();
+        let sleep = tokio::time::sleep(backoff);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => return None,
+                _ = wait_stop(&mut stop) => return Some(SenderState::Stopped),
+                event = self.encoder_events.recv() => match event {
+                    Some(EncoderEvent::CaptureFailed(reason)) => {
+                        return Some(self.capture_failed(reason));
+                    }
+                    Some(EncoderEvent::Warning(message)) => {
+                        tracing::warn!(%message, "encoder");
+                        self.emit(SenderEvent::Error(message));
+                    }
+                    Some(EncoderEvent::StreamFailed { .. }) => {}
+                    None => return Some(SenderState::Failed(CoreError::Closed.to_string())),
+                },
+            }
+        }
+    }
+
+    /// The capture died: report it and give up (a final state).
+    fn capture_failed(&self, reason: String) -> SenderState {
+        let message = format!("the audio capture stopped: {reason}");
+        tracing::warn!(%message, "sender failed");
+        self.emit(SenderEvent::Error(message.clone()));
+        SenderState::Failed(message)
     }
 
     fn command(&self, command: EncoderCommand) {
@@ -821,6 +859,14 @@ impl Control {
                     Some(EncoderEvent::Warning(message)) => {
                         tracing::warn!(%message, "encoder");
                         self.emit(SenderEvent::Error(message));
+                    }
+                    Some(EncoderEvent::CaptureFailed(reason)) => {
+                        self.command(EncoderCommand::Clear);
+                        let stop = ControlMessage::new(Body::StreamStop(StreamStop { stream_id }));
+                        if ch.send(&stop).await.is_ok() {
+                            let _ = ch.close("capture failed").await;
+                        }
+                        return SessionEnd::CaptureFailed(reason);
                     }
                     None => {
                         let _ = ch.close("encoder stopped").await;
