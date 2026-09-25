@@ -92,6 +92,27 @@ void main() {
     });
   });
 
+  test('the multicast lock is reference counted', () async {
+    final methods = <String>[];
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      methods.add(call.method);
+      return null;
+    });
+    final native = NativeChannel(eventsSupported: false);
+    // Discovery and a sender that finds its hub by id overlap.
+    await native.acquireMulticastLock();
+    await native.acquireMulticastLock();
+    await native.releaseMulticastLock();
+    expect(methods, ['acquireMulticastLock']);
+    await native.releaseMulticastLock();
+    expect(methods, ['acquireMulticastLock', 'releaseMulticastLock']);
+    // An unbalanced release does not reach the platform.
+    await native.releaseMulticastLock();
+    expect(methods, hasLength(2));
+    await native.acquireMulticastLock();
+    expect(methods.last, 'acquireMulticastLock');
+  });
+
   test('platform errors are not swallowed', () async {
     messenger.setMockMethodCallHandler(channel, (call) async {
       throw PlatformException(code: 'denied', message: 'no');

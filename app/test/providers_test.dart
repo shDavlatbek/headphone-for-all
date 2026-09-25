@@ -18,6 +18,16 @@ import 'helpers.dart';
 /// Lets stream events and microtasks run.
 Future<void> settle() => Future<void>.delayed(Duration.zero);
 
+/// A live sender's status.
+const streamingStatus = SenderStatusDto(
+  state: 'streaming',
+  hubName: 'Desk PC',
+  bitrate: 128000,
+  lossPct: 0,
+  rttMs: 3,
+  levelDb: -20,
+);
+
 const trustedHub = HubInfoDto(
   deviceId: 'hub1-0000-0000-0001',
   name: 'Desk PC',
@@ -460,9 +470,11 @@ void main() {
         sender.selectTarget(HubTarget.manual(host: '10.0.0.9'));
         final starting = sender.start();
         await settle();
-        expect(native.calls, ['startSystemCapture']);
+        // The failure stops the capture at once, which cancels the start.
+        expect(native.calls, ['startSystemCapture', 'stopSystemCapture']);
         expect(fake.senderStatusNow.state, 'failed');
-        native.consent.complete(true);
+        // A cancelled start answers false (§8.8).
+        native.consent.complete(false);
         await starting;
         await settle();
 
@@ -492,6 +504,129 @@ void main() {
       expect(state.status.state, 'idle');
       expect(state.error, 'Capture stopped: revoked');
     });
+
+    test(
+      'Android: a sender adopted from an earlier UI stops its capture',
+      () async {
+        // The Flutter engine was recreated while the core kept sending.
+        final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+        fake.emitSenderStatus(streamingStatus);
+        final native = RecordingNativeChannel();
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        await settle();
+        expect(c.read(senderControllerProvider).isLive, isTrue);
+        expect(native.calls, isEmpty);
+
+        await c.read(senderControllerProvider.notifier).stop();
+        expect(native.calls, ['stopSystemCapture']);
+        expect(fake.calls.last, 'senderStop');
+      },
+    );
+
+    test('Android: an adopted sender honours capture events', () async {
+      final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+      fake.emitSenderStatus(streamingStatus);
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      await settle();
+      native.emit(
+        const NativeEvent(NativeEventType.captureStopped, message: 'revoked'),
+      );
+      await settle();
+      await settle();
+      final state = c.read(senderControllerProvider);
+      expect(fake.calls, contains('senderStop'));
+      expect(state.status.state, 'idle');
+      expect(state.error, 'Capture stopped: revoked');
+    });
+
+    test('Android: an adopted sender that fails stops its capture', () async {
+      final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+      fake.emitSenderStatus(streamingStatus);
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      await settle();
+      fake.emitSenderStatus(
+        const SenderStatusDto(
+          state: 'failed',
+          error: 'the hub went away',
+          bitrate: 0,
+          lossPct: 0,
+          rttMs: 0,
+          levelDb: -120,
+        ),
+      );
+      await settle();
+      expect(native.calls, ['stopSystemCapture']);
+    });
+
+    test(
+      'Android: a capture left behind without a sender is stopped at startup',
+      () async {
+        final fake = FakeHfaApi(platform: 'android');
+        final native = RecordingNativeChannel();
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        await settle();
+        expect(native.calls, ['stopSystemCapture']);
+      },
+    );
+
+    test('Android: the reason of a failed capture start is shown', () async {
+      final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+      final native = _ConsentNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.discovered(trustedHub));
+      final starting = sender.start();
+      await settle();
+      native.emit(
+        const NativeEvent(
+          NativeEventType.captureError,
+          message: 'ForegroundServiceStartNotAllowedException',
+        ),
+      );
+      await settle();
+      native.consent.complete(false);
+      await starting;
+      await settle();
+      final state = c.read(senderControllerProvider);
+      expect(
+        state.error,
+        'Audio capture could not start: '
+        'ForegroundServiceStartNotAllowedException',
+      );
+      expect(fake.calls, contains('senderStop'));
+      expect(state.isLive, isFalse);
+    });
+
+    test(
+      'Android: a sender that finds its hub by id holds the multicast lock',
+      () async {
+        final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+        final native = RecordingNativeChannel();
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        final sender = c.read(senderControllerProvider.notifier);
+        sender.selectTarget(HubTarget.paired(trustedPeer));
+        await sender.start();
+        await settle();
+        expect(c.read(senderControllerProvider).isLive, isTrue);
+        expect(native.calls, contains('acquireMulticastLock'));
+        expect(native.calls, isNot(contains('releaseMulticastLock')));
+
+        await sender.stop();
+        await settle();
+        expect(
+          native.calls.where((m) => m == 'releaseMulticastLock'),
+          hasLength(1),
+        );
+      },
+    );
 
     test(
       'iOS: pairs through the app, then writes the broadcast config',

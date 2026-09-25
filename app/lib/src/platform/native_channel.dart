@@ -199,10 +199,25 @@ class NativeChannel {
   Future<void> stopHubService() => _invoke<void>('stopHubService');
 
   /// Android: holds a `WifiManager.MulticastLock` (mDNS discovery).
-  Future<void> acquireMulticastLock() => _invoke<void>('acquireMulticastLock');
+  ///
+  /// The native lock is a single, non-reference-counted one (§8.8), and the
+  /// sender screen's discovery and a sender that finds its hub by id both
+  /// need it, so the references are counted here: only the first acquire
+  /// and the last release reach the platform.
+  Future<void> acquireMulticastLock() async {
+    if (_multicastHolders++ > 0) return;
+    await _invoke<void>('acquireMulticastLock');
+  }
 
-  /// Releases the multicast lock.
-  Future<void> releaseMulticastLock() => _invoke<void>('releaseMulticastLock');
+  /// Drops one reference taken with [acquireMulticastLock]; the last one
+  /// releases the lock.
+  Future<void> releaseMulticastLock() async {
+    if (_multicastHolders == 0) return;
+    if (--_multicastHolders > 0) return;
+    await _invoke<void>('releaseMulticastLock');
+  }
+
+  int _multicastHolders = 0;
 
   /// iOS: writes `broadcast_config.json` for the broadcast extension.
   Future<void> writeBroadcastConfig(BroadcastConfig config) =>
