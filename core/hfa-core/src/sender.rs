@@ -1,19 +1,72 @@
 //! The sender engine: capture → (convert to 48 kHz stereo) → Opus → seal → UDP, controlled
 //! over a [`crate::ControlChannel`].
 //!
-//! - Sends DTX keep-alives (`FLAG_DTX`, empty payload) during silence.
-//! - Adapts bitrate, FEC and expected loss from the hub's `Stats`.
-//! - Reconnects with exponential backoff (1 s .. 30 s) after connection loss.
-//! - The encoder runs on a dedicated soft-real-time thread; networking on tokio tasks.
+//! # Structure
+//!
+//! - **Encoder thread** (`hfa-encoder`, soft real-time, see `sender_encoder.rs`): owns the
+//!   capture for the whole life of the sender, converts to 48 kHz stereo, cuts exact
+//!   `frame_ms` frames, detects silence (DTX keep-alives), encodes with Opus, builds the
+//!   [media payload container](crate::payload) (with the previous frame as redundancy when
+//!   enabled) and sends through the current [`MediaSender`].
+//! - **Control task** (tokio): resolves the hub, connects ([`ControlChannel::connect`], with
+//!   pairing when needed), announces a stream (`StreamStart` with a fresh `stream_id` and
+//!   media key), waits for `StreamAccepted{udp_port}` ([`STREAM_ACCEPT_TIMEOUT`]), hands the
+//!   stream to the encoder thread, then pings the hub every [`PING_INTERVAL`] (RTT), adapts
+//!   to the hub's `Stats` (redundancy, expected loss, bitrate; see `sender_adapt.rs`),
+//!   reports the hub's `SetVolume`/`SetMute`/`SetPriority` as [`SenderEvent::HubControl`] and
+//!   publishes [`SenderStatus`] once per second.
+//! - **Reconnects:** any control or media failure (including a hub that stays silent for
+//!   [`HUB_TIMEOUT`] or says `Bye`) ends the session; the control task waits with exponential
+//!   backoff ([`INITIAL_BACKOFF`] doubling up to [`MAX_BACKOFF`], back to the start after a
+//!   session that streamed) and starts a **new** stream (new `stream_id` and key). Pairing
+//!   and key errors ([`crate::CoreError::PairingRequired`], [`crate::CoreError::PairingFailed`],
+//!   [`crate::CoreError::KeyMismatch`]) are final: the state becomes [`SenderState::Failed`].
+//!   After the first connection the hub's key is pinned for every reconnect, and a pairing
+//!   secret is used at most once.
+//! - [`SenderHandle::stop`] sends `StreamStop` + `Bye`, stops the encoder thread and the
+//!   capture, and waits for everything.
 
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use hfa_capture::CaptureSource;
+use hfa_audio::AudioFormat;
+use hfa_capture::{CaptureError, CaptureSource, CaptureTarget};
+use hfa_proto::control::{Body, Ping, Pong, StreamStart, StreamStop};
+use hfa_proto::ControlMessage;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::net::UdpSocket;
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::config::Settings;
-use crate::Result;
+use crate::control::{ControlChannel, PeerInfo};
+use crate::identity::{Identity, TrustStore};
+use crate::media::MediaSender;
+use crate::sender_adapt::Adapter;
+use crate::sender_encoder::{EncoderCommand, EncoderEvent, EncoderParams, EncoderShared};
+use crate::{CoreError, Result};
+
+/// First reconnect delay.
+pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Longest reconnect delay.
+pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How long the sender waits for `StreamAccepted` after `StreamStart`.
+pub const STREAM_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Interval between two `Ping`s (RTT measurement and liveness).
+pub const PING_INTERVAL: Duration = Duration::from_secs(1);
+/// A hub that sent nothing (no `Pong`, no `Stats`) for this long is considered gone.
+pub const HUB_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long a [`HubAddress::Discover`] lookup browses mDNS before giving up.
+pub const DISCOVER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Capacity of the capture ring, in ms of capture audio.
+const CAPTURE_RING_MS: usize = 500;
+/// Capacity of the event channel.
+const EVENT_CAPACITY: usize = 64;
+/// Interval of [`SenderEvent::Status`] events.
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How to reach the hub.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,30 +204,195 @@ pub enum SenderEvent {
     Error(String),
 }
 
+/// Opens a capture source for a sender, with the documented fallbacks, and returns it with an
+/// optional warning for the user.
+///
+/// On macOS, [`CaptureTarget::SystemMixExcludingSelf`] fails with
+/// [`CaptureError::Backend`] when this process has no Core Audio process object; the sender
+/// then captures the whole system mix instead ([`CaptureTarget::SystemMix`]) and returns a
+/// warning saying so (the caller shows it: the engine's events cannot be subscribed to before
+/// the engine exists). Every other target is opened as is.
+///
+/// # Errors
+/// [`CoreError::Capture`] from [`hfa_capture::open_capture`].
+pub fn open_capture(target: &CaptureTarget) -> Result<(Box<dyn CaptureSource>, Option<String>)> {
+    match hfa_capture::open_capture(target) {
+        Ok(capture) => Ok((capture, None)),
+        Err(CaptureError::Backend(reason))
+            if cfg!(target_os = "macos") && *target == CaptureTarget::SystemMixExcludingSelf =>
+        {
+            let capture = hfa_capture::open_capture(&CaptureTarget::SystemMix)?;
+            let warning = format!(
+                "cannot exclude this app from the capture ({reason}); capturing the whole system \
+                 mix instead"
+            );
+            tracing::warn!("{warning}");
+            Ok((capture, Some(warning)))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Entry point of the sender engine.
 pub struct SenderEngine;
 
 impl SenderEngine {
-    /// Starts the sender on the current tokio runtime. Loads the identity and trust store from
-    /// `settings.data_dir`. Returns immediately; connection progress is reported through
-    /// [`SenderHandle::status`] and [`SenderHandle::events`].
+    /// Starts the sender on the current tokio runtime: loads the identity and trust store from
+    /// `settings.data_dir`, starts the capture into a ring and the encoder thread, and spawns
+    /// the control task. Returns immediately (before the connection is up); connection
+    /// progress is reported through [`SenderHandle::status`] and [`SenderHandle::events`].
     ///
     /// # Errors
-    /// Invalid settings or identity/trust store I/O errors.
-    pub async fn start(_config: SenderConfig) -> Result<SenderHandle> {
-        todo!("feat/core-engine")
+    /// Invalid settings or hub address ([`CoreError::Config`]), identity/trust store I/O
+    /// errors, a capture that cannot start ([`CoreError::Capture`]) or thread creation
+    /// failures.
+    pub async fn start(config: SenderConfig) -> Result<SenderHandle> {
+        let SenderConfig {
+            hub,
+            settings,
+            capture,
+            label,
+            expected_hub_key,
+            pairing_secret,
+        } = config;
+        settings.validate()?;
+        match &hub {
+            HubAddress::Direct { host, port } if host.trim().is_empty() || *port == 0 => {
+                return Err(CoreError::Config(format!(
+                    "invalid hub address {host:?} port {port}"
+                )));
+            }
+            HubAddress::Discover { name_or_id } if name_or_id.trim().is_empty() => {
+                return Err(CoreError::Config("empty hub name".into()));
+            }
+            _ => {}
+        }
+        let format = capture.format();
+        if format.sample_rate == 0 || format.channels == 0 {
+            return Err(CoreError::Config(format!(
+                "capture format {} Hz / {} channels is invalid",
+                format.sample_rate, format.channels
+            )));
+        }
+        let (identity, trust) = load_identity(&settings).await?;
+
+        let ring_samples =
+            format.sample_rate as usize * usize::from(format.channels) * CAPTURE_RING_MS / 1000;
+        let (sink, source) = hfa_capture::pcm_ring_with_channels(ring_samples, format.channels);
+        let mut capture = capture;
+        let (capture, started) = tokio::task::spawn_blocking(move || {
+            let result = capture.start(sink);
+            (capture, result)
+        })
+        .await
+        .map_err(|e| CoreError::Io(format!("capture start task failed: {e}")))?;
+        started?;
+        tracing::info!(
+            capture = %capture.describe(),
+            rate = format.sample_rate,
+            channels = format.channels,
+            hub = ?hub,
+            "sender started"
+        );
+
+        let shared = Arc::new(EncoderShared::new());
+        let (encoder_tx, encoder_rx) = std::sync::mpsc::channel();
+        let (encoder_events_tx, encoder_events) = mpsc::unbounded_channel();
+        let thread = crate::sender_encoder::spawn(
+            capture,
+            source,
+            format,
+            EncoderParams {
+                frame_ms: settings.frame_ms,
+                fec: settings.fec,
+            },
+            Arc::clone(&shared),
+            encoder_rx,
+            encoder_events_tx,
+        )?;
+
+        let adapter = Adapter::new(settings.bitrate, if settings.fec { 5 } else { 0 });
+        let (status_tx, status_rx) = watch::channel(SenderStatus {
+            state: SenderState::Connecting,
+            bitrate: settings.bitrate,
+            ..SenderStatus::default()
+        });
+        let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let control = Control {
+            hub,
+            settings,
+            label,
+            identity,
+            trust,
+            expected_hub_key,
+            secret: pairing_secret.map(zeroize::Zeroizing::new),
+            pinned: None,
+            adapter,
+            status: status_tx,
+            events: events.clone(),
+            encoder: encoder_tx,
+            encoder_events,
+            shared: Arc::clone(&shared),
+            stop: stop_rx,
+            epoch: Instant::now(),
+            hub_control: (1.0, false, false),
+        };
+        let task = tokio::spawn(control.run(thread));
+        Ok(SenderHandle {
+            events,
+            status: status_rx,
+            shared,
+            stop: stop_tx,
+            task,
+        })
     }
 }
 
-/// Handle to a running sender. `Send + Sync`.
+/// Loads (or creates) the identity and the trust store off the async workers.
+pub(crate) async fn load_identity(settings: &Settings) -> Result<(Identity, TrustStore)> {
+    let dir = settings.data_dir.clone();
+    let name = settings.device_name.clone();
+    tokio::task::spawn_blocking(move || {
+        let identity = Identity::load_or_create(&dir, &name)?;
+        let trust = TrustStore::load(&dir)?;
+        Ok((identity, trust))
+    })
+    .await
+    .map_err(|e| CoreError::Io(format!("identity loading task failed: {e}")))?
+}
+
+/// Resolves once `stop` is `true` or its sender is gone.
+pub(crate) async fn wait_stop(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stopped| *stopped).await;
+}
+
+/// Handle to a running sender. `Send + Sync`. Dropping it stops the sender in the background.
 pub struct SenderHandle {
     events: broadcast::Sender<SenderEvent>,
+    status: watch::Receiver<SenderStatus>,
+    shared: Arc<EncoderShared>,
+    stop: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl fmt::Debug for SenderHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SenderHandle")
+            .field("status", &*self.status.borrow())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SenderHandle {
-    /// Current status snapshot.
+    /// Current status snapshot (the level is live).
     pub fn status(&self) -> SenderStatus {
-        todo!("feat/core-engine")
+        let mut status = self.status.borrow().clone();
+        status.level_db = match status.state {
+            SenderState::Stopped | SenderState::Failed(_) => hfa_audio::meter::SILENCE_DB,
+            _ => self.shared.level_db(),
+        };
+        status
     }
 
     /// Subscribes to events.
@@ -182,8 +400,559 @@ impl SenderHandle {
         self.events.subscribe()
     }
 
+    /// Audio datagrams and DTX keep-alives sent so far (all streams), for diagnostics.
+    pub fn packets_sent(&self) -> (u64, u64) {
+        (
+            self.shared.packets_sent.load(Ordering::Relaxed),
+            self.shared.keepalives_sent.load(Ordering::Relaxed),
+        )
+    }
+
     /// Stops streaming (sends `StreamStop` + `Bye`), stops the capture and waits for all tasks.
     pub async fn stop(self) {
-        todo!("feat/core-engine")
+        let _ = self.stop.send(true);
+        if let Err(e) = self.task.await {
+            tracing::warn!(error = %e, "sender control task failed");
+        }
+    }
+}
+
+/// How a session (one connection) ended.
+enum SessionEnd {
+    /// [`SenderHandle::stop`] was called.
+    Stopped,
+    /// Connection lost or refused; try again after a backoff.
+    Retry {
+        reason: String,
+        /// The session got as far as streaming (resets the backoff).
+        streamed: bool,
+    },
+    /// Give up (pairing or key errors).
+    Fatal(CoreError),
+}
+
+fn end_with(error: CoreError, streamed: bool) -> SessionEnd {
+    match error {
+        CoreError::PairingRequired | CoreError::PairingFailed(_) | CoreError::KeyMismatch(_) => {
+            SessionEnd::Fatal(error)
+        }
+        other => SessionEnd::Retry {
+            reason: other.to_string(),
+            streamed,
+        },
+    }
+}
+
+/// The control task's state.
+struct Control {
+    hub: HubAddress,
+    settings: Settings,
+    label: String,
+    identity: Identity,
+    trust: TrustStore,
+    expected_hub_key: Option<[u8; 32]>,
+    /// Pairing secret; cleared after a successful pairing (one-time secrets).
+    secret: Option<zeroize::Zeroizing<String>>,
+    /// The hub's key after the first connection (every reconnect must reach the same hub).
+    pinned: Option<[u8; 32]>,
+    adapter: Adapter,
+    status: watch::Sender<SenderStatus>,
+    events: broadcast::Sender<SenderEvent>,
+    encoder: std::sync::mpsc::Sender<EncoderCommand>,
+    encoder_events: mpsc::UnboundedReceiver<EncoderEvent>,
+    shared: Arc<EncoderShared>,
+    stop: watch::Receiver<bool>,
+    epoch: Instant,
+    /// Gain, mute and priority the hub applies to our stream.
+    hub_control: (f32, bool, bool),
+}
+
+impl Control {
+    async fn run(mut self, encoder_thread: std::thread::JoinHandle<()>) {
+        let mut backoff = INITIAL_BACKOFF;
+        let final_state = loop {
+            if *self.stop.borrow() {
+                break SenderState::Stopped;
+            }
+            self.set_state(SenderState::Connecting);
+            match self.session().await {
+                SessionEnd::Stopped => break SenderState::Stopped,
+                SessionEnd::Fatal(error) => {
+                    let message = error.to_string();
+                    tracing::warn!(error = %message, "sender failed");
+                    self.emit(SenderEvent::Error(message.clone()));
+                    break SenderState::Failed(message);
+                }
+                SessionEnd::Retry { reason, streamed } => {
+                    self.command(EncoderCommand::Clear);
+                    if streamed {
+                        backoff = INITIAL_BACKOFF;
+                    }
+                    tracing::info!(%reason, retry_in = ?backoff, "hub connection lost");
+                    self.emit(SenderEvent::Error(format!(
+                        "{reason}; reconnecting in {} s",
+                        backoff.as_secs()
+                    )));
+                    self.set_state(SenderState::Reconnecting);
+                    let mut stop = self.stop.clone();
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = wait_stop(&mut stop) => break SenderState::Stopped,
+                    }
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        };
+        self.command(EncoderCommand::Clear);
+        self.shared.stop.store(true, Ordering::Release);
+        if tokio::task::spawn_blocking(move || encoder_thread.join())
+            .await
+            .is_err()
+        {
+            tracing::warn!("encoder thread join failed");
+        }
+        self.set_state(final_state);
+        self.publish_status();
+    }
+
+    fn emit(&self, event: SenderEvent) {
+        let _ = self.events.send(event);
+    }
+
+    fn command(&self, command: EncoderCommand) {
+        // Fails only once the encoder thread is gone; nothing left to control then.
+        let _ = self.encoder.send(command);
+    }
+
+    fn set_state(&self, state: SenderState) {
+        let changed = self.status.send_if_modified(|s| {
+            if s.state == state {
+                false
+            } else {
+                s.state = state.clone();
+                true
+            }
+        });
+        if changed {
+            self.emit(SenderEvent::StateChanged(state));
+        }
+    }
+
+    fn publish_status(&self) {
+        let level = self.shared.level_db();
+        self.status.send_modify(|s| s.level_db = level);
+        let status = self.status.borrow().clone();
+        self.emit(SenderEvent::Status(status));
+    }
+
+    fn now_us(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// One connection: resolve, connect (pairing), stream until something ends it.
+    async fn session(&mut self) -> SessionEnd {
+        let mut stop = self.stop.clone();
+        let connected = tokio::select! {
+            r = self.connect_phase() => r,
+            _ = wait_stop(&mut stop) => return SessionEnd::Stopped,
+        };
+        match connected {
+            Ok((ch, peer)) => {
+                self.on_connected(&peer);
+                self.stream_phase(ch).await
+            }
+            Err(e) => end_with(e, false),
+        }
+    }
+
+    async fn connect_phase(&mut self) -> Result<(ControlChannel, PeerInfo)> {
+        let (addr, discovered_key, required_id) = self.resolve().await?;
+        let key = self.pinned.or(self.expected_hub_key).or(discovered_key);
+        if self.secret.is_some() && !key.is_some_and(|k| self.trust.is_trusted(&k)) {
+            self.set_state(SenderState::Pairing);
+        }
+        let secret = self.secret.as_ref().map(|s| s.as_str().to_owned());
+        let (ch, peer) =
+            ControlChannel::connect(addr, &self.identity, &self.trust, key, secret).await?;
+        if let Some(id) = required_id {
+            if peer.device_id != id {
+                let _ = ch.close("unexpected hub").await;
+                return Err(CoreError::KeyMismatch(peer.device_id));
+            }
+        }
+        Ok((ch, peer))
+    }
+
+    fn on_connected(&mut self, peer: &PeerInfo) {
+        tracing::info!(hub = %peer.device_id, name = %peer.name, addr = %peer.addr, "connected to hub");
+        self.pinned = Some(peer.public_key);
+        self.emit(SenderEvent::Connected {
+            device_id: peer.device_id.clone(),
+            name: peer.name.clone(),
+        });
+        if peer.newly_paired {
+            // One-time secret: never offer it again.
+            self.secret = None;
+            self.emit(SenderEvent::Paired {
+                device_id: peer.device_id.clone(),
+                name: peer.name.clone(),
+            });
+        }
+    }
+
+    /// Hub socket address, the hub key known from the trust store (discovery), and the device
+    /// id the hub must have (discovery by id / pinned hub).
+    async fn resolve(&self) -> Result<(SocketAddr, Option<[u8; 32]>, Option<String>)> {
+        match &self.hub {
+            HubAddress::Direct { host, port } => {
+                let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+                let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, *port))
+                    .await
+                    .map_err(|e| CoreError::HubNotFound(format!("{host}: {e}")))?
+                    .collect();
+                let addr = addrs
+                    .iter()
+                    .find(|a| a.is_ipv4())
+                    .or_else(|| addrs.first())
+                    .copied()
+                    .ok_or_else(|| CoreError::HubNotFound(host.to_owned()))?;
+                Ok((addr, None, None))
+            }
+            HubAddress::Discover { name_or_id } => {
+                let target = match self.pinned {
+                    Some(key) => hfa_proto::fingerprint(&key),
+                    None => name_or_id.trim().to_owned(),
+                };
+                discover(&target, &self.trust).await
+            }
+        }
+    }
+
+    /// `StreamStart` → `StreamAccepted`, then the media sender aimed at the hub's UDP port.
+    async fn start_stream(&mut self, ch: &mut ControlChannel) -> Result<MediaSender> {
+        let hub_ip = ch.peer_addr().ip();
+        let bind: SocketAddr = match hub_ip {
+            IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+            IpAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
+        let socket = Arc::new(UdpSocket::bind(bind).await?);
+        let stream_id = loop {
+            let id = rand::random::<u32>();
+            if id != 0 {
+                break id;
+            }
+        };
+        let mut media = MediaSender::new(socket, ch.peer_addr(), stream_id);
+        let bitrate = self.adapter.current().bitrate;
+        ch.send(&ControlMessage::new(Body::StreamStart(StreamStart {
+            stream_id,
+            sample_rate: AudioFormat::INTERNAL.sample_rate,
+            channels: u32::from(AudioFormat::INTERNAL.channels),
+            frame_ms: self.settings.frame_ms,
+            bitrate,
+            label: self.label.clone(),
+            media_key: media.key().as_bytes().to_vec(),
+        })))
+        .await?;
+        let deadline = tokio::time::Instant::now() + STREAM_ACCEPT_TIMEOUT;
+        loop {
+            let msg = tokio::time::timeout_at(deadline, ch.recv())
+                .await
+                .map_err(|_| CoreError::Timeout("waiting for StreamAccepted".into()))??;
+            match msg.body {
+                Some(Body::StreamAccepted(a)) if a.stream_id == stream_id => {
+                    let port = u16::try_from(a.udp_port)
+                        .ok()
+                        .filter(|p| *p != 0)
+                        .ok_or_else(|| {
+                            CoreError::Protocol(format!("invalid media port {}", a.udp_port))
+                        })?;
+                    media.set_dest(SocketAddr::new(hub_ip, port));
+                    return Ok(media);
+                }
+                Some(Body::StreamRejected(r)) if r.stream_id == stream_id => {
+                    return Err(CoreError::Rejected(r.reason));
+                }
+                Some(Body::Bye(b)) => {
+                    return Err(CoreError::Protocol(format!(
+                        "hub closed the connection: {}",
+                        b.reason
+                    )));
+                }
+                Some(Body::Ping(p)) => {
+                    ch.send(&ControlMessage::new(Body::Pong(Pong {
+                        nonce: p.nonce,
+                        t_us: p.t_us,
+                    })))
+                    .await?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn stream_phase(&mut self, mut ch: ControlChannel) -> SessionEnd {
+        let mut stop = self.stop.clone();
+        let started = tokio::select! {
+            r = self.start_stream(&mut ch) => Some(r),
+            _ = wait_stop(&mut stop) => None,
+        };
+        let media = match started {
+            None => {
+                let _ = ch.close("sender stopped").await;
+                return SessionEnd::Stopped;
+            }
+            Some(Err(e)) => {
+                let _ = ch.close(&e.to_string()).await;
+                return end_with(e, false);
+            }
+            Some(Ok(media)) => media,
+        };
+        let stream_id = media.stream_id();
+        tracing::info!(stream_id, dest = %media.dest(), "streaming");
+        self.command(EncoderCommand::Stream {
+            media,
+            adaptation: self.adapter.current(),
+        });
+        self.status.send_modify(|s| {
+            s.bitrate = self.adapter.current().bitrate;
+            s.loss_pct = 0.0;
+        });
+        self.set_state(SenderState::Streaming);
+        self.publish_status();
+
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut status_tick = tokio::time::interval(STATUS_INTERVAL);
+        status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_rx = Instant::now();
+        let mut nonce = 0u64;
+        loop {
+            tokio::select! {
+                msg = ch.recv() => {
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(e) => return end_with(e, true),
+                    };
+                    last_rx = Instant::now();
+                    if let Some(end) = self.on_message(&mut ch, msg, stream_id).await {
+                        self.command(EncoderCommand::Clear);
+                        let _ = ch.close("stream ended").await;
+                        return end;
+                    }
+                }
+                _ = ping.tick() => {
+                    if last_rx.elapsed() > HUB_TIMEOUT {
+                        self.command(EncoderCommand::Clear);
+                        let _ = ch.close("no answer").await;
+                        return SessionEnd::Retry {
+                            reason: format!("the hub did not answer for {} s", HUB_TIMEOUT.as_secs()),
+                            streamed: true,
+                        };
+                    }
+                    nonce = nonce.wrapping_add(1);
+                    let msg = ControlMessage::new(Body::Ping(Ping { nonce, t_us: self.now_us() }));
+                    if let Err(e) = ch.send(&msg).await {
+                        return end_with(e, true);
+                    }
+                }
+                _ = status_tick.tick() => self.publish_status(),
+                event = self.encoder_events.recv() => match event {
+                    Some(EncoderEvent::StreamFailed { stream_id: id, error }) if id == stream_id => {
+                        let _ = ch.close("media failed").await;
+                        return end_with(error, true);
+                    }
+                    Some(EncoderEvent::StreamFailed { .. }) => {}
+                    Some(EncoderEvent::Warning(message)) => {
+                        tracing::warn!(%message, "encoder");
+                        self.emit(SenderEvent::Error(message));
+                    }
+                    None => {
+                        let _ = ch.close("encoder stopped").await;
+                        return SessionEnd::Fatal(CoreError::Closed);
+                    }
+                },
+                _ = wait_stop(&mut stop) => {
+                    self.command(EncoderCommand::Clear);
+                    let bye = ControlMessage::new(Body::StreamStop(StreamStop { stream_id }));
+                    if ch.send(&bye).await.is_ok() {
+                        let _ = ch.close("sender stopped").await;
+                    }
+                    return SessionEnd::Stopped;
+                }
+            }
+        }
+    }
+
+    /// Handles one control message while streaming; `Some` ends the session.
+    async fn on_message(
+        &mut self,
+        ch: &mut ControlChannel,
+        msg: ControlMessage,
+        stream_id: u32,
+    ) -> Option<SessionEnd> {
+        match msg.body? {
+            Body::Pong(p) => {
+                let now = self.now_us();
+                if now >= p.t_us {
+                    let rtt_ms = (now - p.t_us) as f32 / 1000.0;
+                    self.status.send_modify(|s| s.rtt_ms = rtt_ms);
+                }
+            }
+            Body::Ping(p) => {
+                let pong = ControlMessage::new(Body::Pong(Pong {
+                    nonce: p.nonce,
+                    t_us: p.t_us,
+                }));
+                if let Err(e) = ch.send(&pong).await {
+                    return Some(end_with(e, true));
+                }
+            }
+            Body::Stats(s) if s.stream_id == stream_id => {
+                let before = self.adapter.current();
+                let after = self.adapter.on_report(s.loss_pct, Instant::now());
+                if after != before {
+                    tracing::debug!(
+                        ?before,
+                        ?after,
+                        loss = s.loss_pct,
+                        "adapting to reported loss"
+                    );
+                    self.command(EncoderCommand::Adapt(after));
+                }
+                self.status.send_modify(|st| {
+                    st.loss_pct = if s.loss_pct.is_finite() {
+                        s.loss_pct
+                    } else {
+                        0.0
+                    };
+                    st.bitrate = after.bitrate;
+                });
+            }
+            Body::SetVolume(v) if v.stream_id == stream_id => {
+                self.hub_control.0 = v.gain;
+                self.emit_hub_control();
+            }
+            Body::SetMute(m) if m.stream_id == stream_id => {
+                self.hub_control.1 = m.muted;
+                self.emit_hub_control();
+            }
+            Body::SetPriority(p) if p.stream_id == stream_id => {
+                self.hub_control.2 = p.priority;
+                self.emit_hub_control();
+            }
+            Body::StreamStop(s) if s.stream_id == stream_id => {
+                return Some(SessionEnd::Retry {
+                    reason: "the hub stopped the stream".into(),
+                    streamed: true,
+                });
+            }
+            Body::StreamRejected(r) if r.stream_id == stream_id => {
+                return Some(SessionEnd::Retry {
+                    reason: format!("the hub rejected the stream: {}", r.reason),
+                    streamed: true,
+                });
+            }
+            Body::Bye(b) => {
+                return Some(SessionEnd::Retry {
+                    reason: format!("the hub closed the connection: {}", b.reason),
+                    streamed: true,
+                });
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn emit_hub_control(&self) {
+        let (gain, muted, priority) = self.hub_control;
+        self.emit(SenderEvent::HubControl {
+            gain,
+            muted,
+            priority,
+        });
+    }
+}
+
+/// Finds a hub by device id or name over mDNS (see [`HubAddress::Discover`]).
+async fn discover(
+    target: &str,
+    trust: &TrustStore,
+) -> Result<(SocketAddr, Option<[u8; 32]>, Option<String>)> {
+    let mut browser = crate::discovery::browse()?;
+    let by_id = hfa_proto::is_fingerprint(target);
+    let wanted = target.to_lowercase();
+    let mut deadline = tokio::time::Instant::now() + DISCOVER_TIMEOUT;
+    let mut best: Option<crate::HubInfo> = None;
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, browser.recv()).await {
+        let crate::DiscoveryEvent::Found(info) = event else {
+            continue;
+        };
+        let matches = if by_id {
+            info.device_id == target
+        } else {
+            info.name.to_lowercase() == wanted
+        };
+        if !matches || info.addrs.is_empty() {
+            continue;
+        }
+        if by_id || trust.get(&info.device_id).is_some() {
+            best = Some(info);
+            break;
+        }
+        if best.is_none() {
+            // An untrusted name match: give a trusted hub of the same name a moment.
+            deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
+            best = Some(info);
+        }
+    }
+    let info = best.ok_or_else(|| CoreError::HubNotFound(target.to_owned()))?;
+    let ip = info.addrs[0];
+    let key = trust.get(&info.device_id).map(|p| p.public_key);
+    Ok((
+        SocketAddr::new(ip, info.port),
+        key,
+        by_id.then(|| target.to_owned()),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_and_key_errors_are_final_others_retry() {
+        assert!(matches!(
+            end_with(CoreError::PairingRequired, false),
+            SessionEnd::Fatal(_)
+        ));
+        assert!(matches!(
+            end_with(CoreError::PairingFailed("x".into()), true),
+            SessionEnd::Fatal(_)
+        ));
+        assert!(matches!(
+            end_with(CoreError::KeyMismatch("x".into()), false),
+            SessionEnd::Fatal(_)
+        ));
+        for e in [
+            CoreError::Closed,
+            CoreError::Io("refused".into()),
+            CoreError::Timeout("x".into()),
+            CoreError::Rejected("full".into()),
+            CoreError::HubNotFound("x".into()),
+        ] {
+            assert!(matches!(
+                end_with(e, true),
+                SessionEnd::Retry { streamed: true, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn open_capture_passes_non_system_targets_through() {
+        let (capture, warning) =
+            open_capture(&CaptureTarget::Tone { freq_hz: 440.0 }).expect("tone");
+        assert!(warning.is_none());
+        assert_eq!(capture.format(), AudioFormat::INTERNAL);
     }
 }

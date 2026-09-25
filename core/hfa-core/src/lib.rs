@@ -8,8 +8,10 @@
 //! - [`control`]: the Noise-encrypted TCP [`ControlChannel`].
 //! - [`discovery`]: mDNS advertising and browsing of hubs.
 //! - [`media`]: encrypted UDP media send/receive helpers.
+//! - [`payload`]: the media payload container (Opus packet + optional redundant copy).
 //! - [`sender`]: [`SenderEngine`] (capture → Opus → UDP).
 //! - [`hub`]: [`HubEngine`] (UDP → jitter buffer → decode → drift → mix → output).
+//! - [`netsim`]: a lossy/jittery UDP relay for tests and `hfa selftest`.
 //!
 //! See `docs/CONTRACTS.md` §6 for the binding contract.
 
@@ -18,16 +20,21 @@ pub mod control;
 pub mod discovery;
 pub mod error;
 pub mod hub;
+mod hub_mixer;
 pub mod identity;
 pub mod media;
+pub mod netsim;
 pub mod pairing;
+pub mod payload;
 pub mod sender;
+mod sender_adapt;
+mod sender_encoder;
 
 pub use config::Settings;
 pub use control::{ControlChannel, PeerInfo};
 pub use discovery::{browse, Advertiser, Browser, DiscoveryEvent, HubInfo};
 pub use error::CoreError;
-pub use hub::{HubConfig, HubEngine, HubEvent, HubHandle, SourceInfo, StreamStats};
+pub use hub::{HubConfig, HubEngine, HubEvent, HubHandle, SourceInfo, StreamCounters, StreamStats};
 pub use identity::{Identity, TrustStore, TrustedPeer};
 pub use pairing::{PairingAttempt, PairingInfo, PairingManager};
 pub use sender::{
