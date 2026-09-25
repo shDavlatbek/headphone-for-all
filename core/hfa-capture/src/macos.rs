@@ -6,12 +6,16 @@
 //!    process objects (system mix; the list holds our own process when excluding self), or a
 //!    stereo mixdown of one process object (per-app capture). It gets a fresh UUID, is private
 //!    (only visible to this process) and uses [`MUTE_BEHAVIOR`].
-//! 2. `AudioHardwareCreateProcessTap` turns the description into a tap `AudioObjectID`; its
-//!    `kAudioTapPropertyFormat` gives the stream format (always float32 in practice).
+//! 2. `AudioHardwareCreateProcessTap` turns the description into a tap `AudioObjectID` (its
+//!    `kAudioTapPropertyFormat` is only logged for diagnostics).
 //! 3. A private aggregate device is created whose only member is the tap (`TapList` entry with
 //!    the tap's UUID and drift compensation, `TapAutoStart = 1`). Unlike AudioCap we do not add
 //!    the default output device as a sub-device: a headset with a microphone would otherwise
 //!    add its input streams to the aggregate's input buffers (same approach as `audiotee`).
+//!    The capture format (`format()`) is the virtual format of the aggregate's first *input
+//!    stream*, polled briefly until the new device exposes it: that is what the IOProc
+//!    receives, and it can differ from the tap format (drift compensation resamples the tap
+//!    to the aggregate's clock).
 //! 4. An IOProc registered on the aggregate device receives the tapped audio as its *input*
 //!    `AudioBufferList` and copies it into the [`PcmSink`] without allocating (interleaved or
 //!    non-interleaved float32).
@@ -27,8 +31,9 @@
 //!
 //! **Permission.** Taps need the "System Audio Recording" permission. The app bundle must carry
 //! `NSAudioCaptureUsageDescription` in its `Info.plist`; macOS prompts on first use. If the user
-//! denies it, some macOS versions fail the Core Audio calls (mapped to
-//! [`CaptureError::PermissionDenied`]) while others deliver silence.
+//! denies it, some macOS versions fail `AudioHardwareCreateProcessTap` (mapped to
+//! [`CaptureError::PermissionDenied`]) while others deliver silence. Elsewhere only `'!hog'`
+//! means a permission problem; `'nope'` from other calls is a [`CaptureError::Backend`].
 //!
 //! This file is owned by `feat/capture-macos`. It exposes exactly the four `pub(crate)`
 //! functions of the platform-module interface (see `docs/CONTRACTS.md` §5).
@@ -38,6 +43,7 @@ use std::mem::{self, size_of};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use hfa_audio::AudioFormat;
 use objc2::rc::Retained;
@@ -47,17 +53,18 @@ use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
     kAudioAggregateDeviceNameKey, kAudioAggregateDeviceTapAutoStartKey,
     kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioDevicePermissionsError,
-    kAudioHardwareBadObjectError, kAudioHardwareIllegalOperationError,
+    kAudioDevicePropertyStreams, kAudioHardwareIllegalOperationError,
     kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyTranslatePIDToProcessObject,
     kAudioHardwareUnsupportedOperationError, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioObjectUnknown,
-    kAudioProcessPropertyBundleID, kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID,
-    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyFormat,
-    AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID, AudioDeviceIOProc, AudioDeviceIOProcID,
-    AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
-    AudioHardwareDestroyAggregateDevice, AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectPropertySelector, CATapDescription, CATapMuteBehavior,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
+    kAudioObjectUnknown, kAudioProcessPropertyBundleID, kAudioProcessPropertyIsRunningOutput,
+    kAudioProcessPropertyPID, kAudioStreamPropertyVirtualFormat, kAudioSubTapDriftCompensationKey,
+    kAudioSubTapUIDKey, kAudioTapPropertyFormat, AudioDeviceCreateIOProcID,
+    AudioDeviceDestroyIOProcID, AudioDeviceIOProc, AudioDeviceIOProcID, AudioDeviceStart,
+    AudioDeviceStop, AudioHardwareCreateAggregateDevice, AudioHardwareDestroyAggregateDevice,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress, AudioObjectPropertyScope, AudioObjectPropertySelector,
+    CATapDescription, CATapMuteBehavior,
 };
 use objc2_core_audio_types::{
     kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
@@ -86,6 +93,18 @@ const SCRATCH_FRAMES: usize = 1024;
 
 /// Most channels handled for non-interleaved input (taps are stereo; this is headroom).
 const MAX_PLANAR_CHANNELS: usize = 16;
+
+/// How many times to look for the aggregate device's input stream format, and the pause between
+/// tries: a freshly created aggregate device can take a moment before its tap stream exists.
+const DEVICE_READY_ATTEMPTS: u32 = 20;
+/// Pause between two [`DEVICE_READY_ATTEMPTS`].
+const DEVICE_READY_DELAY: Duration = Duration::from_millis(25);
+
+/// How many times to look up this process's Core Audio object before giving up on
+/// `exclude_self`, and the pause between tries (the HAL registers a process on first contact).
+const OWN_PROCESS_ATTEMPTS: u32 = 5;
+/// Pause between two [`OWN_PROCESS_ATTEMPTS`].
+const OWN_PROCESS_DELAY: Duration = Duration::from_millis(20);
 
 /// Name given to the tap and to the private aggregate device.
 const DEVICE_NAME: &str = "headphone-for-all capture";
@@ -158,6 +177,8 @@ pub(crate) fn open_process(pid: u32) -> Result<Box<dyn CaptureSource>, CaptureEr
 
 /// Lists processes that are currently producing audio output (excluding this process).
 pub(crate) fn list_apps() -> Result<Vec<CaptureApp>, CaptureError> {
+    // Before macOS 14.2 no app could be captured anyway (and the property may not exist).
+    ensure_supported()?;
     let own_pid = std::process::id();
     let objects = read_process_objects().map_err(|s| os_error("reading the process list", s))?;
     let mut apps = Vec::new();
@@ -439,7 +460,7 @@ impl TapDevice {
         // out-pointer.
         let status = unsafe { (fns.create)(Retained::as_ptr(&description), &mut tap_id) };
         if status != NO_ERR || tap_id == kAudioObjectUnknown {
-            return Err(os_error("creating the process tap", status));
+            return Err(tap_create_error(status));
         }
         let tap = ProcessTap {
             id: tap_id,
@@ -447,7 +468,7 @@ impl TapDevice {
         };
 
         // SAFETY: kAudioTapPropertyFormat is an AudioStreamBasicDescription (plain C struct).
-        let asbd = unsafe {
+        let tap_asbd = unsafe {
             read_property::<AudioStreamBasicDescription>(
                 tap.id,
                 kAudioTapPropertyFormat,
@@ -456,7 +477,8 @@ impl TapDevice {
             )
         }
         .map_err(|s| os_error("reading the tap format", s))?;
-        let format = format_from_asbd(&asbd)?;
+        // Only for diagnostics: the IOProc receives the aggregate device's format (below).
+        let tap_format = format_from_asbd(&tap_asbd)?;
 
         let aggregate_uid = format!("org.headphone-for-all.tap.{}", NSUUID::UUID().UUIDString());
         let dict = aggregate_description(&aggregate_uid, &tap_uuid);
@@ -470,12 +492,83 @@ impl TapDevice {
             // `tap` is destroyed by its Drop.
             return Err(os_error("creating the aggregate device", status));
         }
+        let aggregate = AggregateDevice { id: aggregate_id };
+
+        // The IOProc runs on the aggregate device and receives its input stream, in the format
+        // the aggregate chose (drift compensation resamples the tap to the aggregate's clock).
+        // That, not the tap format, is what `format()` must report. On error both objects are
+        // destroyed by their Drop (aggregate first).
+        let format = wait_for_input_format(aggregate.id)?;
+        if format == tap_format {
+            tracing::debug!(?format, "aggregate device input format matches the tap");
+        } else {
+            tracing::info!(
+                ?tap_format,
+                aggregate_format = ?format,
+                "aggregate device input format differs from the tap format; using the aggregate's"
+            );
+        }
         Ok(Self {
-            aggregate: AggregateDevice { id: aggregate_id },
+            aggregate,
             _tap: tap,
             format,
         })
     }
+}
+
+/// Reads the aggregate device's input stream format (what the IOProc receives), retrying while
+/// the freshly created device has no usable input stream yet.
+fn wait_for_input_format(device: AudioObjectID) -> Result<AudioFormat, CaptureError> {
+    let mut last_error = CaptureError::Backend(
+        "Core Audio: the aggregate device never exposed the tap's input stream".to_owned(),
+    );
+    for attempt in 0..DEVICE_READY_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(DEVICE_READY_DELAY);
+        }
+        match read_input_stream_format(device) {
+            Ok(Some(asbd)) => match format_from_asbd(&asbd) {
+                Ok(format) => return Ok(format),
+                // E.g. a zero sample rate while the device is still coming up.
+                Err(e) => last_error = e,
+            },
+            Ok(None) => {}
+            Err(status) => {
+                last_error = os_error("reading the aggregate device's input format", status);
+            }
+        }
+    }
+    Err(last_error)
+}
+
+/// The virtual format of the device's first input stream, `Ok(None)` if it has no input stream.
+fn read_input_stream_format(
+    device: AudioObjectID,
+) -> Result<Option<AudioStreamBasicDescription>, OsStatus> {
+    let streams = read_object_list(
+        device,
+        property_address(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput),
+    )?;
+    let Some(&stream) = streams.first() else {
+        return Ok(None);
+    };
+    if streams.len() > 1 {
+        tracing::debug!(
+            streams = streams.len(),
+            "aggregate device has several input streams; using the first"
+        );
+    }
+    // SAFETY: kAudioStreamPropertyVirtualFormat is an AudioStreamBasicDescription (plain C
+    // struct), read from a stream object in the global scope.
+    let asbd = unsafe {
+        read_property::<AudioStreamBasicDescription>(
+            stream,
+            kAudioStreamPropertyVirtualFormat,
+            None,
+            EMPTY_ASBD,
+        )
+    }?;
+    Ok(Some(asbd))
 }
 
 /// Builds the `CATapDescription` for `target`.
@@ -486,11 +579,15 @@ fn tap_description(target: TapTarget) -> Result<Retained<CATapDescription>, Capt
             if target == TapTarget::SystemExcludingSelf {
                 match own_process_object() {
                     Ok(Some(object)) => excluded.push(NSNumber::numberWithUnsignedInt(object)),
-                    // Not yet known to the audio server: nothing of ours can be in the mix yet.
-                    Ok(None) => tracing::warn!(
-                        "this process has no Core Audio process object yet; the system tap \
-                         cannot exclude it"
-                    ),
+                    // Never fall back to a tap that includes us: once this device also plays
+                    // the hub mix, it would be captured again (a feedback loop).
+                    Ok(None) => {
+                        return Err(CaptureError::Backend(
+                            "this process is not registered with Core Audio yet, so it cannot \
+                             be excluded from the system tap"
+                                .to_owned(),
+                        ))
+                    }
                     Err(status) => return Err(os_error("looking up this process", status)),
                 }
             }
@@ -825,12 +922,19 @@ fn interleave(planes: &[&[f32]], offset: usize, out: &mut [f32]) {
 // Property helpers
 // ---------------------------------------------------------------------------------------------
 
-fn global_address(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+fn property_address(
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
-        mScope: kAudioObjectPropertyScopeGlobal,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMain,
     }
+}
+
+fn global_address(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+    property_address(selector, kAudioObjectPropertyScopeGlobal)
 }
 
 /// The system object (`kAudioObjectSystemObject`).
@@ -890,9 +994,11 @@ fn read_string_property(
 }
 
 /// `kAudioHardwarePropertyTranslatePIDToProcessObject`: `Ok(None)` if the audio server does not
-/// know the process.
+/// know the process (including pids that cannot exist because they do not fit in a `pid_t`).
 fn translate_pid(pid: u32) -> Result<Option<AudioObjectID>, OsStatus> {
-    let pid = i32::try_from(pid).map_err(|_| kAudioHardwareBadObjectError)?;
+    let Ok(pid) = i32::try_from(pid) else {
+        return Ok(None);
+    };
     let qualifier = pid.to_ne_bytes();
     // SAFETY: the property is an AudioObjectID (u32) qualified by a pid_t (i32).
     let object = unsafe {
@@ -907,24 +1013,40 @@ fn translate_pid(pid: u32) -> Result<Option<AudioObjectID>, OsStatus> {
 }
 
 /// This process's audio object. The HAL registers a process when it first talks to the audio
-/// server, so if the first lookup finds nothing, touch the process list and look again.
+/// server, so while the lookup finds nothing, touch the process list and look again (a few
+/// times, briefly; this never runs on a real-time thread).
 fn own_process_object() -> Result<Option<AudioObjectID>, OsStatus> {
     let pid = std::process::id();
-    if let Some(object) = translate_pid(pid)? {
-        return Ok(Some(object));
+    for attempt in 0..OWN_PROCESS_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(OWN_PROCESS_DELAY);
+        }
+        if let Some(object) = translate_pid(pid)? {
+            return Ok(Some(object));
+        }
+        read_process_objects()?;
     }
-    read_process_objects()?;
     translate_pid(pid)
 }
 
 /// `kAudioHardwarePropertyProcessObjectList`.
 fn read_process_objects() -> Result<Vec<AudioObjectID>, OsStatus> {
-    let address = global_address(kAudioHardwarePropertyProcessObjectList);
+    read_object_list(
+        SYSTEM_OBJECT,
+        global_address(kAudioHardwarePropertyProcessObjectList),
+    )
+}
+
+/// Reads a variable-length `AudioObjectID` array property (unknown ids removed).
+fn read_object_list(
+    object: AudioObjectID,
+    address: AudioObjectPropertyAddress,
+) -> Result<Vec<AudioObjectID>, OsStatus> {
     let mut size: u32 = 0;
     // SAFETY: valid address and out-pointer; no qualifier.
     let status = unsafe {
         AudioObjectGetPropertyDataSize(
-            SYSTEM_OBJECT,
+            object,
             NonNull::from(&address),
             0,
             ptr::null(),
@@ -944,7 +1066,7 @@ fn read_process_objects() -> Result<Vec<AudioObjectID>, OsStatus> {
     // `size` bytes and reports how many it wrote.
     let status = unsafe {
         AudioObjectGetPropertyData(
-            SYSTEM_OBJECT,
+            object,
             NonNull::from(&address),
             0,
             ptr::null(),
@@ -1035,10 +1157,26 @@ fn status_string(status: OsStatus) -> String {
     }
 }
 
-/// Maps a failed Core Audio call to a [`CaptureError`].
+/// Maps a failed Core Audio call to a [`CaptureError`]. `'nope'` is Core Audio's generic
+/// "illegal operation" status, so here it is a [`CaptureError::Backend`]; only
+/// [`tap_create_error`] reads it as a missing permission.
 fn os_error(what: &str, status: OsStatus) -> CaptureError {
+    map_status(what, status, false)
+}
+
+/// Maps a failed `AudioHardwareCreateProcessTap`: there `'nope'` means the "System Audio
+/// Recording" permission was refused.
+fn tap_create_error(status: OsStatus) -> CaptureError {
+    map_status("creating the process tap", status, true)
+}
+
+/// Shared mapping: `'!hog'` (and `'nope'` when `nope_is_permission`) → `PermissionDenied`,
+/// `'unop'` → `Unsupported`, anything else → `Backend`.
+fn map_status(what: &str, status: OsStatus, nope_is_permission: bool) -> CaptureError {
     let status_text = status_string(status);
-    if status == kAudioDevicePermissionsError || status == kAudioHardwareIllegalOperationError {
+    if status == kAudioDevicePermissionsError
+        || (nope_is_permission && status == kAudioHardwareIllegalOperationError)
+    {
         CaptureError::PermissionDenied(format!(
             "{what} failed ({status_text}); allow \"System Audio Recording\" for this app in \
              System Settings > Privacy & Security"
@@ -1226,6 +1364,101 @@ mod tests {
             CaptureError::Unsupported(_)
         ));
         assert!(matches!(os_error("x", -50), CaptureError::Backend(_)));
+    }
+
+    #[test]
+    fn nope_means_permission_only_for_tap_creation() {
+        // 'nope' from e.g. AudioDeviceStart is a generic failure, not a permission problem.
+        assert!(matches!(
+            os_error(
+                "starting the tap device",
+                kAudioHardwareIllegalOperationError
+            ),
+            CaptureError::Backend(_)
+        ));
+        assert!(matches!(
+            tap_create_error(kAudioHardwareIllegalOperationError),
+            CaptureError::PermissionDenied(_)
+        ));
+        // '!hog' is a permission error everywhere; other statuses keep their mapping.
+        assert!(matches!(
+            tap_create_error(kAudioDevicePermissionsError),
+            CaptureError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            tap_create_error(kAudioHardwareUnsupportedOperationError),
+            CaptureError::Unsupported(_)
+        ));
+        assert!(matches!(tap_create_error(-50), CaptureError::Backend(_)));
+    }
+
+    #[test]
+    fn impossible_pid_is_not_found() {
+        // u32::MAX does not fit in a pid_t: no Core Audio call, just "unknown process".
+        assert_eq!(translate_pid(u32::MAX), Ok(None));
+        match open_process(u32::MAX) {
+            Err(CaptureError::NotFound(_)) => {}
+            // Older macOS rejects every entry point before looking at the pid.
+            Err(CaptureError::Unsupported(_)) => assert!(ensure_supported().is_err()),
+            Err(other) => panic!("expected NotFound, got {other:?}"),
+            Ok(_) => panic!("opened a tap for pid u32::MAX"),
+        }
+    }
+
+    #[test]
+    fn list_apps_is_unsupported_before_macos_14_2() {
+        if ensure_supported().is_err() {
+            assert!(matches!(list_apps(), Err(CaptureError::Unsupported(_))));
+        }
+    }
+
+    #[test]
+    fn aggregate_description_has_the_audiocap_keys() {
+        let key = |k: &CStr| CFString::from_str(&k.to_string_lossy());
+        let string = |dict: &CFDictionary<CFString, CFType>, k: &CStr| {
+            dict.get(&key(k))
+                .and_then(|v| v.downcast::<CFString>().ok())
+                .map(|v| v.to_string())
+        };
+        let number = |dict: &CFDictionary<CFString, CFType>, k: &CStr| {
+            dict.get(&key(k))
+                .and_then(|v| v.downcast::<CFNumber>().ok())
+                .and_then(|v| v.as_i32())
+        };
+
+        let dict = aggregate_description("uid-x", "TAP-UUID");
+        assert_eq!(dict.len(), 6);
+        assert_eq!(
+            string(&dict, kAudioAggregateDeviceNameKey).as_deref(),
+            Some(DEVICE_NAME)
+        );
+        assert_eq!(
+            string(&dict, kAudioAggregateDeviceUIDKey).as_deref(),
+            Some("uid-x")
+        );
+        assert_eq!(number(&dict, kAudioAggregateDeviceIsPrivateKey), Some(1));
+        assert_eq!(number(&dict, kAudioAggregateDeviceIsStackedKey), Some(0));
+        assert_eq!(number(&dict, kAudioAggregateDeviceTapAutoStartKey), Some(1));
+
+        let tap_list = dict
+            .get(&key(kAudioAggregateDeviceTapListKey))
+            .and_then(|v| v.downcast::<CFArray>().ok())
+            .expect("TapList is a CFArray");
+        assert_eq!(tap_list.len(), 1);
+        // SAFETY: every element of a CFArray is a CF object.
+        let tap_list: &CFArray<CFType> = unsafe { tap_list.cast_unchecked() };
+        let entry = tap_list
+            .get(0)
+            .and_then(|v| v.downcast::<CFDictionary>().ok())
+            .expect("the TapList entry is a CFDictionary");
+        // SAFETY: the entry was built with CFString keys and CF object values.
+        let entry: &CFDictionary<CFString, CFType> = unsafe { entry.cast_unchecked() };
+        assert_eq!(entry.len(), 2);
+        assert_eq!(
+            string(entry, kAudioSubTapUIDKey).as_deref(),
+            Some("TAP-UUID")
+        );
+        assert_eq!(number(entry, kAudioSubTapDriftCompensationKey), Some(1));
     }
 
     #[test]

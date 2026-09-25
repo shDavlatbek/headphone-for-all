@@ -313,15 +313,19 @@ Modules:
     mutes_local_output = false` (all `true` on 14.2+).
   - Taps are private, get a fresh UUID and use `pub(crate) const MUTE_BEHAVIOR = CATapMuteBehavior::MutedWhenTapped`
     (the sender's own speakers go quiet while it streams). The tap and the private aggregate device are created by
-    `open_*` (so `format()` = `kAudioTapPropertyFormat`), the IOProc by `start`; `stop`/`Drop` tear down in the
+    `open_*` (`format()` = the virtual format of the aggregate's first input stream, i.e. what the IOProc receives,
+    which may differ from `kAudioTapPropertyFormat`), the IOProc by `start`; `stop`/`Drop` tear down in the
     order `AudioDeviceStop` → `AudioDeviceDestroyIOProcID` → `AudioHardwareDestroyAggregateDevice` →
     `AudioHardwareDestroyProcessTap`. `start` after `stop` rebuilds the tap (`Format` error if its format changed).
   - The aggregate device contains **only the tap** (no output sub-device, unlike AudioCap), so a headset
     microphone can never leak into the captured input buffers.
   - `list_apps` returns processes with `kAudioProcessPropertyIsRunningOutput`, excluding our own pid; the name is
     the last bundle-id component, else `proc_name`, sorted case-insensitively.
-  - Errors: `'!hog'`/`'nope'` → `PermissionDenied`, `'unop'` → `Unsupported`, unknown pid → `NotFound`, other
-    statuses → `Backend`. A denied permission may also just yield silence on some macOS versions.
+  - Errors: `'!hog'` → `PermissionDenied` (and `'nope'` only from `AudioHardwareCreateProcessTap`; elsewhere
+    `'nope'` → `Backend`), `'unop'` → `Unsupported`, unknown or impossible (> `i32::MAX`) pid → `NotFound`, other
+    statuses → `Backend`. `open_system(true)` fails with `Backend` rather than creating a non-excluding tap when this
+    process has no Core Audio process object. `list_apps` also returns `Unsupported` before macOS 14.2. A denied
+    permission may also just yield silence on some macOS versions.
   - **App requirement (`feat/apple`):** the macOS app's `Info.plist` must contain `NSAudioCaptureUsageDescription`.
 
 ## 6. `hfa-core` (networking + engines; tokio)
