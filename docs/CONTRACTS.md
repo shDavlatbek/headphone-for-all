@@ -874,7 +874,8 @@ Modules:
   `local_addr()`, `stats() -> ProxyStats { received, dropped, forwarded }`, `stop().await`. One-way relay: random
   drops and a random `0..=jitter_ms` delay per datagram (which reorders them); deterministic per seed. Use it with
   `set_media_port_override(Some(proxy.local_addr().port()))`.
-- Tests: `hfa-core/tests/engine_{stream,lifecycle,lossy,dtx}.rs` + `tests/engine_common/mod.rs` (helpers: temp devices,
+- Tests: `hfa-core/tests/engine_{stream,lifecycle,lossy,dtx}.rs` (lifecycle includes `Discover` by device id over real
+  mDNS) + `tests/engine_common/mod.rs` (helpers: temp devices,
   WAV analysis with a 50 ms-block Goertzel detector — a single long Goertzel sum is cancelled by the tiny frequency
   shifts of drift correction).
 

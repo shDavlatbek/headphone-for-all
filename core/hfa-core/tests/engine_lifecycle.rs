@@ -150,3 +150,46 @@ async fn a_taken_port_is_an_error() {
     assert!(err.to_string().contains("already in use"), "{err}");
     hub.hub.stop().await;
 }
+
+/// A sender finds an advertised hub over mDNS by its device id and streams to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sender_discovers_the_hub_by_device_id() {
+    let _serial = serial().await;
+    let hub_dev = Device::new("Discoverable hub");
+    let hub = hfa_core::HubEngine::start(hfa_core::HubConfig {
+        settings: hub_dev.settings(0),
+        output: Box::new(hfa_capture::output_file::NullOutput::new(
+            hfa_audio::AudioFormat::INTERNAL,
+            10,
+        )),
+        advertise: true,
+    })
+    .await
+    .expect("hub");
+    let mut events = hub.events();
+    let pin = hub.start_pairing().pin;
+    let dev = Device::new("Finder");
+    let (capture, _) =
+        hfa_core::sender::open_capture(&hfa_capture::CaptureTarget::Tone { freq_hz: 440.0 })
+            .expect("tone");
+    let sender = hfa_core::SenderEngine::start(hfa_core::SenderConfig {
+        hub: hfa_core::HubAddress::Discover {
+            name_or_id: hub.device_id().to_owned(),
+        },
+        settings: dev.settings(0),
+        capture,
+        label: "Found".into(),
+        expected_hub_key: None,
+        pairing_secret: Some(pin),
+    })
+    .await
+    .expect("sender");
+    let added = wait_event(&mut events, Duration::from_secs(40), |ev| match ev {
+        HubEvent::SourceAdded(info) => Some(info.device_name.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(added.as_deref(), Some("Finder"), "{:?}", sender.status());
+    sender.stop().await;
+    hub.stop().await;
+}
