@@ -163,6 +163,11 @@ impl AudioOutput for WavFileOutput {
     fn has_error(&self) -> bool {
         self.error.load(Ordering::Relaxed)
     }
+
+    /// `false`: `start` truncates the file, which would lose the recording so far.
+    fn restartable(&self) -> bool {
+        false
+    }
 }
 
 impl Drop for WavFileOutput {
@@ -492,6 +497,7 @@ mod tests {
         sink.push(&vec![0.1f32; AudioFormat::INTERNAL.samples_for_ms(500)]);
         let out_dyn: &mut dyn AudioOutput = &mut out;
         assert!(!out_dyn.has_error());
+        assert!(!out_dyn.restartable(), "a restart would truncate the file");
         out_dyn.start(source).expect("start");
         // 10 ms blocks of 3840 bytes overflow the 8 KiB write buffer within a few blocks.
         let deadline = Instant::now() + Duration::from_secs(5);
