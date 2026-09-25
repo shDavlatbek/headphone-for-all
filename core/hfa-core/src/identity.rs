@@ -11,9 +11,10 @@
 //!
 //! The `device_id` is always [`hfa_proto::fingerprint`] of the static public key.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Weak};
 
 use base64::Engine as _;
 use hfa_proto::StaticKeypair;
@@ -251,6 +252,13 @@ struct TrustFile {
 /// saved to disk immediately (atomically: temp file + rename). If saving fails, the in-memory
 /// store is left unchanged, so memory and disk never disagree.
 ///
+/// **One store per data directory and process:** [`TrustStore::load`] returns a handle to the
+/// store that is already open for that directory (re-read from disk), so a running hub or
+/// sender, the FFI and the CLI all see a pairing or a removal at once. Writers merge with the
+/// file: [`TrustStore::add`] and [`TrustStore::remove`] re-read `trusted.json` before changing
+/// it, so a change another process saved meanwhile (e.g. `hfa trust remove` next to a running
+/// app) is kept instead of being overwritten; [`TrustStore::reload`] picks such a change up.
+///
 /// Readers ([`TrustStore::is_trusted`], [`TrustStore::get`], [`TrustStore::peers`]) never
 /// wait for disk I/O, so they may be called from async tasks: writers are serialized by a
 /// separate lock held during the save, and the peer list lock is only taken briefly to copy
@@ -260,6 +268,10 @@ struct TrustFile {
 pub struct TrustStore {
     inner: Arc<TrustInner>,
 }
+
+/// The stores open in this process, by trust file path (see [`TrustStore`]).
+static OPEN_STORES: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Weak<TrustInner>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 struct TrustInner {
     path: PathBuf,
@@ -280,42 +292,61 @@ impl fmt::Debug for TrustStore {
 
 impl TrustStore {
     /// Loads `<data_dir>/trusted.json` (empty store if missing). Entries whose `device_id`
-    /// does not match their key are dropped with a warning.
+    /// does not match their key are dropped with a warning. If a store for this directory is
+    /// already open in this process, that store is refreshed from the file and a handle to it
+    /// is returned (see [`TrustStore`]).
     ///
     /// # Errors
     /// [`crate::CoreError::Io`] / [`crate::CoreError::Json`], [`crate::CoreError::Config`]
-    /// for an unsupported file version.
+    /// for an unsupported file version (an open store is then left unchanged).
     pub fn load(data_dir: &Path) -> Result<TrustStore> {
         let path = data_dir.join(TRUST_FILE);
-        let peers = match std::fs::read(&path) {
-            Ok(bytes) => {
-                let file: TrustFile = serde_json::from_slice(&bytes)?;
-                if file.version != FILE_FORMAT_VERSION {
-                    return Err(CoreError::Config(format!(
-                        "unsupported trust store version {}",
-                        file.version
-                    )));
-                }
-                let mut peers: Vec<TrustedPeer> = Vec::with_capacity(file.peers.len());
-                for peer in file.peers {
-                    if peer.device_id != hfa_proto::fingerprint(&peer.public_key) {
-                        tracing::warn!(device_id = %peer.device_id, "dropping a trusted peer whose id does not match its key");
-                    } else if !peers.iter().any(|p| p.public_key == peer.public_key) {
-                        peers.push(peer);
-                    }
-                }
-                peers
+        // The same directory reached through another spelling must map to the same store.
+        let key = std::fs::canonicalize(data_dir)
+            .map(|dir| dir.join(TRUST_FILE))
+            .unwrap_or_else(|_| path.clone());
+        let peers = read_peers(&path)?;
+        let mut open = OPEN_STORES.lock();
+        open.retain(|_, store| store.strong_count() > 0);
+        if let Some(inner) = open.get(&key).and_then(Weak::upgrade) {
+            drop(open);
+            {
+                let _writer = inner.save_lock.lock();
+                *inner.peers.lock() = peers;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(TrustStore {
-            inner: Arc::new(TrustInner {
-                path,
-                peers: parking_lot::Mutex::new(peers),
-                save_lock: parking_lot::Mutex::new(()),
-            }),
-        })
+            return Ok(TrustStore { inner });
+        }
+        let inner = Arc::new(TrustInner {
+            path,
+            peers: parking_lot::Mutex::new(peers),
+            save_lock: parking_lot::Mutex::new(()),
+        });
+        open.insert(key, Arc::downgrade(&inner));
+        Ok(TrustStore { inner })
+    }
+
+    /// Re-reads `trusted.json`, so changes saved by another process become visible (blocking
+    /// file I/O).
+    ///
+    /// # Errors
+    /// Like [`TrustStore::load`]; the store is then unchanged.
+    pub fn reload(&self) -> Result<()> {
+        let peers = read_peers(&self.inner.path)?;
+        let _writer = self.inner.save_lock.lock();
+        *self.inner.peers.lock() = peers;
+        Ok(())
+    }
+
+    /// The peer list to change: the file as saved now (another process may have changed
+    /// it), or the in-memory list if the file cannot be read.
+    fn current_for_write(&self) -> Vec<TrustedPeer> {
+        match read_peers(&self.inner.path) {
+            Ok(peers) => peers,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot re-read the trust store; using the loaded copy");
+                self.peers()
+            }
+        }
     }
 
     /// `true` if a peer with this public key is trusted.
@@ -351,7 +382,7 @@ impl TrustStore {
             )));
         }
         let _writer = self.inner.save_lock.lock();
-        let mut peers = self.peers();
+        let mut peers = self.current_for_write();
         match peers.iter_mut().find(|p| p.device_id == peer.device_id) {
             Some(existing) => *existing = peer,
             None => peers.push(peer),
@@ -367,8 +398,10 @@ impl TrustStore {
     /// [`crate::CoreError::Io`] / [`crate::CoreError::Json`] (the store is then unchanged).
     pub fn remove(&self, device_id: &str) -> Result<bool> {
         let _writer = self.inner.save_lock.lock();
-        let mut peers = self.peers();
+        let mut peers = self.current_for_write();
         let Some(pos) = peers.iter().position(|p| p.device_id == device_id) else {
+            // Nothing to save, but show what is on disk.
+            *self.inner.peers.lock() = peers;
             return Ok(false);
         };
         peers.remove(pos);
@@ -381,6 +414,31 @@ impl TrustStore {
     pub fn peers(&self) -> Vec<TrustedPeer> {
         self.inner.peers.lock().clone()
     }
+}
+
+/// Reads a trust file (empty if missing), dropping entries whose id does not match their key.
+fn read_peers(path: &Path) -> Result<Vec<TrustedPeer>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let file: TrustFile = serde_json::from_slice(&bytes)?;
+    if file.version != FILE_FORMAT_VERSION {
+        return Err(CoreError::Config(format!(
+            "unsupported trust store version {}",
+            file.version
+        )));
+    }
+    let mut peers: Vec<TrustedPeer> = Vec::with_capacity(file.peers.len());
+    for peer in file.peers {
+        if peer.device_id != hfa_proto::fingerprint(&peer.public_key) {
+            tracing::warn!(device_id = %peer.device_id, "dropping a trusted peer whose id does not match its key");
+        } else if !peers.iter().any(|p| p.public_key == peer.public_key) {
+            peers.push(peer);
+        }
+    }
+    Ok(peers)
 }
 
 fn save_peers(path: &Path, peers: &[TrustedPeer]) -> Result<()> {
@@ -492,5 +550,50 @@ mod tests {
         assert!(json.contains(&B64.encode([9u8; 32])), "{json}");
         let back: TrustedPeer = serde_json::from_str(&json).expect("parse");
         assert_eq!(back, peer);
+    }
+
+    #[test]
+    fn stores_of_one_directory_are_shared_in_a_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // An engine loaded the store; the FFI/CLI loads it again and forgets a peer.
+        let engine = TrustStore::load(dir.path()).expect("load");
+        engine.add(TrustedPeer::new([1u8; 32], "A")).expect("add");
+        let ui = TrustStore::load(dir.path()).expect("load again");
+        assert!(ui.is_trusted(&[1u8; 32]));
+        assert!(ui
+            .remove(&hfa_proto::fingerprint(&[1u8; 32]))
+            .expect("remove"));
+        assert!(
+            !engine.is_trusted(&[1u8; 32]),
+            "the running engine sees the removal"
+        );
+        // The same directory spelled differently is the same store.
+        let other_spelling = TrustStore::load(&dir.path().join(".")).expect("load");
+        other_spelling
+            .add(TrustedPeer::new([2u8; 32], "B"))
+            .expect("add");
+        assert!(engine.is_trusted(&[2u8; 32]));
+    }
+
+    #[test]
+    fn writers_merge_with_changes_saved_by_another_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TrustStore::load(dir.path()).expect("load");
+        store.add(TrustedPeer::new([1u8; 32], "A")).expect("add");
+        store.add(TrustedPeer::new([2u8; 32], "B")).expect("add");
+        // Another process (e.g. `hfa trust remove`) removes A from the file.
+        let b = store.get(&hfa_proto::fingerprint(&[2u8; 32])).expect("B");
+        save_peers(&dir.path().join(TRUST_FILE), &[b]).expect("external save");
+        // A pairing in this process must not bring A back.
+        store.add(TrustedPeer::new([3u8; 32], "C")).expect("add");
+        assert!(!store.is_trusted(&[1u8; 32]));
+        assert!(store.is_trusted(&[2u8; 32]) && store.is_trusted(&[3u8; 32]));
+        let on_disk = read_peers(&dir.path().join(TRUST_FILE)).expect("read");
+        assert_eq!(on_disk.len(), 2);
+        // reload() picks up an external change without a write.
+        save_peers(&dir.path().join(TRUST_FILE), &[]).expect("external save");
+        assert!(store.is_trusted(&[2u8; 32]));
+        store.reload().expect("reload");
+        assert!(store.peers().is_empty());
     }
 }

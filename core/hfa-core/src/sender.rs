@@ -74,6 +74,8 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 type HubControls = (f32, bool, bool);
 /// Controls of a stream the hub announced nothing for.
 const DEFAULT_HUB_CONTROLS: HubControls = (1.0, false, false);
+/// Every this many pings the trust store is re-read from disk (5 s).
+const TRUST_RELOAD_PINGS: u64 = 5;
 /// Consecutive `Stats` saying the hub receives nothing ([`crate::hub::NO_MEDIA_LOSS_PCT`])
 /// before the sender reports it as an error.
 const NO_MEDIA_REPORTS: u32 = 3;
@@ -784,6 +786,17 @@ impl Control {
                     }
                 }
                 _ = ping.tick() => {
+                    if self.pinned.is_some_and(|k| !self.trust.is_trusted(&k)) {
+                        // The hub was forgotten on this device while streaming (trust is
+                        // otherwise only checked at the handshake).
+                        self.command(EncoderCommand::Clear);
+                        let _ = ch.close("hub no longer trusted").await;
+                        tracing::info!("the hub was removed from the trusted devices; stopping");
+                        return SessionEnd::Fatal(CoreError::PairingRequired);
+                    }
+                    if nonce % TRUST_RELOAD_PINGS == TRUST_RELOAD_PINGS - 1 {
+                        crate::hub::reload_trust(&self.trust).await;
+                    }
                     if last_rx.elapsed() > HUB_TIMEOUT {
                         self.command(EncoderCommand::Clear);
                         let _ = ch.close("no answer").await;

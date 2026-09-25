@@ -959,6 +959,19 @@ Modules:
   sender with the hub's own key with `Bye("own device")` and fails with it (nothing is paired, the pairing window
   is not used). The sender treats it as final (`Failed`), like `KeyMismatch`. (The UI-side defaults — not
   preselecting "everything this device plays" while this device's hub runs — belong to the app.)
+- **One `TrustStore` per data directory and process (`identity.rs`).** `TrustStore::load(dir)` returns a handle to
+  the store already open for that directory (canonicalized path; a process-wide registry of weak handles), after
+  re-reading `trusted.json` into it; so the FFI's `forget_peer`/`trusted_peers` and the engines share one in-memory
+  list and a removal is seen at once (hfa-ffi needs no change: it already loads through `TrustStore::load`).
+  **Merge on write:** `add`/`remove` re-read the file under the save lock before changing it (falling back to the
+  in-memory list if it cannot be read), so a peer removed by another process (`hfa trust remove` beside a running
+  app) is not written back by the next pairing. **New `TrustStore::reload()`** (blocking). The **hub** re-reads the
+  store every 5 s and, every stats tick, removes the streams of devices that are no longer trusted and closes their
+  connections with `Bye("this device is no longer trusted by the hub")` (their reconnect then needs pairing). The
+  **sender** re-reads it every 5 pings and, if its pinned hub is no longer trusted, ends with the final error
+  `PairingRequired` (`Failed("pairing required")`). This resolves the §8.5 "Known limit" (a running engine's own
+  copy) without a `TrustStore` field in `HubConfig`/`SenderConfig`; the app's hub restart after a forget (§8.7) is
+  no longer needed, but harmless.
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

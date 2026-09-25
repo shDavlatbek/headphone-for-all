@@ -251,3 +251,53 @@ async fn a_sender_reaches_the_hub_over_ipv6() {
     assert_eq!(status.state, SenderState::Streaming, "{status:?}");
     assert!(counters.played > 50, "{counters:?}");
 }
+
+/// Forgetting a device takes effect at once in the running engines (the trust store is shared
+/// in the process): the hub drops the forgotten sender's stream, whose reconnect then needs a
+/// new pairing; a sender whose hub is forgotten stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forgetting_a_device_ends_its_running_session() {
+    let _serial = serial().await;
+    let hub_dev = Device::new("Hub");
+    let mut hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let pin = hub.hub.start_pairing().pin;
+    let dev = Device::new("Old phone");
+    let mut sender = start_sender(&dev, hub.hub.local_port(), 440.0, Some(pin)).await;
+    let stream_id = wait_source_added(&mut hub, START_TIMEOUT).await;
+    wait_state(&mut sender, START_TIMEOUT, SenderState::Streaming).await;
+    let device_id = hub.hub.sources()[0].device_id.clone();
+
+    // The hub's user forgets the phone (as the FFI's forget_peer does).
+    let trust = TrustStore::load(hub_dev.path()).expect("trust");
+    assert!(trust.remove(&device_id).expect("remove"));
+    let removed = wait_event(&mut hub.events, Duration::from_secs(5), |ev| match ev {
+        HubEvent::SourceRemoved { stream_id } => Some(*stream_id),
+        _ => None,
+    })
+    .await;
+    assert_eq!(removed, Some(stream_id));
+    let failed = wait_event(&mut sender.events, Duration::from_secs(10), |ev| match ev {
+        SenderEvent::StateChanged(SenderState::Failed(reason)) => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(failed.as_deref(), Some("pairing required"));
+    sender.sender.stop().await;
+
+    // The other way round: the sender device forgets the hub while streaming.
+    let pin = hub.hub.start_pairing().pin;
+    let mut sender = start_sender(&dev, hub.hub.local_port(), 440.0, Some(pin)).await;
+    wait_state(&mut sender, START_TIMEOUT, SenderState::Streaming).await;
+    let sender_trust = TrustStore::load(dev.path()).expect("trust");
+    assert!(sender_trust
+        .remove(hub.hub.device_id())
+        .expect("remove hub"));
+    let failed = wait_event(&mut sender.events, Duration::from_secs(5), |ev| match ev {
+        SenderEvent::StateChanged(SenderState::Failed(reason)) => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(failed.as_deref(), Some("pairing required"));
+    sender.sender.stop().await;
+    hub.hub.stop().await;
+}

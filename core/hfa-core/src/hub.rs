@@ -48,7 +48,9 @@
 //!   sender adapts to); [`StreamStats::loss_pct`] is what the listener misses after
 //!   redundancy/FEC. A stream without datagrams (audio or DTX keep-alives) for [`IDLE_AFTER`]
 //!   is inactive and reported to its sender as [`NO_MEDIA_LOSS_PCT`] loss (nothing arrives);
-//!   after [`REMOVE_AFTER`] it is removed and its connection closed.
+//!   after [`REMOVE_AFTER`] it is removed and its connection closed. So is the stream of a
+//!   device that is no longer trusted (the store is shared with the rest of the process and
+//!   re-read from disk every 5 s, see [`TrustStore`]).
 //! - [`HubHandle::stop`] closes every connection with `Bye`, stops advertising, the tasks,
 //!   the mixer and the output.
 
@@ -118,6 +120,8 @@ const INITIAL_JITTER_TARGET_MS: u32 = 40;
 const EVENT_CAPACITY: usize = 256;
 /// Fewest frames a loss measurement covers (a shorter interval is extended).
 const MIN_FRAMES_FOR_LOSS: u64 = 40;
+/// Every this many stats ticks the trust store is re-read from disk (5 s).
+const TRUST_RELOAD_TICKS: u32 = 5;
 /// How often a free TCP port is tried when `settings.port` is 0 and its UDP twin is taken.
 const PORT_ATTEMPTS: usize = 16;
 /// How long [`HubHandle::stop`] waits for the connections to say `Bye`.
@@ -528,6 +532,8 @@ struct HubState {
 
 struct SourceEntry {
     info: SourceInfo,
+    /// The sender's static key (its trust is re-checked every stats tick).
+    public_key: [u8; 32],
     frame_ms: u32,
     tx: mpsc::UnboundedSender<ConnCommand>,
     shared: Arc<StreamShared>,
@@ -648,6 +654,7 @@ impl Shared {
             let _ = self.mixer.send(MixerCommand::Add(Box::new(mix)));
             st.sources.push(SourceEntry {
                 info: info.clone(),
+                public_key: peer.public_key,
                 frame_ms: ss.frame_ms,
                 tx: tx.clone(),
                 shared: stream,
@@ -824,8 +831,22 @@ impl Shared {
                         hfa_audio::meter::SILENCE_DB
                     },
                 };
+                if !self.trust.is_trusted(&e.public_key) {
+                    // Forgotten on this hub (forget_peer, `hfa trust remove`): trust is only
+                    // checked at the handshake, so end what is already connected.
+                    expired.push((
+                        e.info.stream_id,
+                        e.tx.clone(),
+                        "this device is no longer trusted by the hub".to_owned(),
+                    ));
+                    continue;
+                }
                 if idle_for >= REMOVE_AFTER {
-                    expired.push((e.info.stream_id, e.tx.clone()));
+                    expired.push((
+                        e.info.stream_id,
+                        e.tx.clone(),
+                        format!("no media received for {} s", REMOVE_AFTER.as_secs()),
+                    ));
                     continue;
                 }
                 if report {
@@ -846,17 +867,10 @@ impl Shared {
         for info in updates {
             self.emit(HubEvent::SourceUpdated(info));
         }
-        for (stream_id, tx) in expired {
-            tracing::info!(
-                stream_id,
-                "no media for {} s; removing the stream",
-                REMOVE_AFTER.as_secs()
-            );
+        for (stream_id, tx, reason) in expired {
+            tracing::info!(stream_id, %reason, "removing the stream");
             self.remove_stream(stream_id);
-            let _ = tx.send(ConnCommand::Close(format!(
-                "no media received for {} s",
-                REMOVE_AFTER.as_secs()
-            )));
+            let _ = tx.send(ConnCommand::Close(reason));
         }
     }
 }
@@ -1215,11 +1229,29 @@ async fn stats_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(STATS_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
+    let mut ticks = 0u32;
     loop {
         tokio::select! {
-            _ = tick.tick() => shared.collect_stats(),
+            _ = tick.tick() => {
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(TRUST_RELOAD_TICKS) {
+                    reload_trust(&shared.trust).await;
+                }
+                shared.collect_stats();
+            }
             _ = wait_stop(&mut shutdown) => break,
         }
+    }
+}
+
+/// Re-reads the trust store off the async workers, so a peer removed by another process
+/// (e.g. `hfa trust remove` next to a running app) is noticed.
+pub(crate) async fn reload_trust(trust: &TrustStore) {
+    let trust = trust.clone();
+    match tokio::task::spawn_blocking(move || trust.reload()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!(error = %e, "cannot reload the trust store"),
+        Err(e) => tracing::debug!(error = %e, "trust reload task failed"),
     }
 }
 
