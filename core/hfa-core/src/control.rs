@@ -6,9 +6,10 @@
 //!    handshake payloads); each handshake message is a *record*: its length as `u16` BE, then
 //!    the message. The sender (TCP client) is the initiator. XX gives the initiator the hub's
 //!    static key in message 2: if the sender was given an expected hub key (pairing URI,
-//!    trusted peer), it compares it right there and fails with
+//!    trusted peer) or an expected hub device id (a hub looked up by id over mDNS, see
+//!    [`ControlChannel::connect_checked`]), it compares it right there and fails with
 //!    [`crate::CoreError::KeyMismatch`] **before sending anything else** (so a wrong hub
-//!    never even learns the sender's static key).
+//!    never even learns the sender's static key, `Hello` or a pairing attempt).
 //! 2. **`Hello` exchange** over the transport: the sender sends its `Hello` first, the hub
 //!    answers with its own. Both check `protocol_version == 0`, the peer's `role` and that
 //!    `device_id` is the fingerprint of the peer's authenticated static key
@@ -305,13 +306,45 @@ impl ControlChannel {
         expected_hub_key: Option<[u8; 32]>,
         pairing_secret: Option<String>,
     ) -> Result<(ControlChannel, PeerInfo)> {
-        let secret = pairing_secret.map(Zeroizing::new);
-        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
-        let result = connect_procedure(
+        Self::connect_checked(
             addr,
             identity,
             trust,
             expected_hub_key,
+            None,
+            pairing_secret,
+        )
+        .await
+    }
+
+    /// [`ControlChannel::connect`], and if `expected_hub_id` is `Some`, the fingerprint of the
+    /// hub's static key must equal it (e.g. a hub looked up by device id over mDNS, whose
+    /// address is only a hint). Like `expected_hub_key`, it is checked right after Noise
+    /// message 2, so a hub with another key gets neither the sender's static key, nor its
+    /// `Hello`, nor a pairing attempt with the secret: [`crate::CoreError::KeyMismatch`]
+    /// with the device id of the key that answered.
+    ///
+    /// # Errors
+    /// As [`ControlChannel::connect`].
+    pub async fn connect_checked(
+        addr: SocketAddr,
+        identity: &Identity,
+        trust: &TrustStore,
+        expected_hub_key: Option<[u8; 32]>,
+        expected_hub_id: Option<&str>,
+        pairing_secret: Option<String>,
+    ) -> Result<(ControlChannel, PeerInfo)> {
+        let secret = pairing_secret.map(Zeroizing::new);
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+        let expected = Expected {
+            key: expected_hub_key,
+            id: expected_hub_id,
+        };
+        let result = connect_procedure(
+            addr,
+            identity,
+            trust,
+            expected,
             secret.as_ref().map(|s| s.as_str()),
             deadline,
         )
@@ -552,14 +585,14 @@ async fn connect_procedure(
     addr: SocketAddr,
     identity: &Identity,
     trust: &TrustStore,
-    expected_hub_key: Option<[u8; 32]>,
+    expected: Expected<'_>,
     secret: Option<&str>,
     deadline: tokio::time::Instant,
 ) -> Result<(ControlChannel, PeerInfo)> {
     let (mut ch, mut peer, paired) = within(
         deadline,
         addr,
-        connect_inner(addr, identity, trust, expected_hub_key, secret),
+        connect_inner(addr, identity, trust, expected, secret),
     )
     .await?;
     if paired {
@@ -635,13 +668,32 @@ async fn accept_procedure(
     Ok((ch, peer))
 }
 
+/// What the sender requires of the hub's static key (checked after Noise message 2).
+#[derive(Clone, Copy)]
+struct Expected<'a> {
+    key: Option<[u8; 32]>,
+    id: Option<&'a str>,
+}
+
+impl Expected<'_> {
+    fn check(self, hub_key: &[u8; 32]) -> Result<()> {
+        let id_ok = self
+            .id
+            .is_none_or(|id| id.trim() == hfa_proto::fingerprint(hub_key));
+        if self.key.is_some_and(|k| k != *hub_key) || !id_ok {
+            return Err(CoreError::KeyMismatch(hfa_proto::fingerprint(hub_key)));
+        }
+        Ok(())
+    }
+}
+
 /// The sender side up to (not including) the trust save. Returns `true` as the third
 /// element if pairing succeeded and the hub must be saved.
 async fn connect_inner(
     addr: SocketAddr,
     identity: &Identity,
     trust: &TrustStore,
-    expected_hub_key: Option<[u8; 32]>,
+    expected: Expected<'_>,
     secret: Option<&str>,
 ) -> Result<(ControlChannel, PeerInfo, bool)> {
     let stream = TcpStream::connect(addr).await?;
@@ -656,11 +708,7 @@ async fn connect_inner(
     let hub_key = hs
         .remote_static()
         .ok_or_else(|| CoreError::Protocol("hub sent no static key".into()))?;
-    if let Some(expected) = expected_hub_key {
-        if expected != hub_key {
-            return Err(CoreError::KeyMismatch(hfa_proto::fingerprint(&hub_key)));
-        }
-    }
+    expected.check(&hub_key)?;
     io.write_record(&hs.write_message(&[])?).await?;
     let mut ch = ControlChannel::new(io, hs.into_transport()?, peer_addr);
 

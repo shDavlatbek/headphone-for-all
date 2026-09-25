@@ -257,6 +257,56 @@ async fn expected_hub_key_mismatch_is_detected_first() {
 }
 
 #[tokio::test]
+async fn expected_hub_id_mismatch_is_detected_before_pairing() {
+    // Regression: a hub looked up by device id over mDNS used to be checked only after the
+    // whole handshake, so a hub with another key got the sender's Hello and a pairing
+    // attempt first.
+    let hub = hub().await;
+    let sender = device("Laptop");
+    let info = hub.pairing.start(DEFAULT_PAIRING_TTL);
+    let accepted = hub.accept_one();
+    let wanted = hfa_proto::fingerprint(&[42; 32]);
+    let result = ControlChannel::connect_checked(
+        hub.addr,
+        &sender.identity,
+        &sender.trust,
+        None,
+        Some(&wanted),
+        Some(info.pin.clone()),
+    )
+    .await;
+    match result {
+        Err(CoreError::KeyMismatch(id)) => assert_eq!(id, hub.dev.identity.device_id),
+        other => panic!("expected KeyMismatch, got {other:?}"),
+    }
+    assert!(accepted.await.expect("join").is_err());
+    assert!(hub.dev.trust.peers().is_empty() && sender.trust.peers().is_empty());
+    for _ in 0..MAX_FAILED_ATTEMPTS {
+        drop(
+            hub.pairing
+                .begin_attempt(PairMethod::Pin)
+                .expect("full budget left"),
+        );
+    }
+
+    // The right id pairs normally.
+    let info = hub.pairing.start(DEFAULT_PAIRING_TTL);
+    let accepted = hub.accept_one();
+    let (_ch, peer) = ControlChannel::connect_checked(
+        hub.addr,
+        &sender.identity,
+        &sender.trust,
+        None,
+        Some(&hub.dev.identity.device_id),
+        Some(info.pin),
+    )
+    .await
+    .expect("right id");
+    assert!(peer.newly_paired);
+    accepted.await.expect("join").expect("hub side");
+}
+
+#[tokio::test]
 async fn pairing_trusts_only_one_direction() {
     // A device that paired as a sender with a hub trusts that hub as a hub only: when it
     // runs a hub itself, the other device must pair before it can stream into it.
