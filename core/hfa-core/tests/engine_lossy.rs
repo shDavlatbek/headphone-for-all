@@ -69,3 +69,39 @@ async fn redundancy_recovers_losses_through_a_lossy_link() {
     let dropout = longest_dropout_ms(seg, 0.02);
     assert!(dropout < 100.0, "dropout of {dropout} ms");
 }
+
+/// UDP is blocked (the TCP control connection works): the hub reports that nothing arrives
+/// (`NO_MEDIA_LOSS_PCT`) instead of "0 % loss", and the sender says what is wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_udp_is_reported_to_the_sender() {
+    let _serial = serial().await;
+    let hub_dev = Device::new("Hub");
+    let mut hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let port = hub.hub.local_port();
+    // A socket that swallows the media: the hub never sees a datagram.
+    let black_hole = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+    hub.hub
+        .set_media_port_override(Some(black_hole.local_addr().expect("addr").port()));
+
+    let pin = hub.hub.start_pairing().pin;
+    let dev = Device::new("Firewalled laptop");
+    let mut sender = start_sender(&dev, port, 440.0, Some(pin)).await;
+    wait_source_added(&mut hub, Duration::from_secs(15)).await;
+    wait_state(&mut sender, Duration::from_secs(15), SenderState::Streaming).await;
+
+    let error = wait_event(&mut sender.events, Duration::from_secs(10), |ev| match ev {
+        hfa_core::SenderEvent::Error(m) if m.contains("receives no audio") => Some(m.clone()),
+        _ => None,
+    })
+    .await;
+    let status = sender.sender.status();
+    sender.sender.stop().await;
+    hub.hub.stop().await;
+    let error = error.expect("the sender reports that the hub receives nothing");
+    assert!(error.contains("UDP port"), "{error}");
+    assert_eq!(
+        status.loss_pct,
+        hfa_core::hub::NO_MEDIA_LOSS_PCT,
+        "{status:?}"
+    );
+}

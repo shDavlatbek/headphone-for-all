@@ -73,6 +73,9 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 type HubControls = (f32, bool, bool);
 /// Controls of a stream the hub announced nothing for.
 const DEFAULT_HUB_CONTROLS: HubControls = (1.0, false, false);
+/// Consecutive `Stats` saying the hub receives nothing ([`crate::hub::NO_MEDIA_LOSS_PCT`])
+/// before the sender reports it as an error.
+const NO_MEDIA_REPORTS: u32 = 3;
 
 /// How to reach the hub.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +346,7 @@ impl SenderEngine {
             stop: stop_rx,
             epoch: Instant::now(),
             hub_control: DEFAULT_HUB_CONTROLS,
+            no_media_reports: 0,
         };
         let task = tokio::spawn(control.run(thread));
         Ok(SenderHandle {
@@ -471,6 +475,8 @@ struct Control {
     epoch: Instant,
     /// Gain, mute and priority the hub applies to our stream.
     hub_control: HubControls,
+    /// Consecutive `Stats` of the current stream saying the hub receives nothing.
+    no_media_reports: u32,
 }
 
 impl Control {
@@ -730,6 +736,8 @@ impl Control {
             self.emit_hub_control();
         }
         let stream_id = media.stream_id();
+        let media_port = media.dest().port();
+        self.no_media_reports = 0;
         tracing::info!(stream_id, dest = %media.dest(), "streaming");
         self.command(EncoderCommand::Stream {
             media,
@@ -756,7 +764,7 @@ impl Control {
                         Err(e) => return end_with(e, true),
                     };
                     last_rx = Instant::now();
-                    if let Some(end) = self.on_message(&mut ch, msg, stream_id).await {
+                    if let Some(end) = self.on_message(&mut ch, msg, stream_id, media_port).await {
                         self.command(EncoderCommand::Clear);
                         let _ = ch.close("stream ended").await;
                         return end;
@@ -811,6 +819,7 @@ impl Control {
         ch: &mut ControlChannel,
         msg: ControlMessage,
         stream_id: u32,
+        media_port: u16,
     ) -> Option<SessionEnd> {
         match msg.body? {
             Body::Pong(p) => {
@@ -830,6 +839,19 @@ impl Control {
                 }
             }
             Body::Stats(s) if s.stream_id == stream_id => {
+                if s.loss_pct >= crate::hub::NO_MEDIA_LOSS_PCT {
+                    self.no_media_reports += 1;
+                    if self.no_media_reports == NO_MEDIA_REPORTS {
+                        let message = format!(
+                            "the hub receives no audio from this device (is UDP port \
+                             {media_port} blocked by a firewall on the hub or the network?)"
+                        );
+                        tracing::warn!("{message}");
+                        self.emit(SenderEvent::Error(message));
+                    }
+                } else {
+                    self.no_media_reports = 0;
+                }
                 let before = self.adapter.current();
                 let after = self.adapter.on_report(s.loss_pct, Instant::now());
                 if after != before {

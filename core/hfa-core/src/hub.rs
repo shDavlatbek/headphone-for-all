@@ -36,11 +36,13 @@
 //!   → mixer (gain, mute, priority ducking, limiter) → output format → output ring. It polls
 //!   [`AudioOutput::has_error`] and restarts a failed output.
 //! - **Stats task:** every [`STATS_INTERVAL`] it refreshes each [`SourceInfo`]
-//!   ([`HubEvent::SourceUpdated`]) and sends `Stats` to its sender. `Stats.loss_pct` is the
-//!   **network** loss (before recovery, what the sender adapts to); [`StreamStats::loss_pct`]
-//!   is the loss left after redundancy/FEC. A stream without datagrams (audio or DTX
-//!   keep-alives) for [`IDLE_AFTER`] is inactive; after [`REMOVE_AFTER`] it is removed and
-//!   its connection closed.
+//!   ([`HubEvent::SourceUpdated`]) and sends `Stats` to its sender whenever a loss measurement
+//!   completed (at least 40 frames, or none at all during DTX; a partial interval is extended
+//!   and not reported). `Stats.loss_pct` is the **network** loss (before recovery, what the
+//!   sender adapts to); [`StreamStats::loss_pct`] is what the listener misses after
+//!   redundancy/FEC. A stream without datagrams (audio or DTX keep-alives) for [`IDLE_AFTER`]
+//!   is inactive and reported to its sender as [`NO_MEDIA_LOSS_PCT`] loss (nothing arrives);
+//!   after [`REMOVE_AFTER`] it is removed and its connection closed.
 //! - [`HubHandle::stop`] closes every connection with `Bye`, stops advertising, the tasks,
 //!   the mixer and the output.
 
@@ -80,6 +82,10 @@ pub const STATS_INTERVAL: Duration = Duration::from_secs(1);
 pub const IDLE_AFTER: Duration = Duration::from_secs(2);
 /// A stream without packets for this long is removed.
 pub const REMOVE_AFTER: Duration = Duration::from_secs(30);
+/// `Stats.loss_pct` sent for a stream that received no datagram at all (not even a DTX
+/// keep-alive) for [`IDLE_AFTER`]: everything is lost on the way (e.g. a firewall that lets
+/// the TCP control connection through but blocks UDP).
+pub const NO_MEDIA_LOSS_PCT: f32 = 100.0;
 /// Most streams the hub mixes at once.
 pub const MAX_STREAMS: usize = 16;
 /// Most simultaneous authenticated control connections.
@@ -644,7 +650,20 @@ impl Shared {
                 let recovered = cur.recovered.saturating_sub(e.last.recovered).min(lost);
                 let overflowed = cur.overflowed.saturating_sub(e.last.overflowed);
                 let total = lost + played;
-                if total >= MIN_FRAMES_FOR_LOSS {
+                let idle_for = now.saturating_duration_since(last_packet);
+                let active = idle_for < IDLE_AFTER;
+                // Whether this tick completed a measurement worth sending to the sender. A
+                // partial interval is not: re-sending the previous value would count one
+                // heavy-loss second twice in the sender's adaptation.
+                let mut report = true;
+                if !active {
+                    // Not even DTX keep-alives (every 100 ms) arrive: everything the sender
+                    // sends is lost (UDP blocked by a firewall, or an outage). Say so instead
+                    // of "0 %" (see NO_MEDIA_LOSS_PCT).
+                    e.last = cur;
+                    e.loss_pct = NO_MEDIA_LOSS_PCT;
+                    e.residual_loss_pct = 0.0;
+                } else if total >= MIN_FRAMES_FOR_LOSS {
                     // Too few frames (start-up, DTX) would give a noisy estimate that the
                     // sender might overreact to: keep the previous values and let the
                     // interval grow until it holds enough frames.
@@ -656,13 +675,13 @@ impl Shared {
                     e.residual_loss_pct = 100.0 * (lost - recovered + overflowed) as f32
                         / (total + overflowed) as f32;
                 } else if total == 0 {
-                    // Nothing played (DTX or idle): no loss either.
+                    // Nothing played while keep-alives arrive (DTX): no loss either.
                     e.last = cur;
                     e.loss_pct = 0.0;
                     e.residual_loss_pct = 0.0;
+                } else {
+                    report = false;
                 }
-                let idle_for = now.saturating_duration_since(last_packet);
-                let active = idle_for < IDLE_AFTER;
                 // The audio actually queued while playing (a burst can leave more than the
                 // target for a while), the target before playout starts.
                 let queued = if primed { buffered } else { target };
@@ -683,16 +702,18 @@ impl Shared {
                     expired.push((e.info.stream_id, e.tx.clone()));
                     continue;
                 }
-                let stats = Stats {
-                    stream_id: e.info.stream_id,
-                    loss_pct: e.loss_pct,
-                    jitter_ms: jb.jitter_ms,
-                    buffer_ms: buffered as f32,
-                    latency_ms,
-                    recommended_bitrate: 0,
-                };
-                let _ =
-                    e.tx.send(ConnCommand::Send(ControlMessage::new(Body::Stats(stats))));
+                if report {
+                    let stats = Stats {
+                        stream_id: e.info.stream_id,
+                        loss_pct: e.loss_pct,
+                        jitter_ms: jb.jitter_ms,
+                        buffer_ms: buffered as f32,
+                        latency_ms,
+                        recommended_bitrate: 0,
+                    };
+                    let _ =
+                        e.tx.send(ConnCommand::Send(ControlMessage::new(Body::Stats(stats))));
+                }
                 updates.push(e.info.clone());
             }
         }

@@ -921,6 +921,13 @@ Modules:
   the same restart: it no longer calls `reset_at` (which discarded those packets for good — the replay window had
   already accepted them). Instead **new `JitterBuffer::lower_floor(seq)`** lowers the post-reset floor so the late
   reset packet still joins the buffer, as long as nothing was played since the reset (otherwise it is `TooLate`).
+- **Loss reports (`Stats`).** The hub sends `Stats` to a sender only when a loss measurement **completed**: ≥ 40
+  frames, or no frame at all while DTX keep-alives arrive (0 %). A partial interval is extended and **not** sent
+  (re-sending the previous value counted one heavy-loss second twice in the sender's adaptation). A stream that
+  received no datagram at all for `IDLE_AFTER` (not even keep-alives, e.g. UDP blocked by a firewall while TCP
+  works, or an outage) is reported as **`hub::NO_MEDIA_LOSS_PCT` (100 %)** instead of 0 %. After
+  `NO_MEDIA_REPORTS = 3` such reports in a row the sender emits `SenderEvent::Error("the hub receives no audio from
+  this device (is UDP port N blocked by a firewall …?)")` (once per stream); `SenderStatus.loss_pct` shows 100.
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 
