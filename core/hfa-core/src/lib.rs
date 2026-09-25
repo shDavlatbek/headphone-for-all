@@ -45,7 +45,9 @@ pub use sender::{
 /// Result type used throughout this crate.
 pub type Result<T> = std::result::Result<T, CoreError>;
 
-/// Application version reported in `Hello`.
+/// Application version reported in `Hello` and shown as the app version (`AppInfo.version`).
+/// The Rust workspace version (`core/Cargo.toml`) and the app's `version` in
+/// `app/pubspec.yaml` (which names the installers and bundles) move together; a test checks it.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Platform name reported in `Hello` and mDNS TXT records:
@@ -140,6 +142,27 @@ pub(crate) mod test_alloc {
 
 #[cfg(test)]
 mod tests {
+    /// The core reports the same version as the app, installers and bundles ship
+    /// (`app/pubspec.yaml`, `version: x.y.z+build`).
+    #[test]
+    fn app_version_matches_the_flutter_app() {
+        let pubspec = concat!(env!("CARGO_MANIFEST_DIR"), "/../../app/pubspec.yaml");
+        let Ok(text) = std::fs::read_to_string(pubspec) else {
+            eprintln!("{pubspec} not found (crate built outside the repository); skipped");
+            return;
+        };
+        let version = text
+            .lines()
+            .find_map(|l| l.strip_prefix("version:"))
+            .map(|v| v.trim().split('+').next().unwrap_or_default().to_owned())
+            .expect("pubspec version");
+        assert_eq!(
+            super::APP_VERSION,
+            version,
+            "bump core/Cargo.toml [workspace.package] version together with app/pubspec.yaml"
+        );
+    }
+
     #[test]
     fn platform_name_is_known_on_ci_targets() {
         let name = super::platform_name();

@@ -3,7 +3,7 @@ members = ["hfa-proto", "hfa-audio", "hfa-capture", "hfa-core", "hfa-ffi", "hfa-
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 # rubato 5 (the newest resampler release) needs Rust 1.87.
 rust-version = "1.87"
@@ -18,10 +18,10 @@ repository = "https://github.com/shDavlatbek/headphone-for-all"
 # member re-enables them through its own default `bundled-opus` feature. This lets
 # `--no-default-features` skip the libopus C build (e.g. `cargo check` for Apple targets
 # on a Linux host without the macOS SDK). See docs/CONTRACTS.md "Cargo features".
-hfa-proto = { path = "hfa-proto", version = "0.1.0" }
-hfa-audio = { path = "hfa-audio", version = "0.1.0", default-features = false }
-hfa-capture = { path = "hfa-capture", version = "0.1.0", default-features = false }
-hfa-core = { path = "hfa-core", version = "0.1.0", default-features = false }
+hfa-proto = { path = "hfa-proto", version = "1.0.0" }
+hfa-audio = { path = "hfa-audio", version = "1.0.0", default-features = false }
+hfa-capture = { path = "hfa-capture", version = "1.0.0", default-features = false }
+hfa-core = { path = "hfa-core", version = "1.0.0", default-features = false }
 
 # --- errors, logging, utilities ---
 thiserror = "2.0.21"

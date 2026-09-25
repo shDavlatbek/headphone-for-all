@@ -981,6 +981,9 @@ Modules:
   sender ends in **`Failed("the audio capture stopped: <reason>")`** (also emitted as `SenderEvent::Error`), also
   while it is waiting to reconnect — instead of treating a dead capture as silence (DTX keep-alives forever while
   `Streaming`).
+- **Version.** The Rust workspace version is **1.0.0**, the same as `app/pubspec.yaml` (`version: 1.0.0+1`), so
+  `hfa_core::APP_VERSION` (`AppInfo.version` on the About screen, `Hello.app_version`) matches the installed app.
+  Both move together; `hfa-core`'s unit test `app_version_matches_the_flutter_app` fails when they differ.
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

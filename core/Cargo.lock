@@ -1052,7 +1052,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hfa-audio"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "hound",
  "opusic-sys",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "hfa-capture"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "block2",
  "cpal",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "hfa-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "hfa-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "directories",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "hfa-ffi"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "hfa-proto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "chacha20poly1305 0.11.0",
