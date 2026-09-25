@@ -35,7 +35,7 @@ pub use control::{ControlChannel, PeerInfo};
 pub use discovery::{browse, Advertiser, Browser, DiscoveryEvent, HubInfo};
 pub use error::CoreError;
 pub use hub::{HubConfig, HubEngine, HubEvent, HubHandle, SourceInfo, StreamCounters, StreamStats};
-pub use identity::{Identity, TrustStore, TrustedPeer};
+pub use identity::{Identity, PeerRole, PeerRoles, TrustStore, TrustedPeer};
 pub use pairing::{PairingAttempt, PairingInfo, PairingManager};
 pub use sender::{
     HubAddress, SenderConfig, SenderEngine, SenderEvent, SenderHandle, SenderState, SenderStatus,

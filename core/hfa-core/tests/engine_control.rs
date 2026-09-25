@@ -286,3 +286,69 @@ async fn silent_connections_cannot_lock_senders_out() {
     sender.sender.stop().await;
     hub.hub.stop().await;
 }
+
+/// A sender removed from the hub's trusted devices while connected (the app's "forget",
+/// through its own `TrustStore` handle) is disconnected at once, and the hub does not accept
+/// it again without a new pairing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forgetting_a_connected_sender_disconnects_it() {
+    let _serial = serial().await;
+    let hub_dev = Device::new("Hub");
+    let mut hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let pin = hub.hub.start_pairing().pin;
+    let dev = Device::new("Probe");
+    let identity = Identity::load_or_create(dev.path(), "Probe").expect("identity");
+    let trust = TrustStore::load(dev.path()).expect("trust");
+    let addr: SocketAddr = ([127, 0, 0, 1], hub.hub.local_port()).into();
+    let (mut ch, _) = ControlChannel::connect(addr, &identity, &trust, None, Some(pin))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        request(&mut ch, stream_start(1)).await,
+        Answer::Accepted { .. }
+    ));
+    wait_source_added(&mut hub, START_TIMEOUT).await;
+
+    let settings_trust = TrustStore::load(hub_dev.path()).expect("hub trust");
+    let id = identity.device_id.clone();
+    tokio::task::spawn_blocking(move || settings_trust.remove(&id))
+        .await
+        .expect("join")
+        .expect("forget");
+
+    let bye = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ch.recv().await {
+                Ok(msg) => {
+                    if let Some(Body::Bye(b)) = msg.body {
+                        break Some(b.reason);
+                    }
+                }
+                Err(_) => break None,
+            }
+        }
+    })
+    .await
+    .expect("the hub disconnects the forgotten sender");
+    assert!(
+        bye.as_deref().is_some_and(|r| r.contains("removed")),
+        "{bye:?}"
+    );
+    let removed = wait_event(&mut hub.events, Duration::from_secs(5), |e| match e {
+        HubEvent::SourceRemoved { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(
+        removed.is_some(),
+        "the forgotten sender's stream is removed"
+    );
+
+    // Reconnecting without a secret is refused now.
+    let again = ControlChannel::connect(addr, &identity, &trust, None, None).await;
+    assert!(
+        matches!(again, Err(hfa_core::CoreError::PairingRequired)),
+        "{again:?}"
+    );
+    hub.hub.stop().await;
+}

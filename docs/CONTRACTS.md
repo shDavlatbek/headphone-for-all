@@ -899,6 +899,64 @@ Modules:
   WAV analysis with a 50 ms-block Goertzel detector — a single long Goertzel sum is cancelled by the tiny frequency
   shifts of drift correction).
 
+### 6.4 Refinements made by `fix/core-sec` (the code and module docs in `core/hfa-core/src/{identity,control,discovery}.rs` are authoritative; they override §6.2 where they differ)
+
+- **Identity file:** `public_key` must be the X25519 public key of `private_key` (derived with the new
+  `hfa_proto::StaticKeypair::from_private(&[u8; 32]) -> Result<StaticKeypair>`); a mismatch is
+  `Config("identity file: public key does not match private key")` on load.
+- **Trust store — one shared, file-backed store per data directory:**
+  - `TrustStore::load(dir)` returns the process's live store for that (canonicalized) directory if a handle to it is
+    alive (process-wide registry of weak handles), after re-reading `trusted.json` if it changed; otherwise it loads a
+    new one. The hub engine, the sender engine and `hfa-ffi` therefore share one list.
+  - `add`/`remove` are **read-modify-write against the file**: under the in-process save lock plus an exclusive advisory
+    lock (`fs4`) on `<dir>/trusted.json.lock` (`pub const TRUST_LOCK_FILE`), they re-read `trusted.json`, apply their
+    change to it, save atomically and swap the result in. Changes of other handles/processes are never lost and a
+    removed peer never comes back with a later save. A file that cannot be parsed fails the write (`Json`/`Config`)
+    and is never overwritten. `remove` of an unknown id writes nothing.
+  - Readers (`is_trusted`, `is_trusted_as`, `get`, `peers`) never wait for a writer: at most once per
+    `pub const TRUST_RELOAD_INTERVAL = 1 s` one of them stats the file (len, mtime, and dev/inode on unix) and re-reads
+    it if another process replaced it (skipped while a writer of this process is busy; an unreadable file keeps the
+    loaded list, with a warning). `reload() -> Result<bool>` forces the check (blocking).
+  - `subscribe() -> tokio::sync::watch::Receiver<u64>`: a change counter bumped whenever the peer list changes.
+    **The hub engine subscribes per connection and closes a connection with `Bye{"device removed from the trusted
+    devices"}` as soon as its sender is no longer trusted as a sender** (its streams are removed as usual), so
+    "forget" needs no hub restart any more.
+- **Directional trust (roles):** `TrustedPeer` gains `roles: PeerRoles {hub: bool, sender: bool}`
+  (`"roles":{"hub":..,"sender":..}` in `trusted.json`, `#[serde(default)]` = both, so entries written before this
+  change keep their old behaviour). `PeerRole {Hub, Sender}`; `PeerRoles::{BOTH, only(role), contains, union}`.
+  `TrustedPeer::paired_as(key, name, role)` records one role; `TrustedPeer::new` still means both (manual trust).
+  A pairing saves one role on each side: the sender saves the hub as `Hub`, the hub saves the sender as `Sender`;
+  `add` merges the roles of an existing entry (pairing in the other direction later adds the other role).
+  `TrustStore::is_trusted_as(key, role)`; `is_trusted` stays "any role". The control procedure uses the roles:
+  the sender's `Hello.pairing_required = !is_trusted_as(hub, Hub)`, the hub's
+  `pairing_required = !is_trusted_as(sender, Sender) || sender_hello.pairing_required`. §6.2's "both add each
+  other" now means "each adds the other in the role it played".
+- **Expected hub id in the handshake:** new `ControlChannel::connect_checked(addr, identity, trust,
+  expected_hub_key, expected_hub_id: Option<&str>, secret)`; `connect` = `connect_checked(.., None, ..)`. The id is
+  compared with the fingerprint of the hub's static key right after Noise message 2, like the key, so a hub with
+  another key gets no static key, `Hello` or pairing attempt (`KeyMismatch(<its id>)`). The sender engine passes the
+  id for `HubAddress::Discover` by id (and the pinned hub), and turns a `KeyMismatch` at an address that came from
+  mDNS into a retryable `HubNotFound` (backoff); a key mismatch for a direct address stays final.
+- **Discovery:**
+  - The `mdns-sd` advertiser disables its IPv6 interfaces before registering, so only IPv4 addresses are announced
+    (the hub binds IPv4 only). Re-enable it together with a dual-stack hub bind.
+  - **Platform backend hook** (for iOS, where `mdns-sd`'s own multicast sockets need the restricted
+    `com.apple.developer.networking.multicast` entitlement): `pub trait PlatformDiscovery: Send + Sync {
+    fn browse(&self, feed: DiscoveryFeed) -> Result<DiscoveryGuard>; fn advertise(&self, service: &ServiceAdvert) ->
+    Result<DiscoveryGuard>; }` with `pub type DiscoveryGuard = Box<dyn Send + Sync>` (dropping it stops the backend's
+    browse/registration) and `pub fn set_platform_backend(Option<Arc<dyn PlatformDiscovery>>)` (process-wide; later
+    `browse()` / `Advertiser::start` use it instead of `mdns-sd`, on any OS). `ServiceAdvert {instance, service_type
+    (= SERVICE_TYPE), port, txt: Vec<(String, String)> (v, id, name, platform)}`. `DiscoveryFeed` (cloneable):
+    `resolved(instance, txt, addrs, port) -> bool`, `removed(instance) -> bool`, `is_closed()`; it applies the same
+    validation and `Found`/`Lost` rules as the `mdns-sd` path (shared code) and returns `false` once the `Browser` is
+    dropped. On iOS without a registered backend, `browse()` and `Advertiser::start` fail with `Discovery(..)`
+    instead of finding nothing. **Open:** the Swift `NWBrowser`/`NWListener` backend and its registration through
+    `hfa-ffi` (owned by the Apple/FFI areas).
+- Tests: `tests/net_persist.rs` (shared stores, lost-update and resurrection regressions, merge with another
+  process's write, lazy/forced reload, corrupt file, roles + legacy files), `tests/net_control.rs` (id mismatch
+  before pairing, one-way pairing), `tests/engine_control.rs` (forgetting a connected sender disconnects it),
+  `tests/discovery_backend.rs` (fake platform backend), `tests/net_discovery.rs` (IPv4-only advertising).
+
 ## 7. `hfa-cli` (`hfa` binary, clap)
 
 - `hfa hub [--port N] [--out default|device:<name>|wav:<path>|null] [--no-mdns] [--pair]`: prints the PIN and URI and shows a live sources table.

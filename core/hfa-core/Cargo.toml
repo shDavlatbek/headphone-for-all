@@ -28,6 +28,8 @@ zeroize = { workspace = true }
 directories = { workspace = true }
 mdns-sd = { workspace = true }
 if-addrs = { workspace = true }
+# Advisory lock of `trusted.json.lock` (cross-process trust-store writers).
+fs4 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # gethostname() for the default device name.

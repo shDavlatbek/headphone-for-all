@@ -5,19 +5,27 @@
 //!   (standard base64 with padding). On unix it is created with mode `0600` directly (the
 //!   temporary file is created with that mode, so the private key is never readable by other
 //!   users, not even briefly), and an existing file with a wider mode is tightened on load.
+//!   The public key must be the one derived from the private key (checked on load).
 //! - [`TRUST_FILE`] (`trusted.json`): `{"version":1,"peers":[{"device_id":..,"name":..,
-//!   "public_key":"<b64>","paired_at":<unix s>}]}`, rewritten atomically (temp file + rename)
-//!   on every change, mode `0600` on unix.
+//!   "public_key":"<b64>","paired_at":<unix s>,"roles":{"hub":..,"sender":..}}]}`,
+//!   rewritten atomically (temp file + rename) on every change, mode `0600` on unix. Writers
+//!   of every process serialize on an advisory lock of [`TRUST_LOCK_FILE`] and re-read the
+//!   file before changing it (see [`TrustStore`]). `roles` ([`PeerRoles`]) says in which
+//!   direction a peer was paired; entries without it (older files) are trusted both ways.
 //!
 //! The `device_id` is always [`hfa_proto::fingerprint`] of the static public key.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use hfa_proto::StaticKeypair;
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use crate::config::{write_file_atomic, write_temp_file};
@@ -111,10 +119,16 @@ fn parse_identity_file(file: IdentityFile) -> Result<StaticKeypair> {
             "identity file holds an all-zero key".into(),
         ));
     }
-    Ok(StaticKeypair {
-        private: *private,
-        public,
-    })
+    // The Noise handshake uses the key derived from the private key, while the device id
+    // (and the hub's pairing URI / mDNS id) comes from the stored public key: a mismatch
+    // would load fine and then fail every connection with a confusing key error.
+    let keypair = StaticKeypair::from_private(&private)?;
+    if keypair.public != public {
+        return Err(CoreError::Config(
+            "identity file: public key does not match private key".into(),
+        ));
+    }
+    Ok(keypair)
 }
 
 /// Generates a keypair and stores it at `path` without ever overwriting an existing file.
@@ -212,6 +226,79 @@ mod b64_key {
     }
 }
 
+/// A direction in which a peer was paired with this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerRole {
+    /// The peer is a hub: this device paired with it as a sender and may stream to it.
+    Hub,
+    /// The peer is a sender: it paired with this device's hub and may stream into it.
+    Sender,
+}
+
+/// The directions a trusted peer was paired in (`"roles":{"hub":..,"sender":..}` in
+/// `trusted.json`).
+///
+/// Pairing grants trust in one direction only: a sender that paired with a hub trusts it
+/// *as a hub*, and the hub trusts the sender *as a sender*. So pairing this device as a
+/// sender with a friend's hub never lets that hub stream into this device's own hub
+/// without a pairing of its own. Entries written before roles existed have no `roles`
+/// field and load as [`PeerRoles::BOTH`] (the behaviour they were created with).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PeerRoles {
+    /// Trusted as a hub (see [`PeerRole::Hub`]).
+    pub hub: bool,
+    /// Trusted as a sender (see [`PeerRole::Sender`]).
+    pub sender: bool,
+}
+
+impl PeerRoles {
+    /// Trusted in both directions (entries from before roles existed, manual trust).
+    pub const BOTH: PeerRoles = PeerRoles {
+        hub: true,
+        sender: true,
+    };
+
+    /// Only the given role.
+    pub const fn only(role: PeerRole) -> PeerRoles {
+        match role {
+            PeerRole::Hub => PeerRoles {
+                hub: true,
+                sender: false,
+            },
+            PeerRole::Sender => PeerRoles {
+                hub: false,
+                sender: true,
+            },
+        }
+    }
+
+    /// `true` if `role` is granted.
+    pub const fn contains(self, role: PeerRole) -> bool {
+        match role {
+            PeerRole::Hub => self.hub,
+            PeerRole::Sender => self.sender,
+        }
+    }
+
+    /// The roles granted by either `self` or `other`.
+    #[must_use]
+    pub const fn union(self, other: PeerRoles) -> PeerRoles {
+        PeerRoles {
+            hub: self.hub || other.hub,
+            sender: self.sender || other.sender,
+        }
+    }
+}
+
+impl Default for PeerRoles {
+    /// [`PeerRoles::BOTH`]: what an entry without a `roles` field (written before roles
+    /// existed) was trusted for.
+    fn default() -> Self {
+        PeerRoles::BOTH
+    }
+}
+
 /// A paired peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedPeer {
@@ -224,16 +311,31 @@ pub struct TrustedPeer {
     pub public_key: [u8; 32],
     /// Unix time (seconds) of pairing.
     pub paired_at: u64,
+    /// The directions this peer is trusted in (missing in older files: both).
+    #[serde(default)]
+    pub roles: PeerRoles,
 }
 
 impl TrustedPeer {
-    /// A peer with `device_id` derived from `public_key` and `paired_at` = now.
+    /// A peer trusted in **both** directions ([`PeerRoles::BOTH`]), with `device_id` derived
+    /// from `public_key` and `paired_at` = now. Pairings record one direction only: use
+    /// [`TrustedPeer::paired_as`] for them.
     pub fn new(public_key: [u8; 32], name: impl Into<String>) -> Self {
         Self {
             device_id: hfa_proto::fingerprint(&public_key),
             name: name.into(),
             public_key,
             paired_at: unix_now(),
+            roles: PeerRoles::BOTH,
+        }
+    }
+
+    /// A peer trusted only as `role` (what a pairing records), otherwise like
+    /// [`TrustedPeer::new`].
+    pub fn paired_as(public_key: [u8; 32], name: impl Into<String>, role: PeerRole) -> Self {
+        Self {
+            roles: PeerRoles::only(role),
+            ..Self::new(public_key, name)
         }
     }
 }
@@ -245,17 +347,33 @@ struct TrustFile {
     peers: Vec<TrustedPeer>,
 }
 
+/// File name of the lock file that serializes trust-store writers of all processes.
+pub const TRUST_LOCK_FILE: &str = "trusted.json.lock";
+/// How often a reader checks whether another process changed `trusted.json`.
+pub const TRUST_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The set of trusted peers, persisted in `<data_dir>/trusted.json`.
 ///
-/// A cheap-to-clone, thread-safe handle: clones share the same store, and every mutation is
-/// saved to disk immediately (atomically: temp file + rename). If saving fails, the in-memory
-/// store is left unchanged, so memory and disk never disagree.
+/// **One store per data directory and process:** [`TrustStore::load`] returns a handle to
+/// the same shared store for the same directory as long as any handle to it is alive, so
+/// the hub, the sender and the app's settings see each other's changes at once, and
+/// [`TrustStore::subscribe`] tells them about every change. Handles are cheap to clone and
+/// thread-safe.
 ///
-/// Readers ([`TrustStore::is_trusted`], [`TrustStore::get`], [`TrustStore::peers`]) never
-/// wait for disk I/O, so they may be called from async tasks: writers are serialized by a
-/// separate lock held during the save, and the peer list lock is only taken briefly to copy
-/// the list and to swap in the saved one. [`TrustStore::add`] and [`TrustStore::remove`] do
-/// block (file write + fsync); call them from `spawn_blocking` or a non-async thread.
+/// **The file is the source of truth:** [`TrustStore::add`] and [`TrustStore::remove`] take an
+/// exclusive advisory lock on `<data_dir>/`[`TRUST_LOCK_FILE`] (other processes: CLI, a
+/// second app instance, the iOS extension), re-read `trusted.json`, apply their change to
+/// what is on disk and write it back atomically (temp file + rename). So no update of another
+/// handle or process is lost, and a peer removed elsewhere never comes back with the next
+/// save. If saving fails, the in-memory store is left unchanged.
+///
+/// Readers ([`TrustStore::is_trusted`], [`TrustStore::is_trusted_as`], [`TrustStore::get`],
+/// [`TrustStore::peers`]) never wait for a writer, so they may be called from async tasks:
+/// they only copy the in-memory list, and at most once per [`TRUST_RELOAD_INTERVAL`] one of
+/// them checks the file's metadata and re-reads the file if another process changed it
+/// (skipped while a writer of this process is busy; a file that cannot be read keeps the
+/// current list). [`TrustStore::add`], [`TrustStore::remove`] and [`TrustStore::reload`]
+/// block (file lock, write + fsync); call them from `spawn_blocking` or a non-async thread.
 #[derive(Clone)]
 pub struct TrustStore {
     inner: Arc<TrustInner>,
@@ -263,102 +381,164 @@ pub struct TrustStore {
 
 struct TrustInner {
     path: PathBuf,
-    /// The current (saved) peer list. Held only for short, I/O-free sections.
-    peers: parking_lot::Mutex<Vec<TrustedPeer>>,
-    /// Serializes writers for the whole read-modify-save-swap sequence, so no update is lost.
+    lock_path: PathBuf,
+    /// The current peer list and what it was read from. Held only for short, I/O-free
+    /// sections.
+    state: parking_lot::Mutex<TrustState>,
+    /// Serializes this process's writers (and forced reloads) for the whole
+    /// read-modify-save-swap sequence.
     save_lock: parking_lot::Mutex<()>,
+    /// Change counter, bumped whenever the peer list changes.
+    changes: watch::Sender<u64>,
+}
+
+struct TrustState {
+    peers: Vec<TrustedPeer>,
+    /// Identity of the `trusted.json` version `peers` reflects (`None`: no file).
+    stamp: Option<FileStamp>,
+    /// When a reader last compared `stamp` with the file.
+    checked: Instant,
+}
+
+/// What identifies one version of `trusted.json` (every save replaces the file).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> FileStamp {
+        FileStamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino())
+            },
+        }
+    }
+}
+
+/// Every live store of this process, by canonical trust-file path.
+fn registry() -> &'static parking_lot::Mutex<HashMap<PathBuf, Weak<TrustInner>>> {
+    static REGISTRY: OnceLock<parking_lot::Mutex<HashMap<PathBuf, Weak<TrustInner>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(Default::default)
 }
 
 impl fmt::Debug for TrustStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TrustStore")
             .field("path", &self.inner.path)
-            .field("peers", &self.inner.peers.lock().len())
+            .field("peers", &self.inner.state.lock().peers.len())
             .finish()
     }
 }
 
 impl TrustStore {
-    /// Loads `<data_dir>/trusted.json` (empty store if missing). Entries whose `device_id`
-    /// does not match their key are dropped with a warning.
+    /// Opens the trust store of `data_dir` (empty if `trusted.json` is missing). If this
+    /// process already has a live store for that directory, returns a handle to it (after
+    /// picking up changes on disk). Entries whose `device_id` does not match their key are
+    /// dropped with a warning.
     ///
     /// # Errors
     /// [`crate::CoreError::Io`] / [`crate::CoreError::Json`], [`crate::CoreError::Config`]
     /// for an unsupported file version.
     pub fn load(data_dir: &Path) -> Result<TrustStore> {
-        let path = data_dir.join(TRUST_FILE);
-        let peers = match std::fs::read(&path) {
-            Ok(bytes) => {
-                let file: TrustFile = serde_json::from_slice(&bytes)?;
-                if file.version != FILE_FORMAT_VERSION {
-                    return Err(CoreError::Config(format!(
-                        "unsupported trust store version {}",
-                        file.version
-                    )));
-                }
-                let mut peers: Vec<TrustedPeer> = Vec::with_capacity(file.peers.len());
-                for peer in file.peers {
-                    if peer.device_id != hfa_proto::fingerprint(&peer.public_key) {
-                        tracing::warn!(device_id = %peer.device_id, "dropping a trusted peer whose id does not match its key");
-                    } else if !peers.iter().any(|p| p.public_key == peer.public_key) {
-                        peers.push(peer);
-                    }
-                }
-                peers
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(TrustStore {
-            inner: Arc::new(TrustInner {
-                path,
-                peers: parking_lot::Mutex::new(peers),
-                save_lock: parking_lot::Mutex::new(()),
+        let path = canonical_dir(data_dir).join(TRUST_FILE);
+        let mut stores = registry().lock();
+        stores.retain(|_, store| store.strong_count() > 0);
+        if let Some(inner) = stores.get(&path).and_then(Weak::upgrade) {
+            drop(stores);
+            let store = TrustStore { inner };
+            store.reload()?;
+            return Ok(store);
+        }
+        let (peers, stamp) = read_trust_file(&path)?;
+        let inner = Arc::new(TrustInner {
+            lock_path: path.with_file_name(TRUST_LOCK_FILE),
+            path: path.clone(),
+            state: parking_lot::Mutex::new(TrustState {
+                peers,
+                stamp,
+                checked: Instant::now(),
             }),
-        })
+            save_lock: parking_lot::Mutex::new(()),
+            changes: watch::Sender::new(0),
+        });
+        stores.insert(path, Arc::downgrade(&inner));
+        Ok(TrustStore { inner })
     }
 
-    /// `true` if a peer with this public key is trusted.
+    /// `true` if a peer with this public key is trusted (in any role).
     pub fn is_trusted(&self, public_key: &[u8; 32]) -> bool {
-        self.inner
-            .peers
-            .lock()
-            .iter()
-            .any(|p| p.public_key == *public_key)
+        self.read(|peers| peers.iter().any(|p| p.public_key == *public_key))
+    }
+
+    /// `true` if a peer with this public key is trusted as `role`.
+    pub fn is_trusted_as(&self, public_key: &[u8; 32], role: PeerRole) -> bool {
+        self.read(|peers| {
+            peers
+                .iter()
+                .any(|p| p.public_key == *public_key && p.roles.contains(role))
+        })
     }
 
     /// Looks a peer up by device id.
     pub fn get(&self, device_id: &str) -> Option<TrustedPeer> {
-        self.inner
-            .peers
-            .lock()
-            .iter()
-            .find(|p| p.device_id == device_id)
-            .cloned()
+        self.read(|peers| peers.iter().find(|p| p.device_id == device_id).cloned())
     }
 
-    /// Adds or replaces (same device id) a peer and saves.
+    /// All trusted peers.
+    pub fn peers(&self) -> Vec<TrustedPeer> {
+        self.read(<[TrustedPeer]>::to_vec)
+    }
+
+    /// A receiver of the store's change counter: it changes whenever the peer list does
+    /// (a pairing, a removal, a change by another process picked up by a reader or
+    /// [`TrustStore::reload`]). The hub uses it to disconnect senders that were removed.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.inner.changes.subscribe()
+    }
+
+    /// Re-reads `trusted.json` now if it changed on disk. Returns `true` if the peer list
+    /// changed. Blocks (waits for this process's writers).
+    ///
+    /// # Errors
+    /// As [`TrustStore::load`] (the in-memory list is then unchanged).
+    pub fn reload(&self) -> Result<bool> {
+        let _writer = self.inner.save_lock.lock();
+        self.refresh_locked()
+    }
+
+    /// Adds a peer and saves. A peer with the same device id is replaced, keeping the roles
+    /// it already had ([`PeerRoles::union`]), so pairing in the other direction adds a role.
     ///
     /// # Errors
     /// [`crate::CoreError::Config`] if `peer.device_id` is not the fingerprint of
     /// `peer.public_key`; [`crate::CoreError::Io`] / [`crate::CoreError::Json`] (the store is
     /// then unchanged).
-    pub fn add(&self, peer: TrustedPeer) -> Result<()> {
+    pub fn add(&self, mut peer: TrustedPeer) -> Result<()> {
         if peer.device_id != hfa_proto::fingerprint(&peer.public_key) {
             return Err(CoreError::Config(format!(
                 "device id {} does not match the peer's key",
                 peer.device_id
             )));
         }
-        let _writer = self.inner.save_lock.lock();
-        let mut peers = self.peers();
-        match peers.iter_mut().find(|p| p.device_id == peer.device_id) {
-            Some(existing) => *existing = peer,
-            None => peers.push(peer),
-        }
-        save_peers(&self.inner.path, &peers)?;
-        *self.inner.peers.lock() = peers;
-        Ok(())
+        self.modify(move |peers| {
+            match peers.iter_mut().find(|p| p.device_id == peer.device_id) {
+                Some(existing) => {
+                    peer.roles = peer.roles.union(existing.roles);
+                    *existing = peer;
+                }
+                None => peers.push(peer),
+            }
+            (true, ())
+        })
     }
 
     /// Removes a peer by device id and saves. Returns `true` if it existed.
@@ -366,21 +546,155 @@ impl TrustStore {
     /// # Errors
     /// [`crate::CoreError::Io`] / [`crate::CoreError::Json`] (the store is then unchanged).
     pub fn remove(&self, device_id: &str) -> Result<bool> {
-        let _writer = self.inner.save_lock.lock();
-        let mut peers = self.peers();
-        let Some(pos) = peers.iter().position(|p| p.device_id == device_id) else {
-            return Ok(false);
-        };
-        peers.remove(pos);
-        save_peers(&self.inner.path, &peers)?;
-        *self.inner.peers.lock() = peers;
-        Ok(true)
+        self.modify(
+            |peers| match peers.iter().position(|p| p.device_id == device_id) {
+                Some(pos) => {
+                    peers.remove(pos);
+                    (true, true)
+                }
+                None => (false, false),
+            },
+        )
     }
 
-    /// All trusted peers.
-    pub fn peers(&self) -> Vec<TrustedPeer> {
-        self.inner.peers.lock().clone()
+    /// Runs `f` on the in-memory list, first picking up another process's change of the
+    /// file if one is due (never waits for a writer).
+    fn read<R>(&self, f: impl FnOnce(&[TrustedPeer]) -> R) -> R {
+        let due = self.inner.state.lock().checked.elapsed() >= TRUST_RELOAD_INTERVAL;
+        if due {
+            if let Some(_writer) = self.inner.save_lock.try_lock() {
+                if let Err(e) = self.refresh_locked() {
+                    tracing::warn!(path = %self.inner.path.display(), error = %e, "cannot re-read the trust store; keeping the loaded one");
+                }
+            }
+        }
+        f(&self.inner.state.lock().peers)
     }
+
+    /// Re-reads the file if its stamp changed. The caller holds `save_lock`.
+    fn refresh_locked(&self) -> Result<bool> {
+        let stamp = file_stamp(&self.inner.path)?;
+        {
+            let mut state = self.inner.state.lock();
+            state.checked = Instant::now();
+            if state.stamp == stamp {
+                return Ok(false);
+            }
+        }
+        let (peers, stamp) = read_trust_file(&self.inner.path)?;
+        Ok(self.swap(peers, stamp))
+    }
+
+    /// Read-modify-write against the file under both locks. `f` returns whether it changed
+    /// the list (then it is saved) and the result.
+    fn modify<R>(&self, f: impl FnOnce(&mut Vec<TrustedPeer>) -> (bool, R)) -> Result<R> {
+        let _writer = self.inner.save_lock.lock();
+        let _file_lock = lock_file(&self.inner.lock_path)?;
+        let (mut peers, mut stamp) = read_trust_file(&self.inner.path)?;
+        let (changed, out) = f(&mut peers);
+        if changed {
+            save_peers(&self.inner.path, &peers)?;
+            stamp = file_stamp(&self.inner.path)?;
+        }
+        self.swap(peers, stamp);
+        Ok(out)
+    }
+
+    /// Installs a list read from or written to disk; notifies subscribers if it differs.
+    fn swap(&self, peers: Vec<TrustedPeer>, stamp: Option<FileStamp>) -> bool {
+        let changed = {
+            let mut state = self.inner.state.lock();
+            state.stamp = stamp;
+            state.checked = Instant::now();
+            if state.peers == peers {
+                false
+            } else {
+                state.peers = peers;
+                true
+            }
+        };
+        if changed {
+            self.inner.changes.send_modify(|n| *n = n.wrapping_add(1));
+        }
+        changed
+    }
+}
+
+/// `dir` with symlinks resolved (for the part of it that exists), so every spelling of a
+/// data directory maps to the same store.
+fn canonical_dir(dir: &Path) -> PathBuf {
+    let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return rest.iter().rev().fold(real, |p, c| p.join(c));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return absolute,
+        }
+    }
+}
+
+/// The stamp of the file at `path` (`None` if it does not exist).
+fn file_stamp(path: &Path) -> Result<Option<FileStamp>> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some(FileStamp::of(&meta))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Reads and validates `trusted.json` (empty if missing), with the stamp of the version read.
+fn read_trust_file(path: &Path) -> Result<(Vec<TrustedPeer>, Option<FileStamp>)> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+        Err(e) => return Err(e.into()),
+    };
+    // The stamp of the open file is the stamp of exactly the version read.
+    let stamp = FileStamp::of(&file.metadata()?);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let file: TrustFile = serde_json::from_slice(&bytes)?;
+    if file.version != FILE_FORMAT_VERSION {
+        return Err(CoreError::Config(format!(
+            "unsupported trust store version {}",
+            file.version
+        )));
+    }
+    let mut peers: Vec<TrustedPeer> = Vec::with_capacity(file.peers.len());
+    for peer in file.peers {
+        if peer.device_id != hfa_proto::fingerprint(&peer.public_key) {
+            tracing::warn!(device_id = %peer.device_id, "dropping a trusted peer whose id does not match its key");
+        } else if !peers.iter().any(|p| p.public_key == peer.public_key) {
+            peers.push(peer);
+        }
+    }
+    Ok((peers, Some(stamp)))
+}
+
+/// Opens (creating it and its directory if needed) and exclusively locks the trust-store
+/// lock file; the lock is released when the returned file is dropped.
+fn lock_file(path: &Path) -> Result<std::fs::File> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    // Fully qualified: std's inherent `File::lock` needs a newer Rust than the MSRV.
+    fs4::FileExt::lock(&file)?;
+    Ok(file)
 }
 
 fn save_peers(path: &Path, peers: &[TrustedPeer]) -> Result<()> {
@@ -417,9 +731,11 @@ mod tests {
                 public_key: public.into(),
             })
         };
-        let k = B64.encode([5u8; 32]);
-        assert!(ok(&k, &k).is_ok());
-        assert!(matches!(ok("!!", &k), Err(CoreError::Config(_))));
+        let kp = StaticKeypair::generate().expect("keypair");
+        let k = B64.encode(kp.private);
+        let public = B64.encode(kp.public);
+        assert_eq!(ok(&k, &public).expect("valid"), kp);
+        assert!(matches!(ok("!!", &public), Err(CoreError::Config(_))));
         assert!(matches!(
             ok(&B64.encode([5u8; 31]), &k),
             Err(CoreError::Config(_))
@@ -431,9 +747,29 @@ mod tests {
         let bad_version = parse_identity_file(IdentityFile {
             version: 9,
             private_key: k.clone(),
-            public_key: k,
+            public_key: public,
         });
         assert!(matches!(bad_version, Err(CoreError::Config(_))));
+        // A valid private key next to a public key that is not its own.
+        assert!(matches!(
+            ok(&k, &B64.encode([9u8; 32])),
+            Err(CoreError::Config(e)) if e.contains("does not match")
+        ));
+    }
+
+    #[test]
+    fn identity_with_a_mismatched_public_key_is_rejected_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let created = Identity::load_or_create(dir.path(), "Desk").expect("create");
+        let path = dir.path().join(IDENTITY_FILE);
+        let text = std::fs::read_to_string(&path).expect("read");
+        let edited = text.replace(&B64.encode(created.keypair.public), &B64.encode([9u8; 32]));
+        assert_ne!(text, edited);
+        std::fs::write(&path, edited).expect("write");
+        assert!(matches!(
+            Identity::load_or_create(dir.path(), "Desk"),
+            Err(CoreError::Config(_))
+        ));
     }
 
     #[test]

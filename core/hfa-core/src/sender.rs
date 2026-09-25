@@ -45,7 +45,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Settings;
 use crate::control::{ControlChannel, PeerInfo};
-use crate::identity::{Identity, TrustStore};
+use crate::identity::{Identity, PeerRole, TrustStore};
 use crate::media::MediaSender;
 use crate::sender_adapt::Adapter;
 use crate::sender_encoder::{EncoderCommand, EncoderEvent, EncoderParams, EncoderShared};
@@ -88,8 +88,11 @@ pub enum HubAddress {
     ///
     /// mDNS records are unauthenticated, so: when several hubs match a name, trusted hubs
     /// (in the sender's [`crate::TrustStore`]) are preferred; when `name_or_id` is a device
-    /// id, the engine checks after the handshake that the fingerprint of the hub's Noise
-    /// static key equals it and fails with [`crate::CoreError::KeyMismatch`] otherwise.
+    /// id, the engine checks during the handshake (right after Noise message 2, before the
+    /// sender reveals anything) that the fingerprint of the hub's Noise static key equals
+    /// it. A discovered address whose hub presents another key than the one expected is
+    /// treated like a hub that is not found yet (retried with backoff), never as a final
+    /// error: a stale or forged mDNS answer must not stop the sender.
     Discover {
         /// Device id (exact) or display name (case-insensitive).
         name_or_id: String,
@@ -574,19 +577,22 @@ impl Control {
     async fn connect_phase(&mut self) -> Result<(ControlChannel, PeerInfo)> {
         let (addr, discovered_key, required_id) = self.resolve().await?;
         let key = self.pinned.or(self.expected_hub_key).or(discovered_key);
-        if self.secret.is_some() && !key.is_some_and(|k| self.trust.is_trusted(&k)) {
+        if self.secret.is_some()
+            && !key.is_some_and(|k| self.trust.is_trusted_as(&k, PeerRole::Hub))
+        {
             self.set_state(SenderState::Pairing);
         }
         let secret = self.secret.as_ref().map(|s| s.as_str().to_owned());
-        let (ch, peer) =
-            ControlChannel::connect(addr, &self.identity, &self.trust, key, secret).await?;
-        if let Some(id) = required_id {
-            if peer.device_id != id {
-                let _ = ch.close("unexpected hub").await;
-                return Err(CoreError::KeyMismatch(peer.device_id));
-            }
-        }
-        Ok((ch, peer))
+        ControlChannel::connect_checked(
+            addr,
+            &self.identity,
+            &self.trust,
+            key,
+            required_id.as_deref(),
+            secret,
+        )
+        .await
+        .map_err(|e| discovered_hub_error(&self.hub, addr, e))
     }
 
     fn on_connected(&mut self, peer: &PeerInfo) {
@@ -895,6 +901,21 @@ impl Control {
     }
 }
 
+/// A key mismatch at an address found over mDNS means that address does not (or no longer)
+/// belong to the hub we want; mDNS is unauthenticated, so it becomes a retryable
+/// [`CoreError::HubNotFound`] instead of a final error. Other errors pass through.
+fn discovered_hub_error(hub: &HubAddress, addr: SocketAddr, error: CoreError) -> CoreError {
+    match (hub, error) {
+        (HubAddress::Discover { name_or_id }, CoreError::KeyMismatch(found)) => {
+            tracing::warn!(%addr, target = %name_or_id, %found, "a discovered hub presented an unexpected key");
+            CoreError::HubNotFound(format!(
+                "{name_or_id}: the device at {addr} (found over mDNS) has another key ({found})"
+            ))
+        }
+        (_, other) => other,
+    }
+}
+
 /// Finds a hub by device id or name over mDNS (see [`HubAddress::Discover`]).
 async fn discover(
     target: &str,
@@ -967,6 +988,27 @@ mod tests {
                 SessionEnd::Retry { streamed: true, .. }
             ));
         }
+    }
+
+    #[test]
+    fn key_mismatch_at_a_discovered_address_is_retried() {
+        let addr: SocketAddr = "192.0.2.1:47810".parse().expect("addr");
+        let discover = HubAddress::Discover {
+            name_or_id: "Desk".into(),
+        };
+        let mapped = discovered_hub_error(&discover, addr, CoreError::KeyMismatch("x".into()));
+        assert!(matches!(mapped, CoreError::HubNotFound(_)));
+        assert!(matches!(end_with(mapped, false), SessionEnd::Retry { .. }));
+        // A key the user gave for a direct address stays final.
+        let direct = HubAddress::Direct {
+            host: "192.0.2.1".into(),
+            port: 47810,
+        };
+        let kept = discovered_hub_error(&direct, addr, CoreError::KeyMismatch("x".into()));
+        assert!(matches!(end_with(kept, false), SessionEnd::Fatal(_)));
+        // Other errors are untouched.
+        let other = discovered_hub_error(&discover, addr, CoreError::PairingRequired);
+        assert!(matches!(other, CoreError::PairingRequired));
     }
 
     #[test]

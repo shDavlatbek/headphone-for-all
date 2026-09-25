@@ -126,6 +126,31 @@ impl StaticKeypair {
         kp.private.zeroize();
         result
     }
+
+    /// Rebuilds the keypair from its private key: the public key is derived
+    /// (X25519 scalar multiplication of the base point, as the Noise handshake itself does).
+    /// Use it to check a stored public key against the private key it belongs to.
+    ///
+    /// # Errors
+    /// [`crate::ProtoError::Noise`] if the crypto backend is unavailable (should not happen);
+    /// [`crate::ProtoError::InvalidKey`] for an all-zero private key.
+    pub fn from_private(private: &[u8; 32]) -> Result<Self> {
+        use snow::resolvers::CryptoResolver as _;
+        if *private == [0; 32] {
+            return Err(ProtoError::InvalidKey("all-zero private key".into()));
+        }
+        let mut dh = snow::resolvers::DefaultResolver
+            .resolve_dh(&params()?.dh)
+            .ok_or_else(|| ProtoError::Noise("no X25519 implementation".into()))?;
+        dh.set(private);
+        let public = key32(dh.pubkey());
+        // Do not leave a copy of the private key in the backend's buffer.
+        dh.set(&[0; 32]);
+        Ok(Self {
+            private: *private,
+            public: public?,
+        })
+    }
 }
 
 impl fmt::Debug for StaticKeypair {
@@ -391,6 +416,32 @@ mod tests {
         assert_eq!(resp.read_message(&m3).unwrap(), payloads[2]);
         assert!(init.is_finished() && resp.is_finished());
         (init, resp)
+    }
+
+    #[test]
+    fn from_private_derives_the_public_key() {
+        let kp = StaticKeypair::generate().unwrap();
+        assert_eq!(StaticKeypair::from_private(&kp.private).unwrap(), kp);
+        // RFC 7748 §6.1 test vector (Alice).
+        let hex = |s: &str| -> [u8; 32] {
+            let v: Vec<u8> = (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect();
+            v.try_into().unwrap()
+        };
+        let alice = StaticKeypair::from_private(&hex(
+            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        ))
+        .unwrap();
+        assert_eq!(
+            alice.public,
+            hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+        );
+        assert!(matches!(
+            StaticKeypair::from_private(&[0; 32]),
+            Err(ProtoError::InvalidKey(_))
+        ));
     }
 
     fn transports() -> (NoiseTransport, NoiseTransport, StaticKeypair, StaticKeypair) {
