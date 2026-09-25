@@ -1,0 +1,331 @@
+# Flutter app (app/): analysis and widget tests, a drift check of the flutter_rust_bridge bindings,
+# and release builds for every platform (cargokit compiles core/hfa-ffi inside each build).
+# The integration test runs the real Rust library in the Linux job. Build commands: docs/BUILDING.md.
+name: Flutter
+
+on:
+  push:
+    branches: [main, "claude/**", "feat/**"]
+    paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  FLUTTER_VERSION: 3.47.5
+  # Must equal the flutter_rust_bridge versions in core/Cargo.toml and app/pubspec.yaml.
+  FRB_VERSION: 2.13.0
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Rust build dependencies on Linux (hfa-capture: PipeWire via bindgen, cpal: ALSA; libopus: CMake).
+  LINUX_RUST_DEPS: libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev clang pkg-config cmake
+  # Flutter Linux desktop toolchain and plugin dependencies (tray_manager's cnativeapi: X11 + Xi).
+  LINUX_FLUTTER_DEPS: ninja-build libgtk-3-dev libx11-dev libxi-dev liblzma-dev libstdc++-12-dev
+
+jobs:
+  analyze:
+    name: analyze + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter --version
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+  codegen:
+    name: flutter_rust_bridge drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+          key: codegen
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      # Prebuilt binaries through cargo-binstall. The codegen expands hfa-ffi with cargo-expand.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: flutter_rust_bridge_codegen@${{ env.FRB_VERSION }},cargo-expand
+      - run: flutter_rust_bridge_codegen --version
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+      - name: Regenerate the bindings
+        working-directory: app
+        run: flutter_rust_bridge_codegen generate
+      - name: The committed bindings must be up to date
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --short
+            git --no-pager diff --stat
+            git --no-pager diff | head -n 200
+            echo "::error::Generated bindings are stale: run 'flutter_rust_bridge_codegen generate' in app/ and commit the result."
+            exit 1
+          fi
+
+  linux:
+    name: Linux build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }} ${{ env.LINUX_FLUTTER_DEPS }} xvfb
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      # Loads the real Rust library through flutter_rust_bridge (debug build, virtual display).
+      - name: Integration test
+        run: xvfb-run -a flutter test integration_test -d linux
+      - name: Build (release)
+        run: flutter build linux --release
+      - name: Archive the bundle
+        run: tar -czf "$RUNNER_TEMP/headphone_for_all-linux-x64.tar.gz" -C build/linux/x64/release bundle
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-linux-x64
+          path: ${{ runner.temp }}/headphone_for_all-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+      # Packaging (packaging/linux, feat/desktop) when it is present on this branch.
+      - name: AppImage
+        id: appimage
+        if: hashFiles('packaging/linux/build-appimage.sh') != ''
+        working-directory: .
+        run: bash packaging/linux/build-appimage.sh
+      - uses: actions/upload-artifact@v7
+        if: steps.appimage.outcome == 'success'
+        with:
+          name: headphone_for_all-linux-appimage
+          path: packaging/dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      # The NDK must be the app's android.ndkVersion (app/android/app/build.gradle.kts); cargokit
+      # builds hfa-ffi (and libopus through CMake) with the NDK Gradle selects.
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools platforms;android-36 build-tools;36.0.0 ndk;29.0.14206865
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      # Release APK for arm64-v8a, armeabi-v7a and x86_64, signed with the debug key (no release
+      # keystore in CI): installable for testing, not for a store.
+      - name: Build APK (release)
+        run: flutter build apk --release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-android-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+      # JVM unit tests and Android lint of the Kotlin platform code (feat/android) when present;
+      # -Ptarget-platform keeps cargokit's debug build of the Rust core to arm64 only.
+      - name: Android unit tests + lint
+        if: hashFiles('app/android/app/src/test/**') != ''
+        working-directory: app/android
+        run: ./gradlew --no-daemon -Ptarget-platform=android-arm64 :app:testDebugUnitTest :app:lintDebug
+
+  windows:
+    name: Windows build
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      - name: Build (release)
+        run: flutter build windows --release
+      - name: Zip the release folder
+        run: Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath "$env:RUNNER_TEMP\headphone_for_all-windows-x64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-windows-x64
+          path: ${{ runner.temp }}/headphone_for_all-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+      # Inno Setup installer (packaging/windows, feat/desktop) when it is present on this branch.
+      - name: Installer
+        id: installer
+        if: hashFiles('packaging/windows/build-installer.ps1') != ''
+        working-directory: .
+        run: ./packaging/windows/build-installer.ps1
+      - uses: actions/upload-artifact@v7
+        if: steps.installer.outcome == 'success'
+        with:
+          name: headphone_for_all-windows-x64-setup
+          path: packaging/dist/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS build
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      # Release builds are universal: cargokit builds hfa-ffi for both Mac architectures.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      - name: Build (release)
+        run: flutter build macos --release
+      - name: Zip the app
+        run: |
+          app="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app" || { echo "::error::no .app in build/macos/Build/Products/Release"; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/headphone_for_all-macos.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-macos
+          path: ${{ runner.temp }}/headphone_for_all-macos.zip
+          if-no-files-found: error
+          retention-days: 14
+      # Unsigned disk image (packaging/macos, feat/desktop) when it is present on this branch.
+      - name: DMG
+        id: dmg
+        if: hashFiles('packaging/macos/build-dmg.sh') != ''
+        working-directory: .
+        run: bash packaging/macos/build-dmg.sh
+      - uses: actions/upload-artifact@v7
+        if: steps.dmg.outcome == 'success'
+        with:
+          name: headphone_for_all-macos-dmg
+          path: packaging/dist/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    name: iOS build (no codesign)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      # Builds Runner and every embedded target, including the ReplayKit broadcast upload
+      # extension that links libhfa_ffi.a through the C ABI.
+      - name: Build (release, unsigned)
+        run: flutter build ios --release --no-codesign
+
+  apple-unit-tests:
+    name: XCTest (iOS simulator + macOS)
+    runs-on: macos-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim,aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      # The Flutter builds generate the Xcode configuration and install the pods; xcodebuild then
+      # runs the Runner scheme's RunnerTests (on iOS also the broadcast extension's PCM converter).
+      - name: Build for the iOS simulator
+        run: flutter build ios --simulator --debug
+      - name: iOS RunnerTests
+        run: |
+          udid="$(xcrun simctl list devices available --json | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          ids = [d["udid"] for runtime, ds in sorted(devices.items(), reverse=True)
+                 if ".iOS-" in runtime for d in ds if d["name"].startswith("iPhone")]
+          print(ids[0] if ids else "")')"
+          test -n "$udid" || { echo "::error::no available iPhone simulator"; exit 1; }
+          xcodebuild test -workspace ios/Runner.xcworkspace -scheme Runner \
+            -destination "id=$udid" -quiet CODE_SIGNING_ALLOWED=NO
+      - name: Build for macOS
+        run: flutter build macos --debug
+      - name: macOS RunnerTests
+        run: xcodebuild test -workspace macos/Runner.xcworkspace -scheme Runner -destination 'platform=macOS' -quiet
