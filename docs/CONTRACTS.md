@@ -808,8 +808,9 @@ Modules:
 - **`Stats.loss_pct` = network loss** (jitter-buffer `lost` frames, i.e. before redundancy/FEC recovery), so enabling
   redundancy does not hide the loss and switch itself off again. **`StreamStats.loss_pct` = loss left after
   recovery.** Both are measured over an interval of at least 40 frames (a shorter one is extended; an interval with
-  no frames at all, e.g. DTX, reports 0). `StreamStats.latency_ms = jitter target + stream frame + 2 × mixer tick
-  (10 ms) + output latency`; `level_db` is post-gain RMS (silence when muted or inactive).
+  no frames at all, e.g. DTX, reports 0). `StreamStats.latency_ms = jitter target + stream frame + output ring
+  fill target + the output's whole latency` (re-read every second, see the mixer thread); `level_db` is post-gain
+  RMS (silence when muted or inactive).
 - **DTX (both sides).** Sender: a frame is silent when its peak is below −70 dBFS; after more than 200 ms of silence
   **or of a capture delivering nothing** (e.g. WASAPI loopback while nothing plays — never a timing break) it stops
   sending audio and sends a `FLAG_DTX` keep-alive immediately and then every 100 ms; the media timestamp follows the
@@ -834,8 +835,10 @@ Modules:
   untrusted match; a trusted match (or any match by id) is taken at once and its stored key is passed as
   `expected_hub_key`. `Direct` hosts resolve with `lookup_host`, preferring IPv4. `SenderEvent::Status` once per
   second while streaming (and once at the end); `SenderHandle::status()` has a live `level_db` (RMS of the last
-  captured frame; `SILENCE_DB` once stopped/failed); `rtt_ms` from `Ping`/`Pong`; `loss_pct` = the hub's network
-  loss. Extra: **`SenderHandle::packets_sent() -> (audio, keepalives)`**, `Debug` for `SenderHandle`; dropping the
+  captured frame; `SILENCE_DB` once stopped/failed, and while the capture has delivered nothing for more than the
+  200 ms DTX delay); `rtt_ms` from `Ping`/`Pong`; `loss_pct` = the hub's network loss. `SenderEvent::HubControl`
+  reflects the **current stream**: the controls the hub announces before `StreamAccepted` replace those of any
+  earlier stream (one event if that changes what was shown, e.g. after a hub restart forgot a mute). Extra: **`SenderHandle::packets_sent() -> (audio, keepalives)`**, `Debug` for `SenderHandle`; dropping the
   handle stops the sender in the background.
 - **`sender::open_capture(&CaptureTarget) -> Result<(Box<dyn CaptureSource>, Option<String>)>`** (new): CLI and
   FFI should open sender captures with it. On macOS a `Backend` error for `SystemMixExcludingSelf` falls back to
@@ -843,13 +846,22 @@ Modules:
   exists); every other target/error passes through.
 - **Hub engine.** TCP and UDP are bound on **IPv4 `0.0.0.0`** (IPv6 is not served). A taken port →
   `Io("TCP|UDP port N is already in use (is another hub running?) …")`; port 0 retries until a number is free for
-  both. `MAX_STREAMS = 16`, `MAX_CONNECTIONS = 64` (more are closed at once). `StreamStart` is rejected
+  both. `MAX_STREAMS = 16`. **Connection limits** (pub consts): a new connection must send its first handshake
+  byte within `FIRST_MESSAGE_TIMEOUT = 5 s`; at most `MAX_PENDING_PER_IP = 4` handshakes per IP address run at once
+  (more are closed at once); when `MAX_PENDING_HANDSHAKES = 16` are running, the **oldest** pending one is dropped
+  for the newcomer; authenticated connections (at most `MAX_CONNECTIONS = 64`, more are closed) do not count against
+  the handshake budget; an authenticated connection that owns no stream for `NO_STREAM_TIMEOUT = 30 s` is closed
+  with `Bye("no stream started for 30 s")`. UDP is received into a 64 KiB buffer (datagrams over `MAX_DATAGRAM` are
+  dropped; per-datagram receive errors never pause the loop, only > 100 in a row pause it 10 ms). `StreamStart` is
+  rejected
   (`StreamRejected{reason}`) unless 48000 Hz, 2 channels, `frame_ms` ∈ {10, 20}, a 32-byte key, fewer than 16
   streams and an unused stream id; labels are sanitized (empty → "Audio"). A connection may only stop its own
   streams. Jitter buffer per stream: `min/max_target_ms` from the settings, initial 40 ms (clamped), capacity
   `max(64, max_target / frame + 16)`. Controls (`set_gain/muted/priority`) are remembered per device id for the
-  hub's lifetime and, when a device reconnects, re-applied and announced right after `StreamAccepted`
-  (`SetVolume`/`SetMute`/`SetPriority`). `set_gain` with a non-finite gain → `Config`; `set_master_gain` ignores
+  hub's lifetime and re-applied when a device reconnects. **Every accepted stream** is answered with
+  `SetVolume`, `SetMute`, `SetPriority` (the defaults or the remembered values) **followed by** `StreamAccepted`.
+  A control change updates the source list, the remembered value, the mixer and the sender under one lock, so
+  concurrent calls reach all of them in the same order. `set_gain` with a non-finite gain → `Config`; `set_master_gain` ignores
   non-finite values. A stream without datagrams for `REMOVE_AFTER` is removed and its connection closed with
   `Bye("no media received for 30 s")` (the sender reconnects). `SourceUpdated` for every source once per
   `STATS_INTERVAL`, plus on every control change. `HubHandle::stop` closes connections with `Bye("hub stopping")`
@@ -857,12 +869,19 @@ Modules:
   background. mDNS failures are logged, not fatal.
 - **Mixer thread (`hub_mixer.rs`).** Ticks are always **10 ms at 48 kHz stereo** (streams with 20 ms frames decode
   every other tick); the drift controller is updated every tick with `dt = 10 ms`. Pacing: produce ticks while the
-  output ring holds less than `2 × 10 ms + output latency` (20 ms assumed if unknown), at most 50 per wake, else
-  sleep 2.5 ms. Output ring: 500 ms, `pcm_ring_with_channels(.., output.format().channels)`. Conversion to the output
+  output ring holds less than `2 × 10 ms + min(output latency, 40 ms) + extra` (20 ms assumed if unknown), at most
+  50 per wake, else sleep 2.5 ms. Every second the output's latency (measured by the backend once it runs) and the
+  ring's underrun counter (`PcmSource::stats`) are re-read; an underrun since the last check adds 10 ms of `extra`
+  (up to 200 ms; it never shrinks). Only 40 ms of the output latency are buffered in the ring because the rest (e.g.
+  a Bluetooth link) happens after the device pulled the audio; large device periods are covered by `extra`. Output ring: 500 ms, `pcm_ring_with_channels(.., output.format().channels)`. Conversion to the output
   format: stereo → mono `(L+R)/2`, stereo → n > 2 channels `L, R, 0, …`, then a `StreamResampler` 48 kHz → device
   rate. **Output failure:** on `has_error()` the output is stopped (`HubEvent::Error("the audio output failed;
   reopening it")`) and `start`ed again on a fresh ring every `OUTPUT_RETRY = 2 s` (one `HubEvent::Error` per outage
-  if that fails); meanwhile the streams are consumed at wall-clock pace and the mix is discarded.
+  if that fails); meanwhile the streams are consumed at wall-clock pace and the mix is discarded. An output whose
+  `restartable()` is `false` (WAV: `start` truncates the file) is stopped (finalizing the file) and reported once
+  (`"the audio output failed and is not reopened …"`), never restarted.
+- **Cross-crate addition (`hfa-capture`, made by `feat/core-engine`):** `AudioOutput::restartable(&self) -> bool`,
+  default `true`; `WavFileOutput` returns `false`. Backward compatible (default method).
 - **New diagnostics API:** `HubHandle::stream_counters(stream_id) -> Option<StreamCounters>` with cumulative
   `StreamCounters { datagrams, keepalives, resets, played, lost, late, duplicates, recovered_redundancy,
   recovered_fec, concealed, stretched, underruns }` (serde; `underruns` counts ticks where a playing stream ran dry
@@ -874,8 +893,9 @@ Modules:
   `local_addr()`, `stats() -> ProxyStats { received, dropped, forwarded }`, `stop().await`. One-way relay: random
   drops and a random `0..=jitter_ms` delay per datagram (which reorders them); deterministic per seed. Use it with
   `set_media_port_override(Some(proxy.local_addr().port()))`.
-- Tests: `hfa-core/tests/engine_{stream,lifecycle,lossy,dtx}.rs` (lifecycle includes `Discover` by device id over real
-  mDNS) + `tests/engine_common/mod.rs` (helpers: temp devices,
+- Tests: `hfa-core/tests/engine_{stream,lifecycle,lossy,dtx,control}.rs` (lifecycle includes `Discover` by device id
+  over real mDNS; control covers every `StreamStart` rejection, controls remembered across a reconnect and the
+  handshake limits) + `tests/engine_common/mod.rs` (helpers: temp devices,
   WAV analysis with a 50 ms-block Goertzel detector — a single long Goertzel sum is cancelled by the tiny frequency
   shifts of drift correction).
 

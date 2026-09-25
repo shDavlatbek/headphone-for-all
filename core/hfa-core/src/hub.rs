@@ -8,18 +8,26 @@
 //!   port that is already taken is an error ([`crate::CoreError::Io`] naming the port).
 //! - **Accept loop** (tokio): one task per sender connection ([`ControlChannel::accept`] with
 //!   the hub's [`PairingManager`]; [`HubEvent::PairingCompleted`] /
-//!   [`HubEvent::PairingFailed`]). Then:
+//!   [`HubEvent::PairingFailed`]). Unauthenticated connections are limited, so nobody on the
+//!   LAN can lock senders out: a peer must send its first handshake message within
+//!   [`FIRST_MESSAGE_TIMEOUT`]; at most [`MAX_PENDING_PER_IP`] handshakes per IP address run
+//!   at once (more are closed); when [`MAX_PENDING_HANDSHAKES`] are running, the oldest is
+//!   dropped for a newcomer. Authenticated connections (at most [`MAX_CONNECTIONS`]) do not
+//!   count against that budget; one that owns no stream for [`NO_STREAM_TIMEOUT`] is closed.
+//!   Then:
 //!   - `StreamStart` is validated (48 kHz, 2 channels, `frame_ms` 10 or 20, a 32-byte key, at
 //!     most [`MAX_STREAMS`] streams, a stream id not in use) and registered with the
-//!     [`MediaDemux`], the mixer and the source list, then answered with
-//!     `StreamAccepted{udp_port}` (plus `SetVolume`/`SetMute`/`SetPriority` when the device
-//!     has remembered controls), else `StreamRejected{reason}`.
+//!     [`MediaDemux`], the mixer and the source list, then answered with the stream's
+//!     controls (`SetVolume`, `SetMute`, `SetPriority`: defaults, or the ones remembered for
+//!     the device) followed by `StreamAccepted{udp_port}`, else `StreamRejected{reason}`.
 //!   - `StreamStop`, `Bye` or a lost connection remove the connection's streams
 //!     ([`HubEvent::SourceRemoved`]); `Ping` is answered with `Pong`.
 //!   - The hub's own controls ([`HubHandle::set_gain`], ...) are forwarded to the sender as
 //!     `SetVolume` / `SetMute` / `SetPriority` so its UI can show them. Controls are
 //!     remembered per device id and re-applied when the device reconnects.
-//! - **Receive task** (tokio): UDP → [`MediaDemux::open`] (authentication, replay window) →
+//! - **Receive task** (tokio): UDP (a 64 KiB buffer, so an oversize datagram cannot make the
+//!   receive fail on Windows; per-datagram errors never pause the loop) →
+//!   [`MediaDemux::open`] (authentication, replay window) →
 //!   the stream's jitter buffer (see `hub_mixer.rs`: DTX keep-alives only refresh the
 //!   stream's activity; a `FLAG_RESET` packet, or the first audio after keep-alives, restarts
 //!   the stream's playout).
@@ -36,9 +44,9 @@
 //! - [`HubHandle::stop`] closes every connection with `Bye`, stops advertising, the tasks,
 //!   the mixer and the output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,12 +62,12 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
 use crate::config::{Settings, FRAME_MS_CHOICES};
 use crate::control::{ControlChannel, PeerInfo};
 use crate::discovery::Advertiser;
-use crate::hub_mixer::{Controls, MixStream, MixerCommand, StreamShared, MIX_FRAME_MS};
+use crate::hub_mixer::{Controls, MixStream, MixerCommand, StreamShared};
 use crate::identity::{Identity, TrustStore};
 use crate::media::MediaDemux;
 use crate::pairing::{PairingInfo, PairingManager, DEFAULT_PAIRING_TTL};
@@ -74,8 +82,17 @@ pub const IDLE_AFTER: Duration = Duration::from_secs(2);
 pub const REMOVE_AFTER: Duration = Duration::from_secs(30);
 /// Most streams the hub mixes at once.
 pub const MAX_STREAMS: usize = 16;
-/// Most simultaneous control connections (including ones still in the handshake).
+/// Most simultaneous authenticated control connections.
 pub const MAX_CONNECTIONS: usize = 64;
+/// Most connections still in the handshake (not yet authenticated). When a new one arrives
+/// while this many are pending, the oldest pending one is dropped.
+pub const MAX_PENDING_HANDSHAKES: usize = 16;
+/// Most connections still in the handshake from one IP address (more are refused).
+pub const MAX_PENDING_PER_IP: usize = 4;
+/// How long a new connection may stay silent before the peer's first handshake message.
+pub const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// An authenticated connection without a stream for this long is closed.
+pub const NO_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// Jitter-buffer target before the first jitter estimate (clamped to the settings' bounds).
 const INITIAL_JITTER_TARGET_MS: u32 = 40;
 /// Capacity of the event channel.
@@ -86,6 +103,10 @@ const MIN_FRAMES_FOR_LOSS: u64 = 40;
 const PORT_ATTEMPTS: usize = 16;
 /// How long [`HubHandle::stop`] waits for the connections to say `Bye`.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// UDP receive buffer: larger than any UDP datagram.
+const RECV_BUFFER: usize = 65_536;
+/// Consecutive UDP receive errors after which the receive task pauses 10 ms.
+const ERRORS_BEFORE_BACKOFF: u32 = 100;
 
 /// Everything needed to start a hub.
 pub struct HubConfig {
@@ -116,7 +137,8 @@ pub struct StreamStats {
     pub jitter_ms: f32,
     /// Jitter-buffer fill in ms.
     pub buffer_ms: f32,
-    /// Estimated end-to-end latency in ms (buffer + frame + output latency).
+    /// Estimated end-to-end latency in ms (jitter target + frame + output ring fill target +
+    /// the output's own latency).
     pub latency_ms: f32,
     /// Post-gain level in dBFS.
     pub level_db: f32,
@@ -247,6 +269,7 @@ impl HubEngine {
         let port = listener.local_addr()?.port();
 
         let (sink, source) = crate::hub_mixer::output_ring(format);
+        let underruns = source.stats();
         let mut output = output;
         let (output, started) = tokio::task::spawn_blocking(move || {
             let result = output.start(source);
@@ -263,6 +286,7 @@ impl HubEngine {
         let mixer = crate::hub_mixer::spawn(
             output,
             sink,
+            underruns,
             mixer_rx,
             events.clone(),
             Arc::clone(&mixer_stop),
@@ -305,6 +329,7 @@ impl HubEngine {
             media_port_override: AtomicU32::new(0),
             epoch: Instant::now(),
             next_conn: AtomicU64::new(1),
+            pending: Mutex::new(VecDeque::new()),
         });
         let (shutdown, shutdown_rx) = watch::channel(false);
         let tasks = vec![
@@ -383,12 +408,15 @@ struct Shared {
     /// Receive-path lookup of the streams' shared state.
     streams: Mutex<HashMap<u32, Arc<StreamShared>>>,
     mixer: std::sync::mpsc::Sender<MixerCommand>,
-    /// Output latency in ms (`f32` bits), written by the mixer thread.
+    /// Latency after the mixer in ms (`f32` bits: output ring fill target + the output's
+    /// own latency), written by the mixer thread.
     output_latency: Arc<AtomicU32>,
     /// UDP port announced in `StreamAccepted` instead of the bound one (0 = none).
     media_port_override: AtomicU32,
     epoch: Instant,
     next_conn: AtomicU64,
+    /// Connections whose handshake is running, oldest first.
+    pending: Mutex<VecDeque<PendingConn>>,
 }
 
 /// Lock order: `state` → `demux` → `streams` → a stream's `state`.
@@ -545,7 +573,7 @@ impl Shared {
         stream_id: u32,
         change: impl FnOnce(&mut Controls) -> Body,
     ) -> Result<()> {
-        let (info, tx, controls, body) = {
+        let info = {
             let mut st = self.state.lock();
             let HubState { sources, prefs } = &mut *st;
             let entry = sources
@@ -562,10 +590,13 @@ impl Shared {
             entry.info.muted = c.muted;
             entry.info.priority = c.priority;
             prefs.insert(entry.info.device_id.clone(), c);
-            (entry.info.clone(), entry.tx.clone(), c, body)
+            // Both sends are non-blocking; doing them under the lock keeps the mixer and the
+            // sender in the order in which concurrent calls changed `state` (a slider drag
+            // through the FFI runs `set_gain` on several threads).
+            let _ = self.mixer.send(MixerCommand::Controls(stream_id, c));
+            let _ = entry.tx.send(ConnCommand::Send(ControlMessage::new(body)));
+            entry.info.clone()
         };
-        let _ = self.mixer.send(MixerCommand::Controls(stream_id, controls));
-        let _ = tx.send(ConnCommand::Send(ControlMessage::new(body)));
         self.emit(HubEvent::SourceUpdated(info));
         Ok(())
     }
@@ -614,8 +645,7 @@ impl Shared {
                 }
                 let idle_for = now.saturating_duration_since(last_packet);
                 let active = idle_for < IDLE_AFTER;
-                let latency_ms =
-                    target as f32 + e.frame_ms as f32 + 2.0 * MIX_FRAME_MS as f32 + output_latency;
+                let latency_ms = target as f32 + e.frame_ms as f32 + output_latency;
                 e.info.active = active;
                 e.info.stats = StreamStats {
                     loss_pct: e.residual_loss_pct,
@@ -686,13 +716,33 @@ async fn accept_loop(
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, addr)) => {
-                    if connections.len() >= MAX_CONNECTIONS {
+                    let ip = addr.ip();
+                    // Held across `spawn`, so the task cannot deregister before it is listed.
+                    let mut pending = shared.pending.lock();
+                    let authenticated = connections.len().saturating_sub(pending.len());
+                    if authenticated >= MAX_CONNECTIONS {
                         tracing::debug!(%addr, "too many connections; refusing");
                         continue;
                     }
+                    if pending.iter().filter(|p| p.ip == ip).count() >= MAX_PENDING_PER_IP {
+                        tracing::debug!(%addr, "too many handshakes from this address; refusing");
+                        continue;
+                    }
+                    if pending.len() >= MAX_PENDING_HANDSHAKES {
+                        if let Some(oldest) = pending.pop_front() {
+                            tracing::debug!(ip = %oldest.ip, "too many handshakes; dropping the oldest");
+                            oldest.abort.abort();
+                        }
+                    }
                     let _ = stream.set_nodelay(true);
-                    let id = shared.next_conn.fetch_add(1, Ordering::Relaxed);
-                    connections.spawn(connection(Arc::clone(&shared), stream, id, shutdown.clone()));
+                    let conn = shared.next_conn.fetch_add(1, Ordering::Relaxed);
+                    let abort = connections.spawn(connection(
+                        Arc::clone(&shared),
+                        stream,
+                        conn,
+                        shutdown.clone(),
+                    ));
+                    pending.push_back(PendingConn { conn, ip, abort });
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "accepting a connection failed");
@@ -714,6 +764,26 @@ async fn accept_loop(
     }
 }
 
+/// A connection whose handshake is still running (see [`MAX_PENDING_HANDSHAKES`]).
+struct PendingConn {
+    conn: u64,
+    ip: IpAddr,
+    abort: AbortHandle,
+}
+
+/// Removes a connection from [`Shared::pending`] when its handshake ends (in any way,
+/// including the task being aborted).
+struct PendingGuard<'a> {
+    shared: &'a Shared,
+    conn: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.shared.pending.lock().retain(|p| p.conn != self.conn);
+    }
+}
+
 /// What the connection task does after a message.
 enum Flow {
     Continue,
@@ -727,10 +797,25 @@ async fn connection(
     conn: u64,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let handshake = PendingGuard {
+        shared: &shared,
+        conn,
+    };
+    // A peer that connects and stays silent only holds its slot for a short while.
+    let mut first = [0u8; 1];
+    let spoke = tokio::select! {
+        r = tokio::time::timeout(FIRST_MESSAGE_TIMEOUT, stream.peek(&mut first)) => r,
+        _ = wait_stop(&mut shutdown) => return,
+    };
+    if !matches!(spoke, Ok(Ok(n)) if n > 0) {
+        tracing::debug!(conn, "the peer sent nothing; closing");
+        return;
+    }
     let accepted = tokio::select! {
         r = ControlChannel::accept(stream, &shared.identity, &shared.trust, &shared.pairing) => r,
         _ = wait_stop(&mut shutdown) => return,
     };
+    drop(handshake);
     let (mut ch, peer) = match accepted {
         Ok(v) => v,
         Err(CoreError::PairingFailed(reason)) => {
@@ -752,13 +837,21 @@ async fn connection(
     }
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut owned: Vec<u32> = Vec::new();
+    // A connection without a stream is closed after NO_STREAM_TIMEOUT (it only holds a slot).
+    let mut no_stream_deadline = tokio::time::Instant::now() + NO_STREAM_TIMEOUT;
     let close = loop {
         tokio::select! {
             msg = ch.recv() => match msg {
-                Ok(msg) => match on_message(&shared, &peer, &tx, &mut owned, &mut ch, msg).await {
-                    Flow::Continue => {}
-                    Flow::Close(reason) => break reason,
-                },
+                Ok(msg) => {
+                    let flow = on_message(&shared, &peer, &tx, &mut owned, &mut ch, msg).await;
+                    if !owned.is_empty() {
+                        no_stream_deadline = tokio::time::Instant::now() + NO_STREAM_TIMEOUT;
+                    }
+                    match flow {
+                        Flow::Continue => {}
+                        Flow::Close(reason) => break reason,
+                    }
+                }
                 Err(e) => {
                     tracing::debug!(conn, error = %e, "control connection ended");
                     break None;
@@ -774,6 +867,10 @@ async fn connection(
                 Some(ConnCommand::Close(reason)) => break Some(reason),
                 None => break None,
             },
+            _ = tokio::time::sleep_until(no_stream_deadline), if owned.is_empty() => {
+                tracing::debug!(conn, "no stream on this connection; closing it");
+                break Some(format!("no stream started for {} s", NO_STREAM_TIMEOUT.as_secs()));
+            }
             _ = wait_stop(&mut shutdown) => break Some("hub stopping".to_owned()),
         }
     };
@@ -799,30 +896,28 @@ async fn on_message(
             Ok(c) => {
                 owned.push(ss.stream_id);
                 let id = ss.stream_id;
-                let mut replies = vec![Body::StreamAccepted(StreamAccepted {
-                    stream_id: id,
-                    udp_port: u32::from(shared.udp_port()),
-                })];
-                let d = Controls::default();
-                if c.gain != d.gain {
-                    replies.push(Body::SetVolume(SetVolume {
+                // The stream's controls are always announced, and before `StreamAccepted`,
+                // so the sender takes them over in one step when the stream starts (it may
+                // still show the controls of an earlier stream, e.g. from before this hub
+                // restarted and forgot them).
+                vec![
+                    Body::SetVolume(SetVolume {
                         stream_id: id,
                         gain: c.gain,
-                    }));
-                }
-                if c.muted {
-                    replies.push(Body::SetMute(SetMute {
+                    }),
+                    Body::SetMute(SetMute {
                         stream_id: id,
-                        muted: true,
-                    }));
-                }
-                if c.priority {
-                    replies.push(Body::SetPriority(SetPriority {
+                        muted: c.muted,
+                    }),
+                    Body::SetPriority(SetPriority {
                         stream_id: id,
-                        priority: true,
-                    }));
-                }
-                replies
+                        priority: c.priority,
+                    }),
+                    Body::StreamAccepted(StreamAccepted {
+                        stream_id: id,
+                        udp_port: u32::from(shared.udp_port()),
+                    }),
+                ]
             }
             Err(reason) => {
                 tracing::info!(stream_id = ss.stream_id, %reason, "stream rejected");
@@ -862,24 +957,37 @@ async fn receive_loop(
     socket: Arc<UdpSocket>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // One byte more than any valid datagram, so oversize ones are seen (and rejected).
-    let mut buf = vec![0u8; hfa_proto::MAX_DATAGRAM + 1];
+    // Room for any UDP datagram: a buffer that is too small makes Windows fail the receive
+    // with WSAEMSGSIZE (after consuming the datagram) instead of truncating it.
+    let mut buf = vec![0u8; RECV_BUFFER];
+    let mut errors_in_a_row = 0u32;
     loop {
         let received = tokio::select! {
             r = socket.recv_from(&mut buf) => r,
             _ = wait_stop(&mut shutdown) => break,
         };
         let n = match received {
-            Ok((n, _)) => n,
+            Ok((n, _)) => {
+                errors_in_a_row = 0;
+                n
+            }
             Err(e) => {
-                // Windows reports an earlier ICMP "port unreachable" as ConnectionReset.
-                if e.kind() != std::io::ErrorKind::ConnectionReset {
-                    tracing::debug!(error = %e, "UDP receive failed");
+                // Per-datagram errors (Windows reports an earlier ICMP "port unreachable" as
+                // ConnectionReset, an oversize datagram as WSAEMSGSIZE) must not slow the loop
+                // down, or anyone on the LAN could stall all media. Only a long run of errors
+                // points to a broken socket and is worth a pause.
+                errors_in_a_row = errors_in_a_row.saturating_add(1);
+                if errors_in_a_row > ERRORS_BEFORE_BACKOFF {
+                    tracing::debug!(error = %e, "UDP receive keeps failing");
+                    errors_in_a_row = 0;
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 continue;
             }
         };
+        if n > hfa_proto::MAX_DATAGRAM {
+            continue;
+        }
         let opened = shared.demux.lock().open(&buf[..n]);
         let Ok((header, payload)) = opened else {
             continue;

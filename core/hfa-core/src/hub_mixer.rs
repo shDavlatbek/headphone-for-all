@@ -23,12 +23,19 @@
 //! # Pacing and output
 //!
 //! The thread is paced by the output ring: while the ring holds less than the target
-//! (`2 × MIX_FRAME_MS` + the output's latency) it produces one tick, otherwise it sleeps a
-//! quarter tick. The mix (48 kHz stereo) is converted to the output format (channel map,
-//! then resampling to the device rate if needed) and pushed. [`AudioOutput::has_error`] is
-//! polled every loop: a failed output is stopped (reported as [`HubEvent::Error`]) and
-//! restarted every [`OUTPUT_RETRY`] until that works (a failing restart is reported once per
-//! outage); meanwhile the mixer keeps consuming the jitter buffers at wall-clock pace and
+//! (`2 × MIX_FRAME_MS` + the output's latency, at most [`MAX_PACING_LATENCY_MS`] of it, +
+//! an extra fill that grows by [`UNDERRUN_STEP_MS`] whenever the output ran dry, up to
+//! [`MAX_EXTRA_FILL_MS`]) it produces one tick, otherwise it sleeps a quarter tick. The
+//! output's latency and the ring's underrun counter are re-read every [`OUTPUT_REFRESH`]:
+//! a real device only measures its latency once it runs, and a device period larger than
+//! the target shows up as underruns. The published latency after the mixer is the ring
+//! target plus the output's whole latency. The mix (48 kHz stereo) is converted to the
+//! output format (channel map, then resampling to the device rate if needed) and pushed.
+//! [`AudioOutput::has_error`] is polled every loop: a failed output is stopped (reported as
+//! [`HubEvent::Error`]) and restarted every [`OUTPUT_RETRY`] until that works (a failing
+//! restart is reported once per outage) — unless it is not
+//! [restartable](AudioOutput::restartable) (a WAV file would be truncated), then it stays
+//! stopped; meanwhile the mixer keeps consuming the jitter buffers at wall-clock pace and
 //! discards the mix.
 //!
 //! After warm-up a tick does not allocate (buffers are preallocated; the input list is a
@@ -46,7 +53,7 @@ use hfa_audio::{
     packet_has_fec, AudioFormat, DriftConfig, DriftController, JitterBuffer, LevelMeter, Mixer,
     MixerConfig, OpusDecoder, Pop, SourceId, StreamResampler,
 };
-use hfa_capture::{AudioOutput, PcmSink};
+use hfa_capture::{AudioOutput, PcmSink, RingStats};
 use hfa_proto::{MediaHeader, FLAG_DTX, FLAG_RESET};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -66,6 +73,17 @@ const MAX_PACKET_FRAMES: usize = 5760;
 pub(crate) const OUTPUT_RING_MS: usize = 500;
 /// Output latency assumed when the output does not know its own.
 const DEFAULT_OUTPUT_LATENCY_MS: f32 = 20.0;
+/// Largest part of the output's own latency added to the ring's fill target. The output
+/// reports its whole playback delay (a Bluetooth link adds 150-250 ms after the device has
+/// pulled the audio); buffering all of it again in the ring would only double the latency.
+/// Device periods larger than this are covered by the underrun-driven extra fill.
+const MAX_PACING_LATENCY_MS: f32 = 40.0;
+/// Extra ring fill added after the output ran dry.
+const UNDERRUN_STEP_MS: f32 = 10.0;
+/// Most extra ring fill.
+const MAX_EXTRA_FILL_MS: f32 = 200.0;
+/// How often the output's latency and the ring's underruns are re-read.
+pub(crate) const OUTPUT_REFRESH: Duration = Duration::from_secs(1);
 /// Pause between two attempts to restart a failed output.
 pub(crate) const OUTPUT_RETRY: Duration = Duration::from_secs(2);
 /// Most ticks produced in one go before the thread checks commands and sleeps again.
@@ -347,6 +365,13 @@ struct OutputStage {
     output: Box<dyn AudioOutput>,
     /// `None` while the output is down.
     sink: Option<PcmSink>,
+    /// Underruns (samples) of the ring the output currently plays from.
+    underruns: RingStats,
+    /// Underrun count at the last refresh (`None` right after a (re)start: start-up
+    /// underruns before the first tick do not count).
+    seen_underruns: Option<u64>,
+    /// Extra fill target after output underruns (ms, only grows).
+    extra_ms: f32,
     format: AudioFormat,
     mapped: Vec<f32>,
     resampler: Option<StreamResampler>,
@@ -354,6 +379,7 @@ struct OutputStage {
     target_frames: usize,
     retry_at: Option<Instant>,
     reported_retry_failure: bool,
+    /// Latency after the mixer (ring fill target + the output's latency), ms as `f32` bits.
     latency_ms: Arc<AtomicU32>,
 }
 
@@ -365,11 +391,19 @@ pub(crate) fn output_ring(format: AudioFormat) -> (PcmSink, hfa_capture::PcmSour
 }
 
 impl OutputStage {
-    fn new(output: Box<dyn AudioOutput>, sink: PcmSink, latency_ms: Arc<AtomicU32>) -> Self {
+    fn new(
+        output: Box<dyn AudioOutput>,
+        sink: PcmSink,
+        underruns: RingStats,
+        latency_ms: Arc<AtomicU32>,
+    ) -> Self {
         let mut stage = Self {
             format: output.format(),
             output,
             sink: Some(sink),
+            underruns,
+            seen_underruns: None,
+            extra_ms: 0.0,
             mapped: Vec::new(),
             resampler: None,
             converted: Vec::new(),
@@ -384,6 +418,7 @@ impl OutputStage {
 
     /// (Re)builds the converter and the fill target for the output's current format.
     fn configure(&mut self) {
+        self.seen_underruns = None;
         self.format = self.output.format();
         let rate = self.format.sample_rate.max(1);
         let ch = usize::from(self.format.channels.max(1));
@@ -401,16 +436,44 @@ impl OutputStage {
         };
         let out_frames_per_tick = MIX_FRAMES * rate as usize / 48_000 + 64;
         self.converted = Vec::with_capacity(out_frames_per_tick * ch * 2);
+        self.update_target();
+    }
+
+    /// Re-reads the output's latency (atomic loads only; the backend measures it once it
+    /// runs) and recomputes the fill target and the published latency. No allocation.
+    fn update_target(&mut self) {
+        let rate = self.format.sample_rate.max(1);
+        let ch = usize::from(self.format.channels.max(1));
         let latency = self
             .output
             .latency_ms()
             .filter(|l| l.is_finite() && *l >= 0.0)
             .unwrap_or(DEFAULT_OUTPUT_LATENCY_MS);
-        self.latency_ms.store(latency.to_bits(), Ordering::Relaxed);
-        let target_ms = 2.0 * MIX_FRAME_MS as f32 + latency;
+        let target_ms =
+            2.0 * MIX_FRAME_MS as f32 + latency.min(MAX_PACING_LATENCY_MS) + self.extra_ms;
+        let out_frames_per_tick = MIX_FRAMES * rate as usize / 48_000 + 64;
         let capacity_frames = self.sink.as_ref().map_or(0, |s| s.capacity() / ch);
         self.target_frames = ((rate as f32 * target_ms / 1000.0) as usize)
             .min(capacity_frames.saturating_sub(out_frames_per_tick));
+        let ring_ms = self.target_frames as f32 * 1000.0 / rate as f32;
+        self.latency_ms
+            .store((ring_ms + latency).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Periodic refresh (every [`OUTPUT_REFRESH`]): an output that ran dry since the last
+    /// refresh (its period is larger than the fill target, or the thread was descheduled)
+    /// gets [`UNDERRUN_STEP_MS`] more fill, up to [`MAX_EXTRA_FILL_MS`]; then the target
+    /// follows the output's current latency.
+    fn refresh(&mut self) {
+        if self.sink.is_none() {
+            return;
+        }
+        let count = self.underruns.count();
+        if self.seen_underruns.is_some_and(|seen| count > seen) {
+            self.extra_ms = (self.extra_ms + UNDERRUN_STEP_MS).min(MAX_EXTRA_FILL_MS);
+        }
+        self.seen_underruns = Some(count);
+        self.update_target();
     }
 
     fn is_up(&self) -> bool {
@@ -465,17 +528,25 @@ impl OutputStage {
         if self.sink.is_some() && self.output.has_error() {
             self.output.stop();
             self.sink = None;
-            self.retry_at = Some(now);
             self.reported_retry_failure = false;
-            let _ = events.send(HubEvent::Error(
-                "the audio output failed; reopening it".into(),
-            ));
+            let message = if self.output.restartable() {
+                self.retry_at = Some(now);
+                "the audio output failed; reopening it"
+            } else {
+                // Restarting would destroy what it already wrote (a WAV file is truncated).
+                self.retry_at = None;
+                "the audio output failed and is not reopened (that would overwrite what it \
+                 wrote)"
+            };
+            let _ = events.send(HubEvent::Error(message.into()));
         }
         if self.sink.is_none() && self.retry_at.is_some_and(|t| now >= t) {
             let (sink, source) = output_ring(self.output.format());
+            let underruns = source.stats();
             match self.output.start(source) {
                 Ok(()) => {
                     self.sink = Some(sink);
+                    self.underruns = underruns;
                     self.retry_at = None;
                     self.configure();
                     tracing::info!(format = ?self.format, "audio output reopened");
@@ -510,6 +581,7 @@ struct MixerThread {
 pub(crate) fn spawn(
     output: Box<dyn AudioOutput>,
     sink: PcmSink,
+    underruns: RingStats,
     commands: Receiver<MixerCommand>,
     events: broadcast::Sender<HubEvent>,
     stop: Arc<AtomicBool>,
@@ -519,7 +591,7 @@ pub(crate) fn spawn(
         streams: Vec::with_capacity(MAX_STREAMS),
         mixer: Mixer::new(MixerConfig::default(), MIX_FRAMES),
         mix: vec![0.0; MIX_SAMPLES],
-        output: OutputStage::new(output, sink, latency_ms),
+        output: OutputStage::new(output, sink, underruns, latency_ms),
         commands,
         events,
         stop,
@@ -535,10 +607,15 @@ impl MixerThread {
         let tick = Duration::from_millis(u64::from(MIX_FRAME_MS));
         let nap = tick / 4;
         let mut wall_next = Instant::now();
+        let mut next_refresh = wall_next + OUTPUT_REFRESH;
         while !self.stop.load(Ordering::Acquire) {
             self.handle_commands();
             let now = Instant::now();
             self.output.check_health(now, &self.events);
+            if now >= next_refresh {
+                self.output.refresh();
+                next_refresh = now + OUTPUT_REFRESH;
+            }
             if self.output.is_up() {
                 let mut ticks = 0;
                 while self.output.needs_audio() && ticks < MAX_TICKS_PER_WAKE {
@@ -789,6 +866,8 @@ mod tests {
         starts: Arc<AtomicU32>,
         error: Arc<AtomicBool>,
         fail_start: Arc<AtomicBool>,
+        latency_ms: Arc<AtomicU32>,
+        restartable: bool,
     }
 
     impl AudioOutput for FakeOutput {
@@ -808,10 +887,13 @@ mod tests {
             *self.source.lock() = None;
         }
         fn latency_ms(&self) -> Option<f32> {
-            Some(5.0)
+            Some(f32::from_bits(self.latency_ms.load(Ordering::Relaxed)))
         }
         fn has_error(&self) -> bool {
             self.error.load(Ordering::Relaxed)
+        }
+        fn restartable(&self) -> bool {
+            self.restartable
         }
     }
 
@@ -820,14 +902,24 @@ mod tests {
         starts: Arc<AtomicU32>,
         error: Arc<AtomicBool>,
         fail_start: Arc<AtomicBool>,
+        /// What the output reports as its latency (ms, `f32` bits).
+        latency_ms: Arc<AtomicU32>,
+        /// What the stage publishes as the latency after the mixer.
+        published: Arc<AtomicU32>,
     }
 
     fn fake_stage(format: AudioFormat) -> (OutputStage, Fake) {
+        fake_stage_with(format, true)
+    }
+
+    fn fake_stage_with(format: AudioFormat, restartable: bool) -> (OutputStage, Fake) {
         let fake = Fake {
             source: Arc::new(Mutex::new(None)),
             starts: Arc::new(AtomicU32::new(0)),
             error: Arc::new(AtomicBool::new(false)),
             fail_start: Arc::new(AtomicBool::new(false)),
+            latency_ms: Arc::new(AtomicU32::new(5.0f32.to_bits())),
+            published: Arc::new(AtomicU32::new(0)),
         };
         let mut output = FakeOutput {
             format,
@@ -835,11 +927,23 @@ mod tests {
             starts: Arc::clone(&fake.starts),
             error: Arc::clone(&fake.error),
             fail_start: Arc::clone(&fake.fail_start),
+            latency_ms: Arc::clone(&fake.latency_ms),
+            restartable,
         };
         let (sink, source) = output_ring(format);
+        let underruns = source.stats();
         output.start(source).expect("start");
-        let stage = OutputStage::new(Box::new(output), sink, Arc::new(AtomicU32::new(0)));
+        let stage = OutputStage::new(
+            Box::new(output),
+            sink,
+            underruns,
+            Arc::clone(&fake.published),
+        );
         (stage, fake)
+    }
+
+    fn published_ms(fake: &Fake) -> f32 {
+        f32::from_bits(fake.published.load(Ordering::Relaxed))
     }
 
     fn goertzel(x: &[f32], freq: f64, rate: f64) -> f64 {
@@ -928,11 +1032,80 @@ mod tests {
         assert!(rx.try_recv().is_err(), "recovery is not an error");
     }
 
+    /// A WAV output is truncated by `start`: after a write error it is stopped (which
+    /// finalizes what it wrote) and reported, never restarted.
+    #[test]
+    fn a_failed_non_restartable_output_is_not_reopened() {
+        let (mut stage, fake) = fake_stage_with(AudioFormat::INTERNAL, false);
+        let (events, mut rx) = broadcast::channel(8);
+        let t0 = Instant::now();
+        fake.error.store(true, Ordering::Relaxed);
+        stage.check_health(t0, &events);
+        assert!(!stage.is_up());
+        assert!(fake.source.lock().is_none(), "stopped");
+        assert!(matches!(rx.try_recv(), Ok(HubEvent::Error(m)) if m.contains("not reopened")));
+        for i in 1..5 {
+            stage.check_health(t0 + OUTPUT_RETRY * i, &events);
+        }
+        assert!(!stage.is_up());
+        assert_eq!(
+            fake.starts.load(Ordering::Relaxed),
+            1,
+            "never started again"
+        );
+        assert!(rx.try_recv().is_err(), "reported once");
+    }
+
+    /// The fill target follows the latency the output measures once it runs (only its first
+    /// 40 ms are buffered in the ring), grows after the output ran dry, and the published
+    /// latency covers the ring and the whole output latency.
+    #[test]
+    fn the_fill_target_follows_the_output() {
+        let (mut stage, fake) = fake_stage(AudioFormat::INTERNAL);
+        // 2 ticks + 5 ms.
+        assert_eq!(stage.target_frames, 1200);
+        assert!((published_ms(&fake) - 30.0).abs() < 0.01);
+
+        // The backend now reports a long playback delay (Bluetooth).
+        fake.latency_ms.store(180.0f32.to_bits(), Ordering::Relaxed);
+        stage.refresh();
+        assert_eq!(stage.target_frames, 48 * 60, "2 ticks + the 40 ms cap");
+        assert!((published_ms(&fake) - 240.0).abs() < 0.01);
+
+        // The device pulls more than the ring holds: an underrun.
+        {
+            let mut guard = fake.source.lock();
+            let src = guard.as_mut().expect("started");
+            let mut buf = vec![0.0; 960];
+            src.pull(&mut buf);
+            assert!(src.underruns() > 0);
+        }
+        stage.refresh();
+        assert_eq!(stage.target_frames, 48 * 70, "one step of extra fill");
+        stage.refresh();
+        assert_eq!(stage.target_frames, 48 * 70, "no new underrun, no change");
+        assert!((published_ms(&fake) - 250.0).abs() < 0.01);
+
+        // Extra fill is bounded.
+        for _ in 0..40 {
+            {
+                let mut guard = fake.source.lock();
+                let src = guard.as_mut().expect("started");
+                let mut buf = vec![0.0; 2];
+                src.pull(&mut buf);
+            }
+            stage.refresh();
+        }
+        let max_ms = 2.0 * MIX_FRAME_MS as f32 + MAX_PACING_LATENCY_MS + MAX_EXTRA_FILL_MS;
+        assert_eq!(stage.target_frames, 48 * max_ms as usize);
+    }
+
     #[test]
     fn mixer_ticks_do_not_allocate_after_warm_up() {
         use hfa_capture::output_file::NullOutput;
         let format = AudioFormat::INTERNAL;
-        let (sink, _source) = output_ring(format);
+        let (sink, source) = output_ring(format);
+        let underruns = source.stats();
         let (_tx, rx) = std::sync::mpsc::channel();
         let (events, _) = broadcast::channel(8);
         let mut worker = MixerThread {
@@ -942,6 +1115,7 @@ mod tests {
             output: OutputStage::new(
                 Box::new(NullOutput::new(format, 10)),
                 sink,
+                underruns,
                 Arc::new(AtomicU32::new(0)),
             ),
             commands: rx,
@@ -1015,6 +1189,7 @@ mod tests {
         let format = AudioFormat::INTERNAL;
         let mut output: Box<dyn AudioOutput> = Box::new(NullOutput::new(format, 10));
         let (sink, source) = output_ring(format);
+        let underruns = source.stats();
         output.start(source).expect("start");
         let (tx, rx) = std::sync::mpsc::channel();
         let (events, _) = broadcast::channel(8);
@@ -1023,6 +1198,7 @@ mod tests {
         let handle = spawn(
             output,
             sink,
+            underruns,
             rx,
             events,
             Arc::clone(&stop),
@@ -1047,6 +1223,7 @@ mod tests {
         handle.join().expect("join");
         let st = shared.state.lock();
         assert!(st.mix.played >= 40, "{:?}", st.mix);
-        assert!((f32::from_bits(latency.load(Ordering::Relaxed)) - 10.0).abs() < 0.01);
+        // Ring target (2 ticks + the output's 10 ms) plus the output's 10 ms.
+        assert!((f32::from_bits(latency.load(Ordering::Relaxed)) - 40.0).abs() < 0.01);
     }
 }

@@ -14,7 +14,9 @@
 //!   stream to the encoder thread, then pings the hub every [`PING_INTERVAL`] (RTT), adapts
 //!   to the hub's `Stats` (redundancy, expected loss, bitrate; see `sender_adapt.rs`),
 //!   reports the hub's `SetVolume`/`SetMute`/`SetPriority` as [`SenderEvent::HubControl`] and
-//!   publishes [`SenderStatus`] once per second.
+//!   publishes [`SenderStatus`] once per second. The controls the hub announces before
+//!   `StreamAccepted` describe the new stream and replace those of any earlier stream (one
+//!   `HubControl` event if that changes what was shown).
 //! - **Reconnects:** any control or media failure (including a hub that stays silent for
 //!   [`HUB_TIMEOUT`] or says `Bye`) ends the session; the control task waits with exponential
 //!   backoff ([`INITIAL_BACKOFF`] doubling up to [`MAX_BACKOFF`], back to the start after a
@@ -67,6 +69,10 @@ const CAPTURE_RING_MS: usize = 500;
 const EVENT_CAPACITY: usize = 64;
 /// Interval of [`SenderEvent::Status`] events.
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// The hub's controls for our stream: gain, muted, priority.
+type HubControls = (f32, bool, bool);
+/// Controls of a stream the hub announced nothing for.
+const DEFAULT_HUB_CONTROLS: HubControls = (1.0, false, false);
 
 /// How to reach the hub.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,7 +342,7 @@ impl SenderEngine {
             shared: Arc::clone(&shared),
             stop: stop_rx,
             epoch: Instant::now(),
-            hub_control: (1.0, false, false),
+            hub_control: DEFAULT_HUB_CONTROLS,
         };
         let task = tokio::spawn(control.run(thread));
         Ok(SenderHandle {
@@ -464,7 +470,7 @@ struct Control {
     stop: watch::Receiver<bool>,
     epoch: Instant,
     /// Gain, mute and priority the hub applies to our stream.
-    hub_control: (f32, bool, bool),
+    hub_control: HubControls,
 }
 
 impl Control {
@@ -628,8 +634,13 @@ impl Control {
         }
     }
 
-    /// `StreamStart` → `StreamAccepted`, then the media sender aimed at the hub's UDP port.
-    async fn start_stream(&mut self, ch: &mut ControlChannel) -> Result<MediaSender> {
+    /// `StreamStart` → `StreamAccepted`, then the media sender aimed at the hub's UDP port,
+    /// and the hub's controls for the new stream (announced before `StreamAccepted`;
+    /// defaults if it announced none).
+    async fn start_stream(
+        &mut self,
+        ch: &mut ControlChannel,
+    ) -> Result<(MediaSender, HubControls)> {
         let hub_ip = ch.peer_addr().ip();
         let bind: SocketAddr = match hub_ip {
             IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
@@ -655,6 +666,7 @@ impl Control {
         })))
         .await?;
         let deadline = tokio::time::Instant::now() + STREAM_ACCEPT_TIMEOUT;
+        let mut controls = DEFAULT_HUB_CONTROLS;
         loop {
             let msg = tokio::time::timeout_at(deadline, ch.recv())
                 .await
@@ -668,8 +680,11 @@ impl Control {
                             CoreError::Protocol(format!("invalid media port {}", a.udp_port))
                         })?;
                     media.set_dest(SocketAddr::new(hub_ip, port));
-                    return Ok(media);
+                    return Ok((media, controls));
                 }
+                Some(Body::SetVolume(v)) if v.stream_id == stream_id => controls.0 = v.gain,
+                Some(Body::SetMute(m)) if m.stream_id == stream_id => controls.1 = m.muted,
+                Some(Body::SetPriority(p)) if p.stream_id == stream_id => controls.2 = p.priority,
                 Some(Body::StreamRejected(r)) if r.stream_id == stream_id => {
                     return Err(CoreError::Rejected(r.reason));
                 }
@@ -706,8 +721,14 @@ impl Control {
                 let _ = ch.close(&e.to_string()).await;
                 return end_with(e, false);
             }
-            Some(Ok(media)) => media,
+            Some(Ok(started)) => started,
         };
+        let (media, controls) = media;
+        // The hub's view of this new stream replaces whatever an earlier stream showed.
+        if controls != self.hub_control {
+            self.hub_control = controls;
+            self.emit_hub_control();
+        }
         let stream_id = media.stream_id();
         tracing::info!(stream_id, dest = %media.dest(), "streaming");
         self.command(EncoderCommand::Stream {

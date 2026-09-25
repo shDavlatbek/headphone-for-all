@@ -94,7 +94,8 @@ async fn untrusted_senders_are_refused() {
 }
 
 /// The hub restarts on the same port (same identity and trust store): the sender notices,
-/// backs off, reconnects without a new pairing and streams a new stream.
+/// backs off, reconnects without a new pairing and streams a new stream. The restarted hub
+/// forgot that it had muted the sender, and the sender's view follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sender_reconnects_after_hub_restart() {
     let _serial = serial().await;
@@ -106,6 +107,13 @@ async fn sender_reconnects_after_hub_restart() {
     let mut sender = start_sender(&dev, port, 440.0, Some(pin)).await;
     let first_id = wait_source_added(&mut hub, START_TIMEOUT).await;
     wait_state(&mut sender, START_TIMEOUT, SenderState::Streaming).await;
+    hub.hub.set_muted(first_id, true).expect("mute");
+    let muted = wait_event(&mut sender.events, Duration::from_secs(5), |ev| match ev {
+        SenderEvent::HubControl { muted, .. } => Some(*muted),
+        _ => None,
+    })
+    .await;
+    assert_eq!(muted, Some(true));
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     hub.hub.stop().await;
@@ -121,6 +129,13 @@ async fn sender_reconnects_after_hub_restart() {
     assert_eq!(hub2.hub.local_port(), port);
     let second_id = wait_source_added(&mut hub2, Duration::from_secs(20)).await;
     assert_ne!(second_id, first_id, "a reconnect announces a new stream");
+    let unmuted = wait_event(&mut sender.events, Duration::from_secs(10), |ev| match ev {
+        SenderEvent::HubControl { muted, .. } => Some(*muted),
+        _ => None,
+    })
+    .await;
+    assert_eq!(unmuted, Some(false), "the new stream is not muted");
+    assert!(!hub2.hub.sources()[0].muted);
     wait_state(&mut sender, Duration::from_secs(10), SenderState::Streaming).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
     let counters = hub2.hub.stream_counters(second_id).expect("counters");
