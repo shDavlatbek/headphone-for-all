@@ -1630,6 +1630,21 @@ the version comes from `app/pubspec.yaml` without the `+build` part.
 - macOS: `macos/build-dmg.sh` → `Headphone_for_All-<ver>-macos.dmg` (create-dmg or hdiutil; optional Developer ID
   signing with the hardened runtime and `notarytool` notarization, credentials only from the environment).
 
+### 8.12 Refinements made by `fix/flutter` (the code in `app/lib` is authoritative)
+
+These supersede the matching statements of §8.5 and §8.7.
+
+**Loading the Rust library (`bootstrap.dart` `loadRustLibrary` / `rustExternalLibrary`).** flutter_rust_bridge's
+default loader derives the library name from the crate (`stem: 'hfa_ffi'`): `libhfa_ffi.so` (Android, Linux),
+`hfa_ffi.dll` (Windows), and on iOS/macOS `hfa_ffi.framework/hfa_ffi`, which does not exist: cargokit force-loads
+`libhfa_ffi.a` into the CocoaPods target `rust_lib_headphone_for_all`, and Flutter's Podfile uses `use_frameworks!`.
+So on iOS and macOS the app passes `RustLib.init(externalLibrary: ExternalLibrary.open(
+'rust_lib_headphone_for_all.framework/rust_lib_headphone_for_all'))`, falling back to
+`ExternalLibrary.process(iKnowHowToUseIt: true)` if the pods are ever linked statically. **Renaming the pod or the
+crate's `[lib] name` must update `appleRustFramework`.** `integration_test/bridge_test.dart` uses the same loader and
+now also covers `initApp` (idempotent, first-run name), a settings round trip and, where an output device exists, hub
+start → pairing window → stop → start.
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |

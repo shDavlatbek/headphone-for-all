@@ -160,6 +160,25 @@ void main() {
       expect(await resolveDataDir(native, requireNative: true), '/group/hfa');
     },
   );
+
+  test('the Rust library is loaded from the pod framework on Apple', () {
+    // Android, Linux, Windows: flutter_rust_bridge's default (named after
+    // the crate, libhfa_ffi.so / hfa_ffi.dll).
+    for (final os in ['android', 'linux', 'windows']) {
+      expect(rustExternalLibrary(os), isNull, reason: os);
+    }
+    expect(
+      appleRustFramework,
+      'rust_lib_headphone_for_all.framework/rust_lib_headphone_for_all',
+    );
+    // iOS / macOS: the framework (not on this test host), else the symbols
+    // linked into the process; never the non-existent hfa_ffi.framework.
+    for (final os in ['ios', 'macos']) {
+      final library = rustExternalLibrary(os);
+      expect(library, isNotNull, reason: os);
+      expect(library!.debugInfo, contains('process'), reason: os);
+    }
+  });
 }
 
 class _DirRecordingFake extends FakeHfaApi {

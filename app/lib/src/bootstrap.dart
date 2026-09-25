@@ -7,6 +7,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
+    show ExternalLibrary;
 import 'package:path_provider/path_provider.dart';
 
 import 'api/hfa_api.dart';
@@ -16,10 +18,38 @@ import 'rust/frb_generated.dart';
 
 bool _rustLoaded = false;
 
-/// Loads the Rust library once (`RustLib.init()`).
+/// The CocoaPods framework that carries the Rust core on iOS and macOS.
+///
+/// cargokit builds `libhfa_ffi.a` and force-loads it into the pod
+/// `rust_lib_headphone_for_all` (`rust_builder/{ios,macos}/*.podspec`), and
+/// Flutter's Podfile uses `use_frameworks!`, so the symbols live in this
+/// framework. flutter_rust_bridge's default loader derives the name from the
+/// crate (`hfa_ffi.framework/hfa_ffi`), which does not exist.
+const appleRustFramework =
+    'rust_lib_headphone_for_all.framework/rust_lib_headphone_for_all';
+
+/// How the Rust library is opened on [os] (`Platform.operatingSystem`):
+/// `null` = flutter_rust_bridge's default loader (Android, Linux, Windows:
+/// `libhfa_ffi.so` / `hfa_ffi.dll`, named after the crate).
+///
+/// iOS and macOS open [appleRustFramework] and, should the pods ever be
+/// linked statically (no framework), fall back to the symbols already linked
+/// into the process.
+ExternalLibrary? rustExternalLibrary([String? os]) {
+  final platform = os ?? (kIsWeb ? 'web' : Platform.operatingSystem);
+  if (platform != 'ios' && platform != 'macos') return null;
+  try {
+    return ExternalLibrary.open(appleRustFramework);
+  } catch (e) {
+    debugPrint('$appleRustFramework: $e; using the process symbols');
+    return ExternalLibrary.process(iKnowHowToUseIt: true);
+  }
+}
+
+/// Loads the Rust library once (`RustLib.init()`, see [rustExternalLibrary]).
 Future<void> loadRustLibrary() async {
   if (_rustLoaded) return;
-  await RustLib.init();
+  await RustLib.init(externalLibrary: rustExternalLibrary());
   _rustLoaded = true;
 }
 
