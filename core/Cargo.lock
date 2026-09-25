@@ -802,6 +802,7 @@ dependencies = [
  "block2",
  "cpal",
  "hfa-audio",
+ "hound",
  "libc",
  "objc2",
  "objc2-core-audio",

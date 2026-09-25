@@ -27,6 +27,7 @@ pub mod error;
 pub mod external;
 pub mod output_cpal;
 pub mod output_file;
+mod pacer;
 pub mod ring;
 pub mod tone;
 pub mod wav_source;
@@ -46,7 +47,7 @@ mod platform;
 
 pub use error::CaptureError;
 pub use external::{register_external, unregister_external, ExternalFeed};
-pub use ring::{pcm_ring, PcmSink, PcmSource, RingStats};
+pub use ring::{pcm_ring, pcm_ring_with_channels, PcmSink, PcmSource, RingStats};
 
 /// Result type used throughout this crate.
 pub type Result<T> = std::result::Result<T, CaptureError>;
@@ -80,6 +81,18 @@ pub trait AudioOutput: Send {
     fn stop(&mut self);
     /// Estimated device latency (buffer + hardware) in ms, if known.
     fn latency_ms(&self) -> Option<f32>;
+    /// `true` once the output failed while running and no longer consumes or plays the ring
+    /// as it should (device unplugged or stream invalidated, WAV write error...). The owner
+    /// (the hub) polls this periodically; on `true` it should stop this output and open a new
+    /// one, or report the error. Reset by `start`. Glitches (xruns) and route changes the
+    /// backend handled itself are not errors.
+    fn has_error(&self) -> bool {
+        false
+    }
+    /// Buffer under/overruns (xruns) the backend reported since `start` (0 if unknown).
+    fn xruns(&self) -> u64 {
+        0
+    }
 }
 
 /// What to capture.
@@ -183,8 +196,10 @@ pub fn open_capture(target: &CaptureTarget) -> Result<Box<dyn CaptureSource>> {
     }
 }
 
-/// Opens (but does not start) an output. `buffer_ms` is the desired device buffer size.
-/// Device outputs use the device's native rate/channels; WAV and null outputs use
+/// Opens (but does not start) an output. `buffer_ms` is the desired device buffer size (the
+/// pull period for WAV and null outputs). Device outputs use 48 kHz when the device supports
+/// it, else the device's default rate, and the device's channel count (see
+/// [`AudioOutput::format`]; the hub resamples to it); WAV and null outputs use
 /// [`AudioFormat::INTERNAL`].
 ///
 /// # Errors

@@ -347,6 +347,8 @@ pub trait AudioOutput: Send {
     fn start(&mut self, source: PcmSource) -> Result<(), CaptureError>;
     fn stop(&mut self);
     fn latency_ms(&self) -> Option<f32>;
+    fn has_error(&self) -> bool { false }   // added by feat/capture-common, see §5.2
+    fn xruns(&self) -> u64 { 0 }            // added by feat/capture-common, see §5.2
 }
 pub enum CaptureTarget { SystemMix, SystemMixExcludingSelf, Process { pid: u32 }, Tone { freq_hz: f32 }, WavFile(PathBuf), External { id: u32 } }
 pub struct CaptureApp { pub pid: u32, pub name: String }
@@ -481,6 +483,64 @@ Modules:
   device in a scratch copy because wine has no loopback) captured a 440 Hz tone at the expected level with no
   overruns, stopped in under 10 ms and restarted. Wine has no loopback or process loopback, so those two
   activations still need a real Windows 10/11 check.
+
+### 5.2 Refinements made by `feat/capture-common` (the code in `core/hfa-capture` is authoritative)
+
+- **Frame-aligned rings.** New `pcm_ring_with_channels(capacity_samples, channels: u16) -> (PcmSink, PcmSource)`
+  (re-exported from `lib.rs`). Capacity is rounded down to whole frames (at least one frame; `channels == 0` → 1).
+  `PcmSink::push` writes **whole frames only** (as many as fit) and returns the samples written; everything else
+  (ring full, trailing partial frame) is dropped and counted in `overruns`. `PcmSource::pull` reads whole frames
+  only and zero-fills the rest of `out` (counted in `underruns`). `pcm_ring(capacity)` is unchanged and equals
+  `pcm_ring_with_channels(capacity, 1)` (sample-granular). New `PcmSink::channels()` / `PcmSource::channels()`.
+  **Engines should create rings with `pcm_ring_with_channels(.., format.channels)`** of the capture/output format.
+- **Output health and ring layout (review fix).** `AudioOutput` gained two default methods:
+  `has_error() -> bool` (default `false`) and `xruns() -> u64` (default `0`). `has_error()` is `true` once the
+  output failed while running and no longer plays/consumes the ring properly (cpal: device unplugged, stream
+  invalidated; WAV: write error). It is reset by `start`. **The hub polls `has_error()` every mixer tick**; on
+  `true` it stops the output and reopens it (or emits `HubEvent::Error`), since the ring no longer drains.
+  Every output's `start` rejects a `PcmSource` whose `channels()` differs from `format().channels` with
+  `InvalidArgument` (so the hub must build the output ring with `pcm_ring_with_channels(.., output.format().channels)`).
+- Software sources and outputs (tone, WAV source, WAV/null outputs) run on a named thread paced against a
+  monotonic clock (`Instant`), computed from the total frame count, so there is no cumulative drift; a thread that
+  falls more than 250 ms behind skips ahead instead of bursting. `stop()` wakes and joins the thread; `Drop`
+  stops. `start` on a running object → `AlreadyRunning`; all of them can be restarted after `stop`.
+- `tone`: 10 ms blocks, amplitude `tone::TONE_AMPLITUDE = 0.25`, same signal on every channel.
+- `wav_source`: `WavFileSource::open` reads the file with `hound` directly (8/16/24/32-bit int, 32-bit float) and
+  delivers it in the file's own format, looping; `frames()`. Errors: missing file → `Io`, bad file → `Audio(Wav)`,
+  no channels / no audio → `Format`. `hound` is now a direct dependency of `hfa-capture`.
+- `external`:
+  - At most **one** `ExternalSource` is attached to a feed at a time: a second `start` → `AlreadyRunning`, and
+    `stop()`/drop of a source only detaches its own attachment.
+  - `register_external(id, format)` with the **same format** as the registered feed returns a handle to that feed
+    (a running source stays attached, e.g. when Android restarts its `AudioRecord`). With a **different format** it
+    replaces the feed and detaches the old source; the sender must re-open the target.
+  - `unregister_external` detaches the running source; unknown ids are ignored. `start` of a source whose feed was
+    unregistered → `NotFound`.
+  - New `ExternalFeed::is_attached()`; `ExternalFeed` implements `Debug`.
+- `output_cpal::CpalOutput`:
+  - Config choice: 48 kHz `f32` (stereo, else the fewest channels ≥ 2, else mono) → device default config →
+    48 kHz in another supported sample format → any supported range at its max rate. Supported device sample
+    formats: `f32`, `f64`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64` (`f32` samples are clamped to
+    [-1, 1] before conversion). `format()` reports the chosen rate/channels.
+  - `buffer_ms` → `BufferSize::Fixed(frames)` clamped into the supported range (default buffer size when the range is
+    unknown or `buffer_ms == 0`); if the fixed size is rejected, the default size is tried.
+  - The stream lives on a dedicated thread (`cpal::Stream` may be `!Send`); `start` waits (≤ 10 s) until it plays.
+    The default device is resolved again on `start`. The `PcmSource` reaches the callback through a one-slot
+    `rtrb` hand-off ring. The data callback only pulls, converts and stores atomics.
+  - cpal errors map to `NotFound` (device not available), `PermissionDenied`, `Format` (unsupported config) or
+    `Backend`. Stream errors: `DeviceNotAvailable`, `StreamInvalidated`, backend errors... are fatal and set
+    `has_error()` (inherent alias `has_stream_error()`). Not fatal: `Xrun` (counted, `xruns()`), `RealtimeDenied`,
+    and `DeviceChanged` (the default-device stream was rerouted by cpal and keeps playing, e.g. a headphone became
+    the default output; counted in the inherent `device_changes()`; the format is unchanged, nothing to reopen).
+    Extra method: `sample_format()`.
+  - `latency_ms()`: `None` until started; then the backend's callback→playback delay, else 2 × the device buffer.
+- `output_file`: block period = `buffer_ms` clamped to 1..=100 ms; `latency_ms()` = that period. When the ring runs
+  dry, the WAV output writes the zero-filled block (silence, like a device would play). `WavFileOutput::create`
+  checks that the parent directory exists (`Io`) and the format is non-zero (`Format`); the file is created or
+  truncated on `start` and finalized on `stop`/drop. Write errors are logged once, set `has_error()`, and the rest
+  is discarded. The WAV `data` chunk is capped just below 4 GiB (`hound` keeps RIFF sizes in a `u32`; ~3.1 h at
+  `AudioFormat::INTERNAL`): at the cap the file is finalized (whole frames), a warning is logged and the output
+  keeps pulling and discarding at the same pace; that is not an error.
 
 ## 6. `hfa-core` (networking + engines; tokio)
 
