@@ -1,115 +1,57 @@
-// Minimal first app: loads the Rust core and shows this device's identity.
-// feat/app replaces the UI (see docs/CONTRACTS.md §8.2).
-
-import 'dart:io';
+// Entry point: WidgetsFlutterBinding → RustLib.init() (skipped in the demo
+// mode) → data directory → initApp → runApp(ProviderScope(HfaApp)).
+//
+// Demo mode without the Rust core: flutter run --dart-define=HFA_FAKE=true
 
 import 'package:flutter/material.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import 'src/rust/api/app.dart';
-import 'src/rust/frb_generated.dart';
+import 'src/api/hfa_api.dart';
+import 'src/app.dart';
+import 'src/bootstrap.dart';
+import 'src/platform/desktop_integration.dart';
+import 'src/platform/native_channel.dart';
+import 'src/state/core_providers.dart';
+
+/// Runs against [FakeHfaApi] instead of the Rust core.
+const demoMode = bool.fromEnvironment('HFA_FAKE');
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await RustLib.init();
-  runApp(HfaApp(appInfo: loadAppInfo()));
-}
-
-/// Initializes the Rust core in `<application support>/hfa` and returns the device info.
-Future<AppInfo> loadAppInfo() async {
-  final support = await getApplicationSupportDirectory();
-  final dataDir = '${support.path}${Platform.pathSeparator}hfa';
-  return initApp(dataDir: dataDir);
-}
-
-/// Root widget: shows [appInfo] once the core is initialized, or the error.
-class HfaApp extends StatelessWidget {
-  const HfaApp({super.key, required this.appInfo});
-
-  /// Result of [loadAppInfo] (injected so tests can pass a fake).
-  final Future<AppInfo> appInfo;
-
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Headphone for All',
-      theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
-      home: Scaffold(
-        appBar: AppBar(title: const Text('Headphone for All')),
-        body: FutureBuilder<AppInfo>(
-          future: appInfo,
-          builder: (context, snapshot) {
-            if (snapshot.hasError) {
-              return _Message(
-                icon: Icons.error_outline,
-                text: 'Could not start the audio core:\n${snapshot.error}',
-              );
-            }
-            final info = snapshot.data;
-            if (info == null) {
-              return const Center(child: CircularProgressIndicator());
-            }
-            return AppInfoView(info: info);
-          },
-        ),
-      ),
-    );
+  try {
+    await initDesktopWindow();
+  } catch (e) {
+    debugPrint('window manager: $e');
   }
+  await start();
 }
 
-/// Shows the fields of an [AppInfo].
-class AppInfoView extends StatelessWidget {
-  const AppInfoView({super.key, required this.info});
-
-  /// The info to show.
+/// Initializes the core and shows the app, or the error screen.
+Future<void> start() async {
+  runApp(const SplashApp());
+  final native = NativeChannel();
+  final HfaApi api = demoMode
+      ? FakeHfaApi.demo(platform: hostPlatformName())
+      : const RustHfaApi();
   final AppInfo info;
-
-  @override
-  Widget build(BuildContext context) {
-    final caps = info.capabilities;
-    final rows = <(String, String)>[
-      ('Device name', info.deviceName),
-      ('Device id', info.deviceId),
-      ('Platform', info.platform),
-      ('Version', info.version),
-      ('System audio capture', _yesNo(caps.systemMix)),
-      ('Per-app capture', _yesNo(caps.perApp)),
-      ('Native capture only', _yesNo(caps.externalOnly)),
-    ];
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        for (final (label, value) in rows)
-          ListTile(title: Text(label), subtitle: SelectableText(value)),
-        if (caps.notes.isNotEmpty)
-          ListTile(title: const Text('Notes'), subtitle: Text(caps.notes)),
+  try {
+    info = await initCore(api: api, native: native, loadRust: !demoMode);
+  } catch (e, stack) {
+    debugPrint('startup failed: $e\n$stack');
+    runApp(InitErrorApp(error: describeError(e), onRetry: start));
+    return;
+  }
+  runApp(
+    ProviderScope(
+      // Errors are shown to the user; never retry engine calls silently.
+      retry: (retryCount, error) => null,
+      overrides: [
+        hfaApiProvider.overrideWithValue(api),
+        nativeChannelProvider.overrideWithValue(native),
+        initialAppInfoProvider.overrideWithValue(info),
+        demoModeProvider.overrideWithValue(demoMode),
       ],
-    );
-  }
-
-  static String _yesNo(bool value) => value ? 'yes' : 'no';
-}
-
-class _Message extends StatelessWidget {
-  const _Message({required this.icon, required this.text});
-
-  final IconData icon;
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 48),
-            const SizedBox(height: 12),
-            Text(text, textAlign: TextAlign.center),
-          ],
-        ),
-      ),
-    );
-  }
+      child: DesktopIntegration(enabled: isDesktopHost, child: const HfaApp()),
+    ),
+  );
 }
