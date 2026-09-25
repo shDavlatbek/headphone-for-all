@@ -3,7 +3,6 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hfa_audio::{
     AudioFormat, DriftConfig, DriftController, JitterBuffer, JitterConfig, Mixer, MixerConfig, Pop,
@@ -12,15 +11,16 @@ use hfa_audio::{
 
 struct Counting;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
 thread_local! {
     static TRACKING: Cell<bool> = const { Cell::new(false) };
+    // Per thread: the tests run in parallel, and `probe_detects_allocations` allocates on
+    // purpose while another test's probe may be open.
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn note() {
     if TRACKING.try_with(|t| t.get()).unwrap_or(false) {
-        ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
+        let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
     }
 }
 
@@ -48,11 +48,11 @@ static GLOBAL: Counting = Counting;
 
 /// Runs `f` and returns how many allocations it made on this thread.
 fn count_allocs(f: impl FnOnce()) -> usize {
-    let before = ALLOCATIONS.load(Ordering::SeqCst);
+    let before = ALLOCATIONS.with(Cell::get);
     TRACKING.with(|t| t.set(true));
     f();
     TRACKING.with(|t| t.set(false));
-    ALLOCATIONS.load(Ordering::SeqCst) - before
+    ALLOCATIONS.with(Cell::get) - before
 }
 
 #[test]
