@@ -84,7 +84,7 @@ Required building blocks (whichever transport):
   drift until the buffer runs dry or overflows. Fix: watch how full the buffer is and resample slightly, with a
   **variable-ratio resampler** (`rubato`) and a PI controller (Roc uses the same approach).
 - **Loss handling:** Opus in-band FEC + PLC. Optionally send each packet twice on bad links.
-- **Discovery:** mDNS/DNS-SD service `_hfa._udp`.
+- **Discovery:** mDNS/DNS-SD service `_hfa._tcp`.
   - Android needs a `WifiManager.MulticastLock`.
   - iOS needs `NSLocalNetworkUsageDescription` + `NSBonjourServices` and should use native `NWBrowser`.
 - **Pairing and encryption:**

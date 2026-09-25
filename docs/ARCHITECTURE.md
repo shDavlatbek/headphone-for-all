@@ -115,13 +115,16 @@ Bandwidth: about 140 kbit/s per stereo stream at 128 kbps Opus, which is trivial
 - The sender skips silent frames (DTX), which saves battery on mobile.
 - Adaptive quality: when the hub reports loss, the sender raises Opus FEC and the expected loss %, then lowers the bitrate.
 
-## 6. Proposed repository layout
+## 6. Repository layout
+
+The exact module-level contract lives in [CONTRACTS.md](CONTRACTS.md).
 
 ```
 headphone-for-all/
 ├── core/                         # Rust workspace
-│   ├── hfa-proto/                # packet header, control messages (prost), crypto framing
-│   ├── hfa-core/                 # sender + hub engines, jitter buffer, drift, mixer, discovery
+│   ├── hfa-proto/                # packet header, control messages (prost), crypto, pairing
+│   ├── hfa-audio/                # Opus codec, jitter buffer, drift, resampler, mixer, meters
+│   ├── hfa-core/                 # config, identity, discovery, control channel, sender + hub engines
 │   ├── hfa-capture/              # CaptureSource backends: windows, macos, linux (cfg-gated)
 │   ├── hfa-ffi/                  # C ABI + JNI + flutter_rust_bridge API surface
 │   └── hfa-cli/                  # headless `hfa send` / `hfa hub` for testing & servers
