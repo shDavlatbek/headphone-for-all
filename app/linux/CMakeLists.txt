@@ -70,6 +70,18 @@ set_target_properties(${BINARY_NAME}
 )
 
 
+# tray_manager's native code (the cnativeapi plugin) uses
+# G_APPLICATION_DEFAULT_FLAGS, which GLib only has since 2.74 (it is the new
+# name of G_APPLICATION_FLAGS_NONE, same value). Ubuntu 22.04, the oldest
+# distribution the AppImage supports (CI builds it there), ships GLib 2.72, so
+# map the new name to the old one for the plugins added below. Newer GLib
+# declares the enumerator itself and gets no definition.
+pkg_check_modules(HFA_GLIB REQUIRED glib-2.0)
+if(HFA_GLIB_VERSION VERSION_LESS "2.74")
+  add_compile_definitions(
+    "G_APPLICATION_DEFAULT_FLAGS=G_APPLICATION_FLAGS_NONE")
+endif()
+
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
 include(flutter/generated_plugins.cmake)
