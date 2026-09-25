@@ -1634,6 +1634,11 @@ the version comes from `app/pubspec.yaml` without the `+build` part.
 
 These supersede the matching statements of §8.5 and the "Open" list of §8.9.
 
+**`hfa send` (hfa-cli, §7).** Loads this device's identity and refuses, before anything starts, a target that is
+this device: `--uri` whose `hub_id` is the own key, `--hub <own device id>`, or a `--hub` name that discovery
+resolves to the own device id ("that is this device's own hub ..."). A typed `--to <own address>` is caught only by
+the engine's own-key check in the handshake (hfa-core).
+
 **Event subscriptions (`manager.rs`).** `sender_events` computes the current status and joins the subscription set
 under the set's lock (`SinkSet::add_with_initial`), and `sender_start` fills the sender slot before the forwarder can
 relay anything (`broadcast_then`), so a status change can no longer fall between the initial status and the
