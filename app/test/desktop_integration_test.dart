@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/bootstrap.dart';
 import 'package:headphone_for_all/src/platform/desktop_integration.dart';
+import 'package:headphone_for_all/src/state/sender_controller.dart';
 import 'package:tray_manager/tray_manager.dart' as tray;
 
 import 'helpers.dart';
@@ -55,6 +56,34 @@ void main() {
     expect(closeActionFor(busy: true, trayUsable: false), CloseAction.quit);
     expect(closeActionFor(busy: false, trayUsable: true), CloseAction.quit);
     expect(closeActionFor(busy: false, trayUsable: false), CloseAction.quit);
+  });
+
+  test('the tray tells what runs and offers to stop sending', () {
+    expect(trayTooltip(hubOn: false), 'Headphone for All');
+    expect(
+      trayTooltip(hubOn: true, sendingTo: 'Desk PC'),
+      'Headphone for All — Hub on · Sending to Desk PC',
+    );
+    expect(
+      trayTooltip(hubOn: false, hubError: 'output device lost'),
+      'Headphone for All — Hub error: output device lost',
+    );
+
+    const idle = SenderState(status: idleSenderStatus);
+    expect(traySendingTo(idle), isNull);
+    expect(traySenderLabel(traySendingTo(idle)), 'Not sending');
+    const live = SenderState(
+      status: SenderStatusDto(
+        state: 'streaming',
+        hubName: 'Desk PC',
+        bitrate: 128000,
+        lossPct: 0,
+        rttMs: 3,
+        levelDb: -20,
+      ),
+    );
+    expect(traySendingTo(live), 'Desk PC');
+    expect(traySenderLabel(traySendingTo(live)), 'Stop sending to Desk PC');
   });
 
   test('the Linux tray host probe never throws', () async {

@@ -1,6 +1,6 @@
 /// Desktop (Windows, macOS, Linux) shell integration: a tray icon with
-/// Show/Hide, Hub on/off and Quit, and "close hides to the tray" while the
-/// hub or the sender runs.
+/// Show/Hide, Hub on/off, the sender (Stop sending) and Quit, a tooltip with
+/// what runs, and "close hides to the tray" while the hub or the sender runs.
 library;
 
 import 'dart:async';
@@ -51,6 +51,31 @@ trayClickPolicy(String os) => switch (os) {
     clickTogglesWindow: false,
   ),
 };
+
+/// The tray tooltip: the app name and what runs, so a hidden window still
+/// shows that this device is capturing (ARCHITECTURE §8) or that the hub
+/// failed.
+String trayTooltip({required bool hubOn, String? sendingTo, String? hubError}) {
+  final parts = [
+    if (hubOn) 'Hub on',
+    if (sendingTo != null) 'Sending to $sendingTo',
+    if (hubError != null) 'Hub error: $hubError',
+  ];
+  return parts.isEmpty
+      ? 'Headphone for All'
+      : 'Headphone for All — ${parts.join(' · ')}';
+}
+
+/// The hub name the tray shows for a live [sender], or `null` when it is
+/// not sending.
+String? traySendingTo(SenderState sender) {
+  if (!sender.isLive) return null;
+  return sender.status.hubName ?? sender.target?.name ?? 'the hub';
+}
+
+/// Label of the tray's sender item ([sendingTo] from [traySendingTo]).
+String traySenderLabel(String? sendingTo) =>
+    sendingTo == null ? 'Not sending' : 'Stop sending to $sendingTo';
 
 /// What closing the window does.
 enum CloseAction {
@@ -131,6 +156,7 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
   tray.Menu? _menu;
   tray.MenuItem? _showItem;
   tray.MenuItem? _hubItem;
+  tray.MenuItem? _senderItem;
   final List<Object> _keepAlive = [];
   bool _quitting = false;
 
@@ -183,11 +209,19 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
         _toggleWindow,
       );
       final hub = _item('Hub', tray.MenuItemType.checkbox, _toggleHub);
+      final sender = _item(
+        'Not sending',
+        tray.MenuItemType.normal,
+        _stopSending,
+      );
       final quit = _item('Quit', tray.MenuItemType.normal, _quit);
-      if (show == null || hub == null || quit == null) return;
+      if (show == null || hub == null || sender == null || quit == null) {
+        return;
+      }
       menu
         ..addItem(show)
         ..addItem(hub)
+        ..addItem(sender)
         ..addSeparator()
         ..addItem(quit);
       icon.setContextMenu(menu);
@@ -204,7 +238,9 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
       _menu = menu;
       _showItem = show;
       _hubItem = hub;
+      _senderItem = sender;
       _syncHubItem(ref.read(hubControllerProvider).running);
+      _syncStatus();
       // The runner may start hidden (`--autostart`), so ask instead of assuming.
       unawaited(_syncShowItem());
     } catch (e) {
@@ -233,6 +269,7 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
       _menu?.dispose();
       _showItem?.dispose();
       _hubItem?.dispose();
+      _senderItem?.dispose();
     } catch (e) {
       debugPrint('tray: $e');
     }
@@ -248,6 +285,33 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
       ..state = running
           ? tray.MenuItemState.checked
           : tray.MenuItemState.unchecked;
+  }
+
+  /// Tooltip and sender item after what runs now.
+  void _syncStatus() {
+    final icon = _trayIcon;
+    if (icon == null) return;
+    final hub = ref.read(hubControllerProvider);
+    final sendingTo = traySendingTo(ref.read(senderControllerProvider));
+    try {
+      icon.setTooltip(
+        trayTooltip(
+          hubOn: hub.running,
+          sendingTo: sendingTo,
+          hubError: hub.error,
+        ),
+      );
+      _senderItem
+        ?..label = traySenderLabel(sendingTo)
+        ..isEnabled = sendingTo != null;
+    } catch (e) {
+      debugPrint('tray: $e');
+    }
+  }
+
+  Future<void> _stopSending() async {
+    if (!ref.read(senderControllerProvider).isLive) return;
+    await ref.read(senderControllerProvider.notifier).stop();
   }
 
   /// Labels the Show/Hide item after the window's current visibility.
@@ -354,6 +418,14 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
       ref.listen(
         hubControllerProvider.select((h) => h.running),
         (_, running) => _syncHubItem(running),
+      );
+      ref.listen(
+        hubControllerProvider.select((h) => (h.running, h.error)),
+        (_, _) => _syncStatus(),
+      );
+      ref.listen(
+        senderControllerProvider.select(traySendingTo),
+        (_, _) => _syncStatus(),
       );
     }
     return widget.child;
