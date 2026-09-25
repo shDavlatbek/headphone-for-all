@@ -9,8 +9,12 @@
 //!   device sample format (`f32`, `f64`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`).
 //!   It never allocates, locks, logs or blocks; it talks to the rest of the program through
 //!   atomics and a one-slot `rtrb` hand-off ring only.
-//! - Stream errors (device unplugged...) raise an atomic flag, see
-//!   [`CpalOutput::has_stream_error`].
+//! - Fatal stream errors (device unplugged, stream invalidated) raise an atomic flag that the
+//!   owner reads through [`AudioOutput::has_error`]. Xruns are counted
+//!   ([`AudioOutput::xruns`]); route changes the backend handled itself (cpal
+//!   `ErrorKind::DeviceChanged`: the stream was rerouted and keeps playing, e.g. when a headphone
+//!   becomes the default output) are counted in [`CpalOutput::device_changes`] and are not
+//!   errors.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -25,7 +29,7 @@ use cpal::{
 };
 use hfa_audio::AudioFormat;
 
-use crate::ring::PcmSource;
+use crate::ring::{check_ring_channels, PcmSource};
 use crate::{AudioOutput, CaptureError, Result};
 
 /// Preferred device sample rate (the internal rate: no resampling in the hub).
@@ -57,6 +61,8 @@ struct Shared {
     stream_error: AtomicBool,
     /// Buffer under/overruns reported by the backend.
     xruns: AtomicU64,
+    /// Route changes the backend handled without interrupting the stream.
+    device_changes: AtomicU64,
     /// Last measured callback → playback delay, in µs (0 = unknown).
     playback_delay_us: AtomicU32,
     /// Device buffer size in frames reported by the stream (0 = unknown).
@@ -84,9 +90,14 @@ fn cpal_error(context: &str, e: &cpal::Error) -> CaptureError {
     }
 }
 
-/// Whether a stream error means the stream no longer plays (as opposed to a glitch).
+/// Whether a stream error means the stream no longer plays (as opposed to a glitch, or a route
+/// change after which cpal documents that "the stream remains active and no rebuild is
+/// required").
 fn is_fatal(kind: ErrorKind) -> bool {
-    !matches!(kind, ErrorKind::Xrun | ErrorKind::RealtimeDenied)
+    !matches!(
+        kind,
+        ErrorKind::Xrun | ErrorKind::RealtimeDenied | ErrorKind::DeviceChanged
+    )
 }
 
 /// Finds an output device of the default host (`None` = the default output device).
@@ -264,15 +275,19 @@ impl CpalOutput {
         self.sample_format
     }
 
-    /// `true` once cpal reported a fatal stream error (e.g. the device was unplugged or the
-    /// stream was invalidated). The owner should then stop this output and open a new one.
+    /// `true` once cpal reported a fatal stream error since `start` (e.g. the device was
+    /// unplugged or the stream was invalidated). Same as [`AudioOutput::has_error`]. The owner
+    /// should then stop this output and open a new one. Xruns, "realtime denied" and route
+    /// changes the backend handled itself are not fatal.
     pub fn has_stream_error(&self) -> bool {
         self.shared.stream_error.load(Ordering::Relaxed)
     }
 
-    /// Number of buffer under/overruns (xruns) the backend reported since `start`.
-    pub fn xruns(&self) -> u64 {
-        self.shared.xruns.load(Ordering::Relaxed)
+    /// Number of route changes since `start` after which the stream kept playing (cpal
+    /// `ErrorKind::DeviceChanged`, e.g. a headphone became the default output). The stream
+    /// format is unchanged; nothing needs to be reopened.
+    pub fn device_changes(&self) -> u64 {
+        self.shared.device_changes.load(Ordering::Relaxed)
     }
 
     fn config(&self, buffer_size: BufferSize) -> StreamConfig {
@@ -410,12 +425,17 @@ impl CallbackState {
 fn error_callback(shared: &Arc<Shared>) -> impl FnMut(cpal::Error) + Send + 'static {
     let shared = Arc::clone(shared);
     // Not a data callback, but it may run on the audio thread: atomics only, no logging.
-    move |err| {
-        if is_fatal(err.kind()) {
-            shared.stream_error.store(true, Ordering::Relaxed);
-        } else if err.kind() == ErrorKind::Xrun {
-            shared.xruns.fetch_add(1, Ordering::Relaxed);
-        }
+    move |err| record_stream_error(&shared, err.kind())
+}
+
+/// Records a stream error reported by cpal in the shared atomics (real-time safe).
+fn record_stream_error(shared: &Shared, kind: ErrorKind) {
+    if is_fatal(kind) {
+        shared.stream_error.store(true, Ordering::Relaxed);
+    } else if kind == ErrorKind::Xrun {
+        shared.xruns.fetch_add(1, Ordering::Relaxed);
+    } else if kind == ErrorKind::DeviceChanged {
+        shared.device_changes.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -492,12 +512,14 @@ impl AudioOutput for CpalOutput {
         if self.running.is_some() {
             return Err(CaptureError::AlreadyRunning);
         }
+        check_ring_channels(&source, self.format)?;
         let mut configs = vec![self.config(self.buffer_size)];
         if self.buffer_size != BufferSize::Default {
             configs.push(self.config(BufferSize::Default));
         }
         self.shared.stream_error.store(false, Ordering::Relaxed);
         self.shared.xruns.store(0, Ordering::Relaxed);
+        self.shared.device_changes.store(0, Ordering::Relaxed);
         self.shared.playback_delay_us.store(0, Ordering::Relaxed);
         self.shared.buffer_frames.store(0, Ordering::Relaxed);
         let params = StreamParams {
@@ -559,6 +581,14 @@ impl AudioOutput for CpalOutput {
             f => f,
         };
         Some(2.0 * frames as f32 * 1000.0 / self.format.sample_rate.max(1) as f32)
+    }
+
+    fn has_error(&self) -> bool {
+        self.has_stream_error()
+    }
+
+    fn xruns(&self) -> u64 {
+        self.shared.xruns.load(Ordering::Relaxed)
     }
 }
 
@@ -698,6 +728,68 @@ mod tests {
     }
 
     #[test]
+    fn only_errors_that_stop_the_stream_are_fatal() {
+        for kind in [
+            ErrorKind::Xrun,
+            ErrorKind::RealtimeDenied,
+            ErrorKind::DeviceChanged,
+        ] {
+            assert!(!is_fatal(kind), "{kind:?} must not be fatal");
+        }
+        for kind in [
+            ErrorKind::DeviceNotAvailable,
+            ErrorKind::StreamInvalidated,
+            ErrorKind::BackendError,
+        ] {
+            assert!(is_fatal(kind), "{kind:?} must be fatal");
+        }
+    }
+
+    /// An output that was never opened on a real device (no hardware needed).
+    fn detached_output(format: AudioFormat) -> CpalOutput {
+        CpalOutput {
+            device_name: "hfa-test: no such device".to_owned(),
+            is_default: false,
+            format,
+            sample_format: SampleFormat::F32,
+            buffer_size: BufferSize::Default,
+            buffer_ms: 20,
+            shared: Arc::new(Shared::default()),
+            running: None,
+        }
+    }
+
+    #[test]
+    fn stream_errors_are_visible_through_the_trait() {
+        let out = detached_output(AudioFormat::INTERNAL);
+        let dyn_out: &dyn AudioOutput = &out;
+        assert!(!dyn_out.has_error());
+        record_stream_error(&out.shared, ErrorKind::Xrun);
+        record_stream_error(&out.shared, ErrorKind::Xrun);
+        record_stream_error(&out.shared, ErrorKind::DeviceChanged);
+        record_stream_error(&out.shared, ErrorKind::RealtimeDenied);
+        let dyn_out: &dyn AudioOutput = &out;
+        assert_eq!(dyn_out.xruns(), 2);
+        assert_eq!(out.device_changes(), 1);
+        assert!(!dyn_out.has_error(), "route changes and xruns keep playing");
+        record_stream_error(&out.shared, ErrorKind::DeviceNotAvailable);
+        let dyn_out: &dyn AudioOutput = &out;
+        assert!(dyn_out.has_error());
+        assert!(out.has_stream_error());
+    }
+
+    #[test]
+    fn start_rejects_a_ring_with_another_channel_count() {
+        let mut out = detached_output(AudioFormat::new(48_000, 6));
+        let (_sink, stereo) = crate::pcm_ring_with_channels(64, 2);
+        assert!(matches!(
+            out.start(stereo),
+            Err(CaptureError::InvalidArgument(_))
+        ));
+        assert_eq!(out.latency_ms(), None, "not started");
+    }
+
+    #[test]
     fn missing_devices_are_errors_not_panics() {
         // This must hold on machines with and without audio hardware (CI containers have
         // none): opening the default device either works or fails cleanly.
@@ -754,13 +846,13 @@ mod tests {
             crate::pcm_ring_with_channels(format.samples_for_ms(2000), format.channels);
         let pushed = sink.push(&vec![0.1f32; format.samples_for_ms(1000)]);
         out.start(source).expect("start");
-        let (_s, source3) = crate::pcm_ring(16);
+        let (_s, source3) = crate::pcm_ring_with_channels(16, format.channels);
         assert_eq!(out.start(source3).err(), Some(CaptureError::AlreadyRunning));
         std::thread::sleep(std::time::Duration::from_millis(300));
         let consumed = pushed - (sink.capacity() - sink.free());
         assert!(consumed > 0, "the device callback pulled nothing");
         assert!(out.latency_ms().is_some_and(|ms| ms > 0.0));
-        assert!(!out.has_stream_error());
+        assert!(!out.has_error());
         out.stop();
         out.stop();
         assert_eq!(out.latency_ms(), None);

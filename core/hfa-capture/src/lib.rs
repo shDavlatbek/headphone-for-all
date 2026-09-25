@@ -81,6 +81,18 @@ pub trait AudioOutput: Send {
     fn stop(&mut self);
     /// Estimated device latency (buffer + hardware) in ms, if known.
     fn latency_ms(&self) -> Option<f32>;
+    /// `true` once the output failed while running and no longer consumes or plays the ring
+    /// as it should (device unplugged or stream invalidated, WAV write error...). The owner
+    /// (the hub) polls this periodically; on `true` it should stop this output and open a new
+    /// one, or report the error. Reset by `start`. Glitches (xruns) and route changes the
+    /// backend handled itself are not errors.
+    fn has_error(&self) -> bool {
+        false
+    }
+    /// Buffer under/overruns (xruns) the backend reported since `start` (0 if unknown).
+    fn xruns(&self) -> u64 {
+        0
+    }
 }
 
 /// What to capture.

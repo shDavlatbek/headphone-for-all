@@ -9,6 +9,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use hfa_audio::AudioFormat;
+
+use crate::{CaptureError, Result};
+
 /// A cloneable, read-only view of one ring counter (overruns of a [`PcmSink`] or underruns
 /// of a [`PcmSource`]).
 ///
@@ -191,6 +195,25 @@ impl PcmSource {
     }
 }
 
+/// Checks that `source` was created for the channel count of `format`, so an output never
+/// reinterprets the frame layout (e.g. a stereo ring played by a 6-channel device would run
+/// 3× too fast with scrambled channels).
+///
+/// # Errors
+/// [`CaptureError::InvalidArgument`] if `source.channels() != format.channels`.
+pub(crate) fn check_ring_channels(source: &PcmSource, format: AudioFormat) -> Result<()> {
+    let expected = format.channels.max(1);
+    if source.channels() == expected {
+        Ok(())
+    } else {
+        Err(CaptureError::InvalidArgument(format!(
+            "the output plays {expected}-channel frames but the ring carries {}-channel frames; \
+             create it with pcm_ring_with_channels(.., {expected})",
+            source.channels()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +383,21 @@ mod tests {
         }
         // Overruns are expected (the producer retries dropped data): what matters is order.
         let _ = producer.join().expect("join");
+    }
+
+    #[test]
+    fn ring_channel_check_requires_matching_layout() {
+        let (_s, stereo) = pcm_ring_with_channels(16, 2);
+        let (_s, mono) = pcm_ring(16);
+        assert!(check_ring_channels(&stereo, AudioFormat::new(48_000, 2)).is_ok());
+        assert!(check_ring_channels(&mono, AudioFormat::new(48_000, 1)).is_ok());
+        assert!(matches!(
+            check_ring_channels(&stereo, AudioFormat::new(48_000, 6)),
+            Err(CaptureError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            check_ring_channels(&mono, AudioFormat::new(48_000, 2)),
+            Err(CaptureError::InvalidArgument(_))
+        ));
     }
 }
