@@ -212,3 +212,42 @@ async fn sender_discovers_the_hub_by_device_id() {
     sender.stop().await;
     hub.stop().await;
 }
+
+/// The hub listens on IPv6 as well as IPv4 (dual-stack): a sender that reaches it over `::1`
+/// streams normally. Skipped on hosts without IPv6.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sender_reaches_the_hub_over_ipv6() {
+    if std::net::UdpSocket::bind("[::1]:0").is_err() {
+        eprintln!("no IPv6 on this host; skipped");
+        return;
+    }
+    let _serial = serial().await;
+    let hub_dev = Device::new("Hub");
+    let mut hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let pin = hub.hub.start_pairing().pin;
+    let dev = Device::new("IPv6 laptop");
+    let (capture, _) =
+        hfa_core::sender::open_capture(&hfa_capture::CaptureTarget::Tone { freq_hz: 440.0 })
+            .expect("tone");
+    let sender = hfa_core::SenderEngine::start(hfa_core::SenderConfig {
+        hub: hfa_core::HubAddress::Direct {
+            host: "[::1]".into(),
+            port: hub.hub.local_port(),
+        },
+        settings: dev.settings(0),
+        capture,
+        label: "IPv6".into(),
+        expected_hub_key: None,
+        pairing_secret: Some(pin),
+    })
+    .await
+    .expect("sender");
+    let stream_id = wait_source_added(&mut hub, START_TIMEOUT).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let counters = hub.hub.stream_counters(stream_id).expect("counters");
+    let status = sender.status();
+    sender.stop().await;
+    hub.hub.stop().await;
+    assert_eq!(status.state, SenderState::Streaming, "{status:?}");
+    assert!(counters.played > 50, "{counters:?}");
+}

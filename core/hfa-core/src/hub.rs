@@ -4,8 +4,10 @@
 //! # Structure
 //!
 //! - **Sockets:** TCP (control) and UDP (media) are bound on the same port number
-//!   (`settings.port`; `0` picks a free number for both, see [`HubHandle::local_port`]). A
-//!   port that is already taken is an error ([`crate::CoreError::Io`] naming the port).
+//!   (`settings.port`; `0` picks a free number for both, see [`HubHandle::local_port`]), as
+//!   dual-stack IPv6 sockets (`[::]`, `IPV6_V6ONLY` off: IPv6 and IPv4 peers), or on IPv4
+//!   `0.0.0.0` only when the host has no IPv6. A port that is already taken is an error
+//!   ([`crate::CoreError::Io`] naming the port).
 //! - **Accept loop** (tokio): one task per sender connection ([`ControlChannel::accept`] with
 //!   the hub's [`PairingManager`]; [`HubEvent::PairingCompleted`] /
 //!   [`HubEvent::PairingFailed`]). Unauthenticated connections are limited, so nobody on the
@@ -52,7 +54,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -397,11 +399,82 @@ impl HubEngine {
     }
 }
 
-/// Binds TCP and UDP on the same port number (see the module docs).
+/// Address families the hub listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stack {
+    /// One IPv6 socket per protocol with `IPV6_V6ONLY` off: IPv6 and (IPv4-mapped) IPv4.
+    Dual,
+    /// IPv4 only (the host has no IPv6).
+    V4,
+}
+
+/// A bind failure: which protocol, and the error.
+type BindError = (&'static str, std::io::Error);
+
+fn new_socket(stack: Stack, ty: socket2::Type, port: u16) -> std::io::Result<socket2::Socket> {
+    use socket2::{Domain, Socket};
+    let (domain, addr): (Domain, std::net::SocketAddr) = match stack {
+        Stack::Dual => (Domain::IPV6, (Ipv6Addr::UNSPECIFIED, port).into()),
+        Stack::V4 => (Domain::IPV4, (Ipv4Addr::UNSPECIFIED, port).into()),
+    };
+    let socket = Socket::new(domain, ty, None)?;
+    if stack == Stack::Dual {
+        socket.set_only_v6(false)?;
+    }
+    // Like `tokio::net::TcpListener::bind`: a restarted hub can take its port back at once
+    // (not on Windows, where SO_REUSEADDR would let another socket steal a bound port).
+    #[cfg(not(windows))]
+    if ty == socket2::Type::STREAM {
+        socket.set_reuse_address(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket)
+}
+
+fn tcp_listener(stack: Stack, port: u16) -> std::io::Result<TcpListener> {
+    let socket = new_socket(stack, socket2::Type::STREAM, port)?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
+}
+
+fn udp_socket(stack: Stack, port: u16) -> std::io::Result<UdpSocket> {
+    let socket = new_socket(stack, socket2::Type::DGRAM, port)?;
+    UdpSocket::from_std(socket.into())
+}
+
+/// Binds TCP and UDP on the same port number in `stack` (port 0: any number free for both).
+fn bind_stack(stack: Stack, port: u16) -> std::result::Result<(TcpListener, UdpSocket), BindError> {
+    if port != 0 {
+        let tcp = tcp_listener(stack, port).map_err(|e| ("TCP", e))?;
+        let udp = udp_socket(stack, port).map_err(|e| ("UDP", e))?;
+        return Ok((tcp, udp));
+    }
+    for _ in 0..PORT_ATTEMPTS {
+        let tcp = tcp_listener(stack, 0).map_err(|e| ("TCP", e))?;
+        let chosen = tcp.local_addr().map_err(|e| ("TCP", e))?.port();
+        match udp_socket(stack, chosen) {
+            Ok(udp) => return Ok((tcp, udp)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => return Err(("UDP", e)),
+        }
+    }
+    Err((
+        "UDP",
+        std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "found no port number free for both TCP and UDP",
+        ),
+    ))
+}
+
+/// Binds TCP and UDP on the same port number (see the module docs): dual-stack (IPv6 and
+/// IPv4) where the host supports IPv6, else IPv4 only.
 async fn bind(port: u16) -> Result<(TcpListener, UdpSocket)> {
-    let any = Ipv4Addr::UNSPECIFIED;
-    let port_error = |proto: &str, e: std::io::Error| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
+    let port_error = |(proto, e): BindError| {
+        if port == 0 {
+            CoreError::Io(format!("cannot bind a {proto} port: {e}"))
+        } else if e.kind() == std::io::ErrorKind::AddrInUse {
             CoreError::Io(format!(
                 "{proto} port {port} is already in use (is another hub running?); choose \
                  another port, or 0 for any free port"
@@ -410,27 +483,14 @@ async fn bind(port: u16) -> Result<(TcpListener, UdpSocket)> {
             CoreError::Io(format!("cannot bind {proto} port {port}: {e}"))
         }
     };
-    if port != 0 {
-        let tcp = TcpListener::bind((any, port))
-            .await
-            .map_err(|e| port_error("TCP", e))?;
-        let udp = UdpSocket::bind((any, port))
-            .await
-            .map_err(|e| port_error("UDP", e))?;
-        return Ok((tcp, udp));
-    }
-    for _ in 0..PORT_ATTEMPTS {
-        let tcp = TcpListener::bind((any, 0)).await?;
-        let chosen = tcp.local_addr()?.port();
-        match UdpSocket::bind((any, chosen)).await {
-            Ok(udp) => return Ok((tcp, udp)),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
-            Err(e) => return Err(e.into()),
+    match bind_stack(Stack::Dual, port) {
+        Ok(sockets) => Ok(sockets),
+        Err((proto, e)) if e.kind() == std::io::ErrorKind::AddrInUse => Err(port_error((proto, e))),
+        Err((proto, e)) => {
+            tracing::info!(%proto, error = %e, "no IPv6 sockets; the hub listens on IPv4 only");
+            bind_stack(Stack::V4, port).map_err(port_error)
         }
     }
-    Err(CoreError::Io(
-        "found no port number free for both TCP and UDP".into(),
-    ))
 }
 
 /// Everything the hub's tasks share.
@@ -824,7 +884,8 @@ async fn accept_loop(
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, addr)) => {
-                    let ip = addr.ip();
+                    // An IPv4 peer on the dual-stack socket shows up as ::ffff:a.b.c.d.
+                    let ip = addr.ip().to_canonical();
                     // Held across `spawn`, so the task cannot deregister before it is listed.
                     let mut pending = shared.pending.lock();
                     let authenticated = connections.len().saturating_sub(pending.len());

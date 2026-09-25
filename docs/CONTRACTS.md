@@ -946,6 +946,13 @@ Modules:
   change is pending. Devices that are not (or no longer) trusted are dropped on load and on save; a missing,
   unreadable or corrupt file is logged and treated as empty (never fatal). The **master gain is not persisted by
   the core** (the app shows and re-applies it; persisting it needs `HubStatusDto` support in `hfa-ffi`/Dart).
+- **IPv6 (replaces "IPv4 `0.0.0.0` only" in §6.3).** The hub binds TCP and UDP as **dual-stack IPv6 sockets**
+  (`[::]:port`, `IPV6_V6ONLY` off, via `socket2`; SO_REUSEADDR on the TCP listener except on Windows, like tokio),
+  so IPv6 and IPv4 peers both connect; when the host has no IPv6 (creating/binding the IPv6 socket fails with
+  anything but `AddrInUse`) it falls back to IPv4 `0.0.0.0`. Same port rules and errors as before. The per-IP
+  handshake limit compares `IpAddr::to_canonical()` (an IPv4 peer shows up as `::ffff:a.b.c.d`). **Sender:**
+  `Direct` hosts and discovered hubs are tried address by address (IPv4 first) until one connects (only I/O and
+  timeout errors move on to the next address).
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

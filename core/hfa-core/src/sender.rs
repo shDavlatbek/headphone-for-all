@@ -578,14 +578,26 @@ impl Control {
     }
 
     async fn connect_phase(&mut self) -> Result<(ControlChannel, PeerInfo)> {
-        let (addr, discovered_key, required_id) = self.resolve().await?;
+        let (addrs, discovered_key, required_id) = self.resolve().await?;
         let key = self.pinned.or(self.expected_hub_key).or(discovered_key);
         if self.secret.is_some() && !key.is_some_and(|k| self.trust.is_trusted(&k)) {
             self.set_state(SenderState::Pairing);
         }
-        let secret = self.secret.as_ref().map(|s| s.as_str().to_owned());
-        let (ch, peer) =
-            ControlChannel::connect(addr, &self.identity, &self.trust, key, secret).await?;
+        // Every address in turn (IPv4 first), until one answers: a host may have an address
+        // the hub cannot be reached on (another family, another network).
+        let mut connected = Err(CoreError::HubNotFound("no address".into()));
+        for addr in addrs {
+            let secret = self.secret.as_ref().map(|s| s.as_str().to_owned());
+            connected =
+                ControlChannel::connect(addr, &self.identity, &self.trust, key, secret).await;
+            match &connected {
+                Err(CoreError::Io(e)) | Err(CoreError::Timeout(e)) => {
+                    tracing::debug!(%addr, error = %e, "hub address unreachable");
+                }
+                _ => break,
+            }
+        }
+        let (ch, peer) = connected?;
         if let Some(id) = required_id {
             if peer.device_id != id {
                 let _ = ch.close("unexpected hub").await;
@@ -612,23 +624,22 @@ impl Control {
         }
     }
 
-    /// Hub socket address, the hub key known from the trust store (discovery), and the device
-    /// id the hub must have (discovery by id / pinned hub).
-    async fn resolve(&self) -> Result<(SocketAddr, Option<[u8; 32]>, Option<String>)> {
+    /// Hub socket addresses (IPv4 first), the hub key known from the trust store
+    /// (discovery), and the device id the hub must have (discovery by id / pinned hub).
+    async fn resolve(&self) -> Result<(Vec<SocketAddr>, Option<[u8; 32]>, Option<String>)> {
         match &self.hub {
             HubAddress::Direct { host, port } => {
                 let host = host.trim().trim_start_matches('[').trim_end_matches(']');
-                let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, *port))
+                let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, *port))
                     .await
                     .map_err(|e| CoreError::HubNotFound(format!("{host}: {e}")))?
                     .collect();
-                let addr = addrs
-                    .iter()
-                    .find(|a| a.is_ipv4())
-                    .or_else(|| addrs.first())
-                    .copied()
-                    .ok_or_else(|| CoreError::HubNotFound(host.to_owned()))?;
-                Ok((addr, None, None))
+                if addrs.is_empty() {
+                    return Err(CoreError::HubNotFound(host.to_owned()));
+                }
+                addrs.sort_by_key(SocketAddr::is_ipv6);
+                addrs.dedup();
+                Ok((addrs, None, None))
             }
             HubAddress::Discover { name_or_id } => {
                 let target = match self.pinned {
@@ -921,7 +932,7 @@ impl Control {
 async fn discover(
     target: &str,
     trust: &TrustStore,
-) -> Result<(SocketAddr, Option<[u8; 32]>, Option<String>)> {
+) -> Result<(Vec<SocketAddr>, Option<[u8; 32]>, Option<String>)> {
     let mut browser = crate::discovery::browse()?;
     let by_id = hfa_proto::is_fingerprint(target);
     let wanted = target.to_lowercase();
@@ -950,13 +961,14 @@ async fn discover(
         }
     }
     let info = best.ok_or_else(|| CoreError::HubNotFound(target.to_owned()))?;
-    let ip = info.addrs[0];
+    let mut addrs: Vec<SocketAddr> = info
+        .addrs
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, info.port))
+        .collect();
+    addrs.sort_by_key(SocketAddr::is_ipv6);
     let key = trust.get(&info.device_id).map(|p| p.public_key);
-    Ok((
-        SocketAddr::new(ip, info.port),
-        key,
-        by_id.then(|| target.to_owned()),
-    ))
+    Ok((addrs, key, by_id.then(|| target.to_owned())))
 }
 
 #[cfg(test)]
