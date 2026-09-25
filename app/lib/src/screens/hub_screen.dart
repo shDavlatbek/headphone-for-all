@@ -4,7 +4,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/core_providers.dart';
 import '../state/hub_controller.dart';
 import '../util/format.dart';
-import '../widgets/dialogs.dart';
 import '../widgets/source_tile.dart';
 import 'pairing_sheet.dart';
 
@@ -15,11 +14,6 @@ class HubScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    ref.listen(hubControllerProvider.select((s) => s.error), (_, error) {
-      if (error == null) return;
-      showMessage(context, error);
-      ref.read(hubControllerProvider.notifier).clearError();
-    });
     final hub = ref.watch(hubControllerProvider);
     final controller = ref.read(hubControllerProvider.notifier);
     return ListView(
@@ -112,6 +106,10 @@ class _HubHeader extends ConsumerWidget {
                 ),
               ],
             ),
+            if (hub.error != null) ...[
+              const SizedBox(height: 12),
+              _HubError(message: hub.error!, onDismiss: controller.clearError),
+            ],
             const SizedBox(height: 12),
             Align(
               alignment: Alignment.centerRight,
@@ -166,6 +164,46 @@ class _HubHeader extends ConsumerWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// The hub's last error, shown until dismissed (errors also appear in a
+/// snack bar from the app shell, wherever the user is).
+class _HubError extends StatelessWidget {
+  const _HubError({required this.message, required this.onDismiss});
+
+  final String message;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      key: const Key('hub-error'),
+      padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+      decoration: BoxDecoration(
+        color: scheme.errorContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.error_outline, color: scheme.onErrorContainer),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              message,
+              style: TextStyle(color: scheme.onErrorContainer),
+            ),
+          ),
+          IconButton(
+            key: const Key('hub-error-dismiss'),
+            tooltip: 'Dismiss',
+            icon: Icon(Icons.close, color: scheme.onErrorContainer),
+            onPressed: onDismiss,
+          ),
+        ],
       ),
     );
   }

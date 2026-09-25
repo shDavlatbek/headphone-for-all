@@ -264,10 +264,14 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
     if (await windowManager.isVisible()) {
       await _hideWindow();
     } else {
-      await windowManager.show();
-      await windowManager.focus();
-      _setVisible(true);
+      await _showWindow();
     }
+  }
+
+  Future<void> _showWindow() async {
+    await windowManager.show();
+    await windowManager.focus();
+    _setVisible(true);
   }
 
   Future<void> _hideWindow() async {
@@ -275,8 +279,19 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
     _setVisible(false);
   }
 
-  Future<void> _toggleHub() =>
-      ref.read(hubControllerProvider.notifier).toggle();
+  Future<void> _toggleHub() async {
+    await ref.read(hubControllerProvider.notifier).toggle();
+    if (!mounted) return;
+    // The window explains a failure (snack bar + hub screen); the tray
+    // checkbox alone would just stay unchecked.
+    if (ref.read(hubControllerProvider).error != null) {
+      try {
+        await _showWindow();
+      } catch (e) {
+        debugPrint('window manager: $e');
+      }
+    }
+  }
 
   Future<void> _quit() async {
     if (_quitting) return;

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
+import 'package:headphone_for_all/src/state/hub_controller.dart';
 import 'package:headphone_for_all/src/state/navigation.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
@@ -172,14 +173,102 @@ void main() {
     await unmount(tester);
   });
 
-  testWidgets('hub errors are shown in a snack bar', (tester) async {
+  testWidgets('hub errors are shown in a snack bar and kept on the hub', (
+    tester,
+  ) async {
     final fake = fakeWithSources();
     await pumpApp(tester, fake, section: AppSection.hub);
     await startHub(tester);
     fake.emitHubEvent(const HubEventDto.error(message: 'output device lost'));
     await tester.pump();
     await tester.pump();
-    expect(find.text('output device lost'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(SnackBar),
+        matching: find.text('output device lost'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('hub-error')),
+        matching: find.text('output device lost'),
+      ),
+      findsOneWidget,
+    );
+    await tester.tap(find.byKey(const Key('hub-error-dismiss')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('hub-error')), findsNothing);
     await unmount(tester);
   });
+
+  testWidgets(
+    'an error raised on another section is announced and survives the poll',
+    (tester) async {
+      final fake = fakeWithSources();
+      final container = await pumpApp(tester, fake);
+      await container.read(hubControllerProvider.notifier).start();
+      await tester.pumpAndSettle();
+
+      fake.emitHubEvent(
+        const HubEventDto.error(
+          message: 'output device failed: headphone disconnected',
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      // Shown on Home, where the hub screen's own listener never was.
+      expect(
+        find.text('output device failed: headphone disconnected'),
+        findsOneWidget,
+      );
+      // The source poll and source updates no longer wipe it.
+      await container.read(hubControllerProvider.notifier).refreshSources();
+      fake.addSource(FakeHfaApi.source(streamId: 3, deviceName: 'Tablet'));
+      await tester.pumpAndSettle();
+      expect(
+        container.read(hubControllerProvider).error,
+        'output device failed: headphone disconnected',
+      );
+
+      container.read(sectionProvider.notifier).select(AppSection.hub);
+      await tester.pumpAndSettle();
+      expect(
+        find.descendant(
+          of: find.byKey(const Key('hub-error')),
+          matching: find.textContaining('headphone disconnected'),
+        ),
+        findsOneWidget,
+      );
+      await unmount(tester);
+    },
+  );
+
+  testWidgets('a successful start clears an earlier start failure', (
+    tester,
+  ) async {
+    final fake = _FlakyStartApi();
+    await pumpApp(tester, fake, section: AppSection.hub);
+    await startHub(tester);
+    expect(find.byKey(const Key('hub-error')), findsOneWidget);
+    expect(find.text('Hub is off'), findsOneWidget);
+    await startHub(tester);
+    expect(find.text('Hub is on'), findsOneWidget);
+    expect(find.byKey(const Key('hub-error')), findsNothing);
+    await unmount(tester);
+  });
+}
+
+/// The first hub start fails (no output device), later ones work.
+class _FlakyStartApi extends FakeHfaApi {
+  var _failed = false;
+
+  @override
+  Future<HubStatusDto> hubStart() async {
+    if (!_failed) {
+      _failed = true;
+      throw const HfaApiException('no output device');
+    }
+    return super.hubStart();
+  }
 }
