@@ -2,6 +2,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/hfa_api.dart';
 import 'core_providers.dart';
+import 'hub_controller.dart';
 
 /// The saved settings.
 final settingsControllerProvider =
@@ -38,12 +39,19 @@ class TrustedPeersController extends AsyncNotifier<List<TrustedPeerDto>> {
       ref.watch(hfaApiProvider).trustedPeers();
 
   /// Removes [deviceId] from the trust store and reloads the list.
-  Future<void> forget(String deviceId) async {
+  ///
+  /// A running hub keeps its own copy of the trust store (CONTRACTS.md
+  /// §8.5): it would still accept the device and could save it back on its
+  /// next pairing. So a running hub is restarted; returns `true` then.
+  Future<bool> forget(String deviceId) async {
     final api = ref.read(hfaApiProvider);
     await api.forgetPeer(deviceId);
     final peers = await api.trustedPeers();
-    if (!ref.mounted) return;
+    if (!ref.mounted) return false;
     state = AsyncData(peers);
+    if (!ref.read(hubControllerProvider).running) return false;
+    await ref.read(hubControllerProvider.notifier).restart();
+    return true;
   }
 }
 

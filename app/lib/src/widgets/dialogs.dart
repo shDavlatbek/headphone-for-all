@@ -158,14 +158,7 @@ class _AddHubDialogState extends State<_AddHubDialog> {
                   labelText: 'Port (optional)',
                   hintText: '47810',
                 ),
-                validator: (v) {
-                  final text = v?.trim() ?? '';
-                  if (text.isEmpty) return null;
-                  final port = int.tryParse(text);
-                  return (port == null || port < 1 || port > 65535)
-                      ? 'Port must be 1–65535'
-                      : null;
-                },
+                validator: validatePort,
               ),
               TextFormField(
                 key: const Key('manual-pin-field'),
@@ -307,4 +300,15 @@ void showMessage(
   ScaffoldMessenger.maybeOf(context)
     ?..hideCurrentSnackBar()
     ..showSnackBar(SnackBar(content: Text(message), action: action));
+}
+
+/// Validates an optional port field: empty (any / default port) or 1–65535.
+/// Returns the error text, or `null` when valid.
+String? validatePort(String? value) {
+  final text = value?.trim() ?? '';
+  if (text.isEmpty) return null;
+  final port = int.tryParse(text);
+  return (port == null || port < 1 || port > 65535)
+      ? 'Port must be 1–65535'
+      : null;
 }

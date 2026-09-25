@@ -27,16 +27,50 @@ Future<void> loadRustLibrary() async {
 /// (Android `filesDir/hfa`, the iOS App Group container shared with the
 /// broadcast extension, macOS Application Support), else
 /// `<application support>/hfa` from path_provider.
-Future<String> resolveDataDir(NativeChannel native) async {
+///
+/// With [requireNative] (default: on iOS) a failing or empty `getDataDir` is
+/// a startup error instead: the broadcast extension reads trust and
+/// settings from the App Group container, so a private fallback directory
+/// would make every broadcast fail later without a hint. The fallback is
+/// kept where the platform has no channel (desktop: `null`) and on Android,
+/// whose path_provider directory is the same `filesDir`.
+Future<String> resolveDataDir(
+  NativeChannel native, {
+  bool? requireNative,
+}) async {
+  final strict = requireNative ?? (!kIsWeb && Platform.isIOS);
   String? nativeDir;
   try {
     nativeDir = await native.getDataDir();
   } on PlatformException catch (e) {
+    if (strict) {
+      throw DataDirException(
+        'The shared app data folder is not available: '
+        '${e.message ?? e.code}',
+      );
+    }
     debugPrint('getDataDir failed, using path_provider: ${e.message}');
   }
   if (nativeDir != null && nativeDir.isNotEmpty) return nativeDir;
+  if (strict) {
+    throw const DataDirException(
+      'The shared app data folder is not available.',
+    );
+  }
   final support = await getApplicationSupportDirectory();
   return '${support.path}${Platform.pathSeparator}hfa';
+}
+
+/// The data directory could not be resolved (shown on [InitErrorApp]).
+class DataDirException implements Exception {
+  /// Creates the error with [message].
+  const DataDirException(this.message);
+
+  /// What went wrong.
+  final String message;
+
+  @override
+  String toString() => message;
 }
 
 /// The device name used on the very first run. Desktop: `null` (the core

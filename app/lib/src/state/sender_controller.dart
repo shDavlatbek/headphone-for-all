@@ -8,9 +8,14 @@ import '../models/hub_target.dart';
 import '../models/source_choice.dart';
 import '../platform/native_channel.dart';
 import 'core_providers.dart';
+import 'settings_controller.dart';
 
 /// Sender states in which a sender is live (`sender_start` would refuse).
 const liveSenderStates = {'connecting', 'pairing', 'streaming', 'reconnecting'};
+
+/// iOS pre-pairing: how often the core's sender status is polled as a
+/// fallback for a status event the subscription may have missed.
+const pairingPollInterval = Duration(milliseconds: 300);
 
 /// What the sender screen shows.
 @immutable
@@ -136,6 +141,8 @@ class SenderController extends Notifier<SenderState> {
         ? target.asPaired()
         : null;
     state = state.copyWith(status: status, target: paired, error: state.error);
+    // The core saved the hub as trusted: refresh the lists that show it.
+    if (paired != null) ref.invalidate(trustedPeersProvider);
     if (_nativeCapture && !liveSenderStates.contains(status.state)) {
       // The engine ended by itself (failed / stopped): stop the capture too.
       _nativeCapture = false;
@@ -216,6 +223,8 @@ class SenderController extends Notifier<SenderState> {
     await _api.senderStart(
       target.toRequest(source.toDto(), label: source.label),
     );
+    // The consent dialog can stay open for a while; the sender may fail
+    // meanwhile (wrong PIN, pairing required, key mismatch).
     final started = await _native.startSystemCapture(
       feedId: androidFeedId,
       sampleRate: nativeSampleRate,
@@ -226,6 +235,23 @@ class SenderController extends Notifier<SenderState> {
       throw const HfaApiException(
         'Audio capture was not allowed. Tap Start again and accept the '
         'screen-capture prompt.',
+      );
+    }
+    // Ask the core (not the possibly late event stream) whether the sender
+    // still runs; if it ended, the capture service must not keep running.
+    SenderStatusDto? now;
+    try {
+      now = await _api.senderStatus();
+    } catch (e) {
+      debugPrint('sender status: ${describeError(e)}');
+    }
+    final live =
+        ref.mounted &&
+        liveSenderStates.contains(now?.state ?? state.status.state);
+    if (!live) {
+      await _quietly(_native.stopSystemCapture);
+      throw HfaApiException(
+        now?.error ?? state.status.error ?? 'The sender stopped.',
       );
     }
     _nativeCapture = true;
@@ -266,6 +292,7 @@ class SenderController extends Notifier<SenderState> {
         deviceId = added.single;
       }
     }
+    if (target.pairingSecret != null) ref.invalidate(trustedPeersProvider);
     await _native.writeBroadcastConfig(
       BroadcastConfig(
         hubHost: target.host,
@@ -284,30 +311,57 @@ class SenderController extends Notifier<SenderState> {
 
   /// Runs a sender on an empty external feed until it streams (paired and
   /// connected) or ends, then stops it. Returns the deciding status.
+  ///
+  /// Event order is not relied upon: the subscription's first event (the
+  /// status before this start) is awaited before `senderStart`, and after
+  /// the start the core's status is also polled, so a status change that
+  /// raced the subscription is still seen.
   Future<SenderStatusDto> _pairOnce(
     HubTarget target,
     SourceChoice source,
   ) async {
     final outcome = Completer<SenderStatusDto>();
-    var first = true;
-    _pairingOnly = true;
-    final sub = _api.senderEvents().listen((status) {
-      // The first event is the status before this start.
-      if (first) {
-        first = false;
-        return;
-      }
-      if (outcome.isCompleted) return;
+    final subscribed = Completer<void>();
+    var started = false;
+    void decide(SenderStatusDto status) {
+      if (!started || outcome.isCompleted) return;
       if (status.state == 'streaming' ||
           status.state == 'failed' ||
           status.state == 'stopped') {
         outcome.complete(status);
       }
+    }
+
+    _pairingOnly = true;
+    final sub = _api.senderEvents().listen((status) {
+      if (!subscribed.isCompleted) {
+        // The status before this start.
+        subscribed.complete();
+        return;
+      }
+      decide(status);
     });
+    Timer? poll;
     try {
+      await subscribed.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () {},
+      );
       await _api.senderStart(
         target.toRequest(source.toDto(), label: source.label),
       );
+      // From here on the core's status belongs to this start.
+      started = true;
+      Future<void> check() async {
+        try {
+          decide(await _api.senderStatus());
+        } catch (e) {
+          debugPrint('sender status: ${describeError(e)}');
+        }
+      }
+
+      unawaited(check());
+      poll = Timer.periodic(pairingPollInterval, (_) => unawaited(check()));
       return await outcome.future.timeout(
         const Duration(seconds: 20),
         onTimeout: () => const SenderStatusDto(
@@ -320,6 +374,7 @@ class SenderController extends Notifier<SenderState> {
         ),
       );
     } finally {
+      poll?.cancel();
       await sub.cancel();
       await _quietly(_api.senderStop);
       _pairingOnly = false;

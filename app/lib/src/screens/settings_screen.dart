@@ -71,6 +71,7 @@ class _SettingsFormState extends ConsumerState<SettingsForm> {
   String? _output;
   bool _saving = false;
   String? _nameError;
+  String? _portError;
 
   @override
   void initState() {
@@ -113,12 +114,22 @@ class _SettingsFormState extends ConsumerState<SettingsForm> {
 
   Future<void> _save() async {
     final name = _name.text.trim();
-    if (name.isEmpty || name.length > 64) {
-      setState(() => _nameError = 'Use 1 to 64 characters');
+    final nameError = name.isEmpty || name.length > 64
+        ? 'Use 1 to 64 characters'
+        : null;
+    // SettingsDto.port is a u16: an out-of-range value would be truncated
+    // on its way to the core and saved as another port.
+    final portError = validatePort(_port.text);
+    if (nameError != null || portError != null) {
+      setState(() {
+        _nameError = nameError;
+        _portError = portError;
+      });
       return;
     }
     setState(() {
       _nameError = null;
+      _portError = null;
       _saving = true;
     });
     try {
@@ -239,10 +250,13 @@ class _SettingsFormState extends ConsumerState<SettingsForm> {
               key: const Key('port'),
               controller: _port,
               keyboardType: TextInputType.number,
+              maxLength: 5,
               inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 labelText: 'Hub port',
                 helperText: 'Empty = any free port',
+                errorText: _portError,
+                counterText: '',
               ),
             ),
             if (info.isDesktop) ...[
@@ -321,26 +335,26 @@ class TrustedDevicesCard extends ConsumerWidget {
     final ok = await showConfirmDialog(
       context,
       title: 'Forget ${peer.name}?',
-      message:
-          'It will need a new PIN to connect again. A running hub keeps its '
-          'current pairings until it restarts.',
+      message: ref.read(hubControllerProvider).running
+          ? 'It will need a new PIN to connect again. The hub restarts to '
+                'apply this, so every device reconnects.'
+          : 'It will need a new PIN to connect again.',
       confirmLabel: 'Forget',
     );
     if (!ok) return;
     try {
-      await ref.read(trustedPeersProvider.notifier).forget(peer.deviceId);
+      final restarted = await ref
+          .read(trustedPeersProvider.notifier)
+          .forget(peer.deviceId);
       if (!context.mounted) return;
-      final hubRunning = ref.read(hubControllerProvider).running;
+      final hubError = ref.read(hubControllerProvider).error;
       showMessage(
         context,
-        'Forgot ${peer.name}.',
-        action: hubRunning
-            ? SnackBarAction(
-                label: 'Restart hub',
-                onPressed: () =>
-                    ref.read(hubControllerProvider.notifier).restart(),
-              )
-            : null,
+        !restarted
+            ? 'Forgot ${peer.name}.'
+            : hubError == null
+            ? 'Forgot ${peer.name}. The hub restarted.'
+            : 'Forgot ${peer.name}, but the hub did not restart: $hubError',
       );
     } catch (e) {
       if (context.mounted) showMessage(context, describeError(e));

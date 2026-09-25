@@ -53,6 +53,23 @@ void main() {
     await unmount(tester);
   });
 
+  testWidgets('an out-of-range port is refused, not truncated', (tester) async {
+    final fake = FakeHfaApi();
+    await pumpApp(tester, fake, section: AppSection.settings);
+    await tester.enterText(find.byKey(const Key('port')), '70000');
+    await tester.tap(find.byKey(const Key('save-settings')));
+    await tester.pumpAndSettle();
+    expect(find.text('Port must be 1–65535'), findsOneWidget);
+    expect(fake.calls, isNot(contains('updateSettings')));
+
+    await tester.enterText(find.byKey(const Key('port')), '65535');
+    await tester.tap(find.byKey(const Key('save-settings')));
+    await tester.pumpAndSettle();
+    expect(find.text('Port must be 1–65535'), findsNothing);
+    expect(fake.settings.port, 65535);
+    await unmount(tester);
+  });
+
   testWidgets('desktop offers the output device; phones do not', (
     tester,
   ) async {

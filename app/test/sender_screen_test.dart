@@ -132,6 +132,39 @@ void main() {
     await unmount(tester);
   });
 
+  testWidgets('a hub paired with a PIN is not asked for a PIN again', (
+    tester,
+  ) async {
+    final fake = senderFake();
+    await pumpApp(tester, fake, section: AppSection.sender);
+    await tester.tap(find.text('Office Mac'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('sender-start')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('pin-field')), '482913');
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Pair'));
+    await tester.pumpAndSettle();
+    expect(find.text('Streaming'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('sender-stop')));
+    await tester.pumpAndSettle();
+
+    // The discovery announcement still says "not trusted", but the trust
+    // store (refreshed after pairing) knows better.
+    await tester.tap(find.text('Desk PC'));
+    await tester.pumpAndSettle();
+    expect(find.text('192.168.1.31:47810 · paired'), findsOneWidget);
+    await tester.tap(find.text('Office Mac'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('sender-start')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pin-field')), findsNothing);
+    expect(find.text('Streaming'), findsOneWidget);
+    expect(fake.lastSenderStart?.pairingSecret, isNull);
+    expect(fake.lastSenderStart?.hubDeviceId, macHub.deviceId);
+    await unmount(tester);
+  });
+
   testWidgets('a pairing-required failure offers "Enter PIN"', (tester) async {
     final fake = senderFake();
     await pumpApp(tester, fake, section: AppSection.sender);

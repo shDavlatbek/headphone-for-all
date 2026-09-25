@@ -109,21 +109,40 @@ class HubController extends Notifier<HubState> {
     if (state.busy || state.running) return;
     state = state.copyWith(busy: true);
     final native = ref.read(nativeChannelProvider);
+    final HubStatusDto status;
     try {
       await native.startHubService();
-      final status = await _api.hubStart();
-      if (state.masterGain != 1) {
-        await _api.hubSetMasterGain(state.masterGain);
-      }
-      if (!ref.mounted) return;
-      state = state.copyWith(running: true, busy: false, port: status.port);
-      _startPolling();
-      await refreshSources();
+      status = await _api.hubStart();
     } catch (e) {
+      // The core hub did not start: the service must not outlive it.
       await _quietly(native.stopHubService);
       if (!ref.mounted) return;
       state = state.copyWith(busy: false, error: describeError(e));
+      return;
     }
+    // The hub runs from here on; a later failure is only reported, so the
+    // UI, the core and the native service keep agreeing that it runs.
+    String? error;
+    if (state.masterGain != 1) {
+      try {
+        await _api.hubSetMasterGain(state.masterGain);
+        _appliedMasterGain = state.masterGain;
+      } catch (e) {
+        // A new hub mixes at unity gain until the slider is moved again.
+        _appliedMasterGain = 1;
+        error = describeError(e);
+      }
+    }
+    if (!ref.mounted) return;
+    state = state.copyWith(
+      running: true,
+      busy: false,
+      port: status.port,
+      masterGain: error == null ? null : 1.0,
+      error: error,
+    );
+    _startPolling();
+    await refreshSources();
   }
 
   /// Stops the hub and the native hub service.

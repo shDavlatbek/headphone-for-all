@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/models/hub_target.dart';
@@ -175,6 +178,29 @@ void main() {
       expect(native.calls, ['startHubService', 'stopHubService']);
     });
 
+    test(
+      'a failure after hubStart keeps core, service and UI agreeing',
+      () async {
+        final fake = _MasterGainFailingApi();
+        final native = RecordingNativeChannel();
+        final c = containerFor(fake, native: native);
+        // Errors are transient (the hub screen shows each in a snack bar).
+        final errors = <String>[];
+        c.listen(hubControllerProvider.select((h) => h.error), (_, error) {
+          if (error != null) errors.add(error);
+        });
+        final hub = c.read(hubControllerProvider.notifier);
+        await hub.setMasterGain(2);
+        await hub.start();
+        final state = c.read(hubControllerProvider);
+        expect(fake.hubRunning, isTrue);
+        expect(state.running, isTrue);
+        expect(errors, ['mixer busy']);
+        expect(state.masterGain, 1);
+        expect(native.calls, ['startHubService']);
+      },
+    );
+
     test('an Error event is surfaced', () async {
       final fake = FakeHfaApi();
       final c = containerFor(fake);
@@ -234,6 +260,44 @@ void main() {
       expect(fake.calls, contains('hubCancelPairing'));
       expect(fake.pairing, isNull);
       expect(c.read(pairingControllerProvider).phase, PairingPhase.idle);
+    });
+
+    test('a cancel while opening closes the late window in the core', () async {
+      final fake = _SlowPairingApi();
+      final c = containerFor(fake);
+      c.listen(pairingControllerProvider, (_, _) {});
+      await fake.hubStart();
+      final pairing = c.read(pairingControllerProvider.notifier);
+      final opening = pairing.start();
+      await settle();
+      expect(c.read(pairingControllerProvider).phase, PairingPhase.opening);
+      await pairing.cancel();
+      // The core opens the window only after the cancel ran.
+      fake.open.complete();
+      await opening;
+      expect(c.read(pairingControllerProvider).phase, PairingPhase.idle);
+      expect(fake.calls.where((m) => m == 'hubCancelPairing'), hasLength(2));
+      expect(fake.pairing, isNull);
+    });
+
+    test('a newer start keeps its window when an older one resolves', () async {
+      final fake = _SlowPairingApi();
+      final c = containerFor(fake);
+      c.listen(pairingControllerProvider, (_, _) {});
+      await fake.hubStart();
+      final pairing = c.read(pairingControllerProvider.notifier);
+      final first = pairing.start();
+      await settle();
+      final firstOpen = fake.open;
+      fake.open = Completer<void>();
+      final second = pairing.start();
+      await settle();
+      firstOpen.complete();
+      await first;
+      fake.open.complete();
+      await second;
+      expect(c.read(pairingControllerProvider).phase, PairingPhase.waiting);
+      expect(fake.calls, isNot(contains('hubCancelPairing')));
     });
 
     test('secondsLeft counts down and never goes negative', () {
@@ -383,6 +447,34 @@ void main() {
       expect(state.error, contains('not allowed'));
     });
 
+    test(
+      'Android: a sender that fails during the consent dialog stops capture',
+      () async {
+        // A hub typed in by address without a PIN: the core fails with
+        // "pairing required" while the consent dialog is still open.
+        final fake = FakeHfaApi(platform: 'android');
+        final native = _ConsentNativeChannel();
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        final sender = c.read(senderControllerProvider.notifier);
+        sender.selectTarget(HubTarget.manual(host: '10.0.0.9'));
+        final starting = sender.start();
+        await settle();
+        expect(native.calls, ['startSystemCapture']);
+        expect(fake.senderStatusNow.state, 'failed');
+        native.consent.complete(true);
+        await starting;
+        await settle();
+
+        final state = c.read(senderControllerProvider);
+        expect(native.calls, ['startSystemCapture', 'stopSystemCapture']);
+        expect(state.isLive, isFalse);
+        expect(state.busy, isFalse);
+        expect(state.error, contains('pairing required'));
+        expect(state.needsPin, isTrue);
+      },
+    );
+
     test('Android: a captureStopped event stops the sender', () async {
       final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
       final native = RecordingNativeChannel();
@@ -435,6 +527,37 @@ void main() {
         expect(c.read(senderControllerProvider).broadcasting, isFalse);
       },
     );
+
+    test('pairing with a PIN refreshes the trusted devices', () async {
+      final fake = FakeHfaApi();
+      final c = containerFor(fake);
+      c.listen(senderControllerProvider, (_, _) {});
+      c.listen(trustedPeersProvider, (_, _) {});
+      expect(await c.read(trustedPeersProvider.future), isEmpty);
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.discovered(strangerHub));
+      await sender.start(pin: '123456');
+      await settle();
+      expect(c.read(senderControllerProvider).target?.trusted, isTrue);
+      final peers = await c.read(trustedPeersProvider.future);
+      expect(peers.map((p) => p.deviceId), [strangerHub.deviceId]);
+    });
+
+    test('iOS: pairing is seen even when status events are missed', () async {
+      final fake = _SilentSenderEventsApi(platform: 'ios');
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.discovered(strangerHub));
+      // Real timers (the status poll) cannot run inside the fake async zone
+      // of `test`, so wait for the outcome with a real bound.
+      await sender.start(pin: '654321').timeout(const Duration(seconds: 5));
+      final state = c.read(senderControllerProvider);
+      expect(state.error, isNull);
+      expect(state.broadcastReady, isTrue);
+      expect(native.lastBroadcastConfig?.hubDeviceId, strangerHub.deviceId);
+    });
 
     test('iOS: a hub typed by address must be paired first', () async {
       final fake = FakeHfaApi(platform: 'ios');
@@ -560,6 +683,26 @@ void main() {
       expect(c.read(settingsControllerProvider).value?.bitrate, 96000);
     });
 
+    test('forget restarts a running hub so it drops the peer', () async {
+      final fake = FakeHfaApi(
+        trusted: [
+          const TrustedPeerDto(deviceId: 'a', name: 'A', pairedAtUnix: 1),
+        ],
+      );
+      final c = containerFor(fake);
+      c.listen(trustedPeersProvider, (_, _) {});
+      c.listen(hubControllerProvider, (_, _) {});
+      await c.read(hubControllerProvider.notifier).start();
+      fake.calls.clear();
+      final restarted = await c.read(trustedPeersProvider.notifier).forget('a');
+      expect(restarted, isTrue);
+      expect(
+        fake.calls,
+        containsAllInOrder(['forgetPeer', 'hubStop', 'hubStart']),
+      );
+      expect(c.read(hubControllerProvider).running, isTrue);
+    });
+
     test('forget removes the peer and reloads the list', () async {
       final fake = FakeHfaApi(
         trusted: [
@@ -580,5 +723,58 @@ class _FailingHubApi extends FakeHfaApi {
   @override
   Future<HubStatusDto> hubStart() async {
     throw const HfaApiException('no output device');
+  }
+}
+
+class _MasterGainFailingApi extends FakeHfaApi {
+  @override
+  Future<void> hubSetMasterGain(double gain) async {
+    if (hubRunning) throw const HfaApiException('mixer busy');
+    return super.hubSetMasterGain(gain);
+  }
+}
+
+/// `hubStartPairing` resolves only when [open] completes.
+class _SlowPairingApi extends FakeHfaApi {
+  Completer<void> open = Completer<void>();
+
+  @override
+  Future<PairingInfoDto> hubStartPairing() async {
+    final gate = open;
+    final info = await super.hubStartPairing();
+    await gate.future;
+    // Like the core: the window exists now, whatever was cancelled before.
+    pairing = info;
+    return info;
+  }
+}
+
+/// A native channel whose consent dialog stays open until [consent]
+/// completes.
+class _ConsentNativeChannel extends RecordingNativeChannel {
+  final Completer<bool> consent = Completer<bool>();
+
+  @override
+  Future<bool> startSystemCapture({
+    required int feedId,
+    required int sampleRate,
+    required int channels,
+  }) {
+    calls.add('startSystemCapture');
+    return consent.future;
+  }
+}
+
+/// A subscription that only ever gets the initial status (every later
+/// status event is lost), as when a change races the subscription.
+class _SilentSenderEventsApi extends FakeHfaApi {
+  _SilentSenderEventsApi({super.platform});
+
+  @override
+  Stream<SenderStatusDto> senderEvents() {
+    calls.add('senderEvents');
+    return Stream<SenderStatusDto>.multi((controller) {
+      controller.add(senderStatusNow);
+    }, isBroadcast: true);
   }
 }

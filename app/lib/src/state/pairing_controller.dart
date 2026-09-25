@@ -62,18 +62,33 @@ final pairingControllerProvider =
 /// Opens and closes pairing windows; `HubController` forwards the
 /// `PairingCompleted` / `PairingFailed` events here.
 class PairingController extends Notifier<PairingState> {
+  /// Bumped by every [start], [cancel] and [reset]: a `hubStartPairing` that
+  /// resolves after its attempt was superseded must not show its window.
+  int _generation = 0;
+
   @override
   PairingState build() => const PairingState();
 
   /// Opens a new pairing window.
   Future<void> start() async {
+    final generation = ++_generation;
     state = const PairingState(phase: PairingPhase.opening);
     try {
       final info = await ref.read(hfaApiProvider).hubStartPairing();
       if (!ref.mounted) return;
+      if (generation != _generation) {
+        // Cancelled while opening: the core's cancel may have run first, so
+        // close the window this call opened. (A newer start owns the window
+        // now and is left alone.)
+        final newerStart =
+            state.phase == PairingPhase.opening ||
+            state.phase == PairingPhase.waiting;
+        if (!newerStart) await _cancelInCore();
+        return;
+      }
       state = PairingState(phase: PairingPhase.waiting, info: info);
     } catch (e) {
-      if (!ref.mounted) return;
+      if (!ref.mounted || generation != _generation) return;
       state = PairingState(
         phase: PairingPhase.failed,
         message: describeError(e),
@@ -84,11 +99,16 @@ class PairingController extends Notifier<PairingState> {
   /// Closes the window (if one is open) and resets the state.
   Future<void> cancel() async {
     if (!ref.mounted) return;
+    _generation++;
     final wasOpen =
         state.phase == PairingPhase.waiting ||
         state.phase == PairingPhase.opening;
     state = const PairingState();
     if (!wasOpen) return;
+    await _cancelInCore();
+  }
+
+  Future<void> _cancelInCore() async {
     try {
       await ref.read(hfaApiProvider).hubCancelPairing();
     } catch (e) {
@@ -97,7 +117,10 @@ class PairingController extends Notifier<PairingState> {
   }
 
   /// Forgets the state without calling the core (the hub stopped).
-  void reset() => state = const PairingState();
+  void reset() {
+    _generation++;
+    state = const PairingState();
+  }
 
   /// A sender paired.
   void onCompleted({required String deviceId, required String name}) {

@@ -34,13 +34,15 @@ class HubTarget {
   });
 
   /// A hub from discovery: dialled by its first address, key pinned by id.
-  factory HubTarget.discovered(HubInfoDto hub) => HubTarget(
+  /// [trusted] overrides the announcement's (possibly stale) `trusted` flag,
+  /// e.g. when the trust store gained the hub after it was discovered.
+  factory HubTarget.discovered(HubInfoDto hub, {bool? trusted}) => HubTarget(
     name: hub.name,
     origin: HubOrigin.discovered,
     host: hub.addrs.isEmpty ? '' : hub.addrs.first,
     port: hub.port,
     deviceId: hub.deviceId,
-    trusted: hub.trusted,
+    trusted: trusted ?? hub.trusted,
     platform: hub.platform,
   );
 

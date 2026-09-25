@@ -253,9 +253,14 @@ class _HubPicker extends ConsumerWidget {
     final locked = sender.isLive || sender.busy;
     final selected = sender.target;
 
+    final peerIds = {for (final p in peers) p.deviceId};
     final discovered = [
       for (final hub in discovery.hubs.values)
-        if (hub.deviceId != info.deviceId) HubTarget.discovered(hub),
+        if (hub.deviceId != info.deviceId)
+          HubTarget.discovered(
+            hub,
+            trusted: hub.trusted || peerIds.contains(hub.deviceId),
+          ),
     ];
     final seen = {for (final t in discovered) t.deviceId};
     final paired = [

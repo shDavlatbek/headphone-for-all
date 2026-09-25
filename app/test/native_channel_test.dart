@@ -132,6 +132,34 @@ void main() {
     expect(fake.dataDir, '/native/hfa');
     expect(info.deviceName, 'Test device');
   });
+  test(
+    'iOS: a failing getDataDir is a startup error, not a fallback',
+    () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        throw PlatformException(code: 'NO_GROUP', message: 'no App Group');
+      });
+      final native = NativeChannel(eventsSupported: false);
+      await expectLater(
+        resolveDataDir(native, requireNative: true),
+        throwsA(
+          isA<DataDirException>().having(
+            (e) => e.message,
+            'message',
+            contains('no App Group'),
+          ),
+        ),
+      );
+
+      messenger.setMockMethodCallHandler(channel, (call) async => '');
+      await expectLater(
+        resolveDataDir(native, requireNative: true),
+        throwsA(isA<DataDirException>()),
+      );
+
+      messenger.setMockMethodCallHandler(channel, (call) async => '/group/hfa');
+      expect(await resolveDataDir(native, requireNative: true), '/group/hfa');
+    },
+  );
 }
 
 class _DirRecordingFake extends FakeHfaApi {
