@@ -108,3 +108,4 @@ hfa selftest --senders 4 --wav mix.wav         # 4 senders, keep the hub's outpu
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): system design, tech stack, wire protocol, mixer,
   threading, repo layout, security.
 - [docs/ROADMAP.md](docs/ROADMAP.md): milestones M0–M5 with exit criteria, future work, risks and open questions.
+- [docs/BUILDING.md](docs/BUILDING.md): prerequisites, building and testing the core, CLI and app on every platform, packaging, CI.

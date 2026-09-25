@@ -1681,3 +1681,63 @@ Latest stable releases as of 2026-09. Members use `dep = { workspace = true }`.
   `ANDROID_NDK_HOME=/opt/android-sdk/ndk/<ver>`, `ANDROID_PLATFORM=android-24`,
   `CC_aarch64_linux_android`/`CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` = `<ndk>/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang`
   and `AR_aarch64_linux_android` = `…/llvm-ar` (or simply `cargo ndk`).
+
+## 12. Continuous integration (`.github/`, owned by `feat/ci`)
+
+### 12.1 Refinements made by `feat/ci` (the workflows in `.github/workflows/` and `docs/BUILDING.md` are authoritative)
+
+**Workflows.** `rust.yml` (jobs `fmt`, `test` on ubuntu/windows/macos-latest, `android`, `ios`, `selftest`,
+`pipewire-live`) and `flutter.yml` (jobs `analyze`, `codegen`, `linux`, `linux-appimage`, `android`, `windows`, `macos`, `ios`,
+`apple-unit-tests`). Triggers: push to `main`, `claude/**`, `feat/**`, every `pull_request`, `workflow_dispatch`;
+changes that touch only `**.md`, `docs/**` or `LICENSE-*` do not run CI. Concurrency group
+`<workflow>-<ref>`, cancel-in-progress everywhere except `refs/heads/main`. `permissions: contents: read`.
+`dependabot.yml`: weekly cargo (`/core`), pub (`/app`) and github-actions updates, minor/patch grouped,
+`flutter_rust_bridge` ignored in cargo and pub (it moves only together with the codegen).
+
+**What each package can rely on / must keep true.**
+- Rust toolchain: every job of `rust.yml` and the `codegen` job lint, test and generate with the **pinned**
+  `RUST_TOOLCHAIN` (currently **1.94.1**, the release of the dev containers), not `stable`: a new Rust release's
+  clippy lints or rustfmt changes cannot break CI unannounced. It is bumped on purpose, in both workflows in one
+  commit, after the local gates (incl. the Windows cross-check) and the codegen pass with the new release. The
+  Flutter build jobs install `stable` because cargokit always builds with rustup's `stable` channel; they do not
+  lint. Code must still build with the MSRV (`rust-version`, 1.87) and with newer stable releases.
+- Rust (all packages): clippy `-D warnings` and `cargo test --workspace --locked` pass on **native** Windows (MSVC)
+  and macOS (Apple Silicon) too, not only on Linux, so `Cargo.lock` must be committed and current. Android:
+  `cargo ndk -t arm64-v8a -P 29 clippy -p hfa-ffi --all-targets -- -D warnings`, run **from `core/`**
+  (cargo-ndk 4 resolves the workspace from the current directory; its own `--manifest-path` is not forwarded
+  like cargo's) with `ANDROID_PLATFORM=android-29` and the runner's newest NDK. iOS: `cargo check` and
+  `cargo clippy -D warnings` of `hfa-ffi --target aarch64-apple-ios` with **default features** (bundled libopus +
+  flutter_rust_bridge, built with the real iOS SDK).
+- `feat/cli`: `cargo run --manifest-path core/Cargo.toml --release -p hfa-cli -- selftest --seconds 8 --loss 5 --jitter 20` must exit 0 on
+  ubuntu-latest (no audio device; the selftest must use the WAV/null output only).
+- `feat/capture-linux`: the ignored PipeWire tests are selected by the name filter **`live_`** and run with
+  `--ignored --test-threads=1` after the recipe of the `live` module docs (dbus-run-session + pipewire +
+  wireplumber, null sink `hfa-test-sink` as the default sink, `XDG_RUNTIME_DIR=/tmp/pw-run`).
+- `feat/ffi`: `flutter_rust_bridge_codegen generate` (2.13.0, installed with cargo-binstall; cargo-expand
+  alongside; rustfmt of `RUST_TOOLCHAIN` formats `frb_generated.rs`) run in `app/` after `flutter pub get` must leave `git status --porcelain` empty. The frb version is
+  pinned in a fourth place: `FRB_VERSION` in `flutter.yml`; the Flutter version in `FLUTTER_VERSION` (3.47.5).
+- `feat/app`: `flutter analyze` reports no issues and `flutter test` passes on ubuntu-latest;
+  `integration_test/` runs against the real library with `xvfb-run -a flutter test integration_test -d linux`.
+  Linux system packages provided to Flutter builds: GTK 3, X11, Xi, ninja, clang, CMake (+ the Rust Linux deps);
+  a plugin that needs more must say so here.
+- `feat/android`: `flutter build apk --release` with JDK 17 (Temurin), SDK platform 36, build-tools 36.0.0 and
+  NDK 29.0.14206865; when `app/android/app/src/test/**` exists the job also runs, from `app/android`,
+  `./gradlew --no-daemon -Ptarget-platform=android-arm64 :app:testDebugUnitTest :app:lintDebug`.
+- `feat/apple`: `flutter build ios --release --no-codesign` (builds `HfaBroadcast`; the runner has the Rust targets
+  `aarch64-apple-ios`, and `aarch64-apple-ios-sim` in the test job) and `flutter build macos --release`
+  (universal). `apple-unit-tests`: `flutter build ios --simulator --debug`, then `xcodebuild test -workspace
+  ios/Runner.xcworkspace -scheme Runner -destination id=<an available iPhone of the newest iOS runtime whose major.minor is <= the
+  active iphonesimulator SDK> (.github/scripts/pick_ios_simulator.py)
+  CODE_SIGNING_ALLOWED=NO`; `flutter build macos --debug`, then `xcodebuild test -workspace
+  macos/Runner.xcworkspace -scheme Runner -destination 'platform=macOS'`. The `Runner` schemes must keep
+  `RunnerTests` in their test action.
+- `feat/desktop`: packaging runs **only when the script exists** and with **no arguments**, after the release
+  build, from the repository root: `./packaging/windows/build-installer.ps1` (pwsh; uploads
+  `packaging/dist/*.exe`), `bash packaging/linux/build-appimage.sh` (job `linux-appimage` on **ubuntu-22.04** — glibc 2.35, libpipewire
+  0.3.48, as packaging/README.md specifies — after its own `flutter build linux --release`;
+  `packaging/dist/*.AppImage`; so the Linux capture code must keep building against libpipewire 0.3.48, i.e. no
+  `pipewire` crate `v0_3_49`+ features),
+  `bash packaging/macos/build-dmg.sh` (unsigned; `packaging/dist/*.dmg`). A failing script fails the job.
+- Artifacts (14 days): `headphone_for_all-linux-x64` (tar.gz of the bundle), `-linux-appimage`,
+  `-android-apk` (release, debug-signed), `-windows-x64` (zip of `runner/Release`), `-windows-x64-setup`,
+  `-macos` (zipped `.app`), `-macos-dmg`.
