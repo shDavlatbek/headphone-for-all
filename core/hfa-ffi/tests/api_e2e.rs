@@ -21,7 +21,9 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use hfa_ffi::api::app::{init_app, trusted_peers};
-use hfa_ffi::api::hub::{hub_sources, hub_start, hub_start_pairing, hub_status, hub_stop};
+use hfa_ffi::api::hub::{
+    hub_set_muted, hub_sources, hub_start, hub_start_pairing, hub_status, hub_stop,
+};
 use hfa_ffi::api::sender::{
     sender_start, sender_status, sender_stop, CaptureSourceDto, SenderStartDto,
 };
@@ -88,6 +90,9 @@ fn hub_process() {
         "HFA_E2E_SOURCE {} {} {}",
         source.device_id, sender_trusted, source.label
     );
+    // The sender shows what the hub does with its stream.
+    hub_set_muted(source.stream_id, true).expect("mute the source");
+    println!("HFA_E2E_MUTED");
 
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).expect("read stop");
@@ -221,12 +226,18 @@ fn pair_stream_and_stop() {
         (s.state == "streaming").then_some(s)
     });
     assert_eq!(status.hub_name.as_deref(), Some("E2E hub"), "{status:?}");
+    assert!(!status.hub_muted && status.hub_gain == 1.0, "{status:?}");
 
     // The hub lists this device's stream with its label and trusts it after the pairing.
     let source = hub.expect_line("HFA_E2E_SOURCE");
     assert_eq!(source[0], me.device_id);
     assert_eq!(source[1], "true", "the hub trusts the sender after pairing");
     assert_eq!(source[2..].join(" "), LABEL);
+    // Muted on the hub: the sender's status says so (SetMute → HubControl → the DTO).
+    hub.expect_line("HFA_E2E_MUTED");
+    wait_for("the hub's mute to reach the sender", || {
+        sender_status().hub_muted.then_some(())
+    });
     // ...and this device saved the hub.
     let peers = trusted_peers().expect("peers");
     assert!(

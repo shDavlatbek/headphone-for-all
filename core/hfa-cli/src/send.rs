@@ -14,8 +14,8 @@ use anyhow::{anyhow, bail, Context};
 use hfa_capture::CaptureTarget;
 use hfa_core::sender::DISCOVER_TIMEOUT;
 use hfa_core::{
-    CoreError, DiscoveryEvent, HubAddress, HubInfo, SenderConfig, SenderEngine, SenderEvent,
-    SenderHandle, SenderState, Settings, TrustStore,
+    CoreError, DiscoveryEvent, HubAddress, HubInfo, Identity, SenderConfig, SenderEngine,
+    SenderEvent, SenderHandle, SenderState, Settings, TrustStore,
 };
 use tokio::sync::broadcast::error::RecvError;
 
@@ -47,8 +47,12 @@ pub async fn run(data_dir: PathBuf, args: SendArgs) -> anyhow::Result<()> {
     // engine's back.
     let _lock = DataDirLock::shared(data_dir.clone()).await?;
     let dir = data_dir.clone();
-    let (settings, trust) = blocking(move || -> hfa_core::Result<_> {
-        Ok((Settings::load_or_default(&dir)?, TrustStore::load(&dir)?))
+    let (settings, trust, own_key) = blocking(move || -> hfa_core::Result<_> {
+        let settings = Settings::load_or_default(&dir)?;
+        // The engine loads (or creates) the same identity; here it only guards against
+        // streaming to this device's own hub.
+        let own_key = Identity::load_or_create(&dir, &settings.device_name)?.public_key();
+        Ok((settings, TrustStore::load(&dir)?, own_key))
     })
     .await?
     .with_context(|| format!("cannot load the settings from {}", data_dir.display()))?;
@@ -60,7 +64,7 @@ pub async fn run(data_dir: PathBuf, args: SendArgs) -> anyhow::Result<()> {
         settings.frame_ms = frame_ms;
     }
 
-    let target = resolve_target(&args, &trust).await?;
+    let target = resolve_target(&args, &trust, &own_key).await?;
     let label = match &args.label {
         Some(l) if !l.trim().is_empty() => l.trim().to_owned(),
         _ => default_label(&args.source).await,
@@ -156,10 +160,34 @@ async fn watch(sender: &SenderHandle) -> anyhow::Result<()> {
     }
 }
 
+/// Refusal to stream to this device's own hub: it would trust itself and play its own output
+/// back into the hub (a feedback loop with a system-audio source).
+fn own_hub_error() -> anyhow::Error {
+    anyhow!(
+        "that is this device's own hub: a device cannot stream to itself (it would play its own \
+         output back). Run `hfa send` on another device, or use another --data-dir."
+    )
+}
+
 /// Resolves `--uri`, `--to`, `--hub` and `--pin` into an engine address, key and secret.
-async fn resolve_target(args: &SendArgs, trust: &TrustStore) -> anyhow::Result<Target> {
+/// `own_key` is this device's static key: a target that is this device is refused.
+async fn resolve_target(
+    args: &SendArgs,
+    trust: &TrustStore,
+    own_key: &[u8; 32],
+) -> anyhow::Result<Target> {
     let uri = args.auth.uri.as_ref();
     let expected_hub_key = uri.map(|u| u.hub_id);
+    let own_id = hfa_proto::fingerprint(own_key);
+    if expected_hub_key.as_ref() == Some(own_key)
+        || args
+            .dest
+            .hub
+            .as_deref()
+            .is_some_and(|h| h.trim().eq_ignore_ascii_case(&own_id))
+    {
+        return Err(own_hub_error());
+    }
     let secret = args
         .auth
         .pin
@@ -167,6 +195,9 @@ async fn resolve_target(args: &SendArgs, trust: &TrustStore) -> anyhow::Result<T
         .or_else(|| uri.map(|u| u.token.clone()));
     if let Some(name_or_id) = &args.dest.hub {
         let info = find_hub(name_or_id, trust).await?;
+        if info.device_id == own_id {
+            return Err(own_hub_error());
+        }
         let key = expected_hub_key.or_else(|| trust.get(&info.device_id).map(|p| p.public_key));
         let shown = format!(
             "{:?} ({}) at {}",
@@ -395,6 +426,27 @@ mod tests {
         }
     }
 
+    /// This device's key in the tests.
+    const OWN: [u8; 32] = [42u8; 32];
+
+    #[tokio::test]
+    async fn the_own_hub_is_refused() {
+        let (_dir, trust) = empty_trust();
+        let uri = hfa_proto::PairingUri::new("127.0.0.1", 5000, OWN, "tok_en-123", "Me")
+            .unwrap()
+            .to_string();
+        let own_id = hfa_proto::fingerprint(&OWN);
+        for argv in [
+            vec!["hfa", "send", "--uri", uri.as_str()],
+            vec!["hfa", "send", "--hub", own_id.as_str()],
+        ] {
+            let err = resolve_target(&send_args(&argv), &trust, &OWN)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("own hub"), "{argv:?}: {err}");
+        }
+    }
+
     fn empty_trust() -> (tempfile::TempDir, TrustStore) {
         let dir = tempfile::tempdir().unwrap();
         let trust = TrustStore::load(dir.path()).unwrap();
@@ -408,7 +460,7 @@ mod tests {
             .unwrap()
             .to_string();
         let (_dir, trust) = empty_trust();
-        let t = resolve_target(&send_args(&["hfa", "send", "--uri", &uri]), &trust)
+        let t = resolve_target(&send_args(&["hfa", "send", "--uri", &uri]), &trust, &OWN)
             .await
             .unwrap();
         assert_eq!(
@@ -425,6 +477,7 @@ mod tests {
         let t = resolve_target(
             &send_args(&["hfa", "send", "--uri", &uri, "--to", "localhost:6000"]),
             &trust,
+            &OWN,
         )
         .await
         .unwrap();
@@ -445,6 +498,7 @@ mod tests {
         let t = resolve_target(
             &send_args(&["hfa", "send", "--to", "127.0.0.1", "--pin", "012345"]),
             &trust,
+            &OWN,
         )
         .await
         .unwrap();
@@ -455,6 +509,7 @@ mod tests {
         let err = resolve_target(
             &send_args(&["hfa", "send", "--to", "no-such-host.invalid"]),
             &trust,
+            &OWN,
         )
         .await
         .unwrap_err();

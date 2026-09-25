@@ -7,7 +7,8 @@
 use hfa_core::{TrustStore, TrustedPeer};
 use hfa_ffi::api::app::{forget_peer, get_settings, init_app, trusted_peers, update_settings};
 use hfa_ffi::api::hub::{
-    hub_cancel_pairing, hub_sources, hub_start, hub_start_pairing, hub_status, hub_stop,
+    hub_cancel_pairing, hub_pairing_status, hub_sources, hub_start, hub_start_pairing, hub_status,
+    hub_stop,
 };
 use hfa_ffi::api::sender::{
     sender_start, sender_status, sender_stop, CaptureSourceDto, SenderStartDto,
@@ -68,11 +69,23 @@ fn api_lifecycle_with_real_engines() {
     assert_ne!(status.port, 0);
     assert_eq!(hub_start().expect("idempotent").port, status.port);
     assert_eq!(hub_status(), status);
+    // Advertising is owned by the FFI: either it runs or the status says why not.
+    assert_eq!(
+        status.advertised,
+        status.advertise_error.is_none(),
+        "{status:?}"
+    );
     assert!(hub_sources().is_empty());
+    assert_eq!(hub_pairing_status().expect("pairing status"), None);
     let pairing = hub_start_pairing().expect("pairing window");
     assert_eq!(pairing.pin.len(), 6);
     assert!(pairing.uri.starts_with("hfa://pair?"));
+    assert_eq!(
+        hub_pairing_status().expect("pairing status"),
+        Some(pairing.clone())
+    );
     hub_cancel_pairing().expect("cancel");
+    assert_eq!(hub_pairing_status().expect("pairing status"), None);
 
     // A sender may not target its own hub.
     let own = SenderStartDto {
@@ -87,6 +100,8 @@ fn api_lifecycle_with_real_engines() {
     assert!(sender_start(own).is_err());
     hub_stop().expect("hub stops");
     assert!(!hub_status().running);
+    assert!(!hub_status().advertised);
+    assert_eq!(hub_pairing_status().expect("pairing status"), None);
 
     // Only after the hub ran: the settings DTO has no form for the Null output, so a round
     // trip turns it into the OS default output (absent on headless CI machines).

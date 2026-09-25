@@ -36,9 +36,10 @@ Events: `{type: "broadcastStarted"}` and `{type: "broadcastFinished", message?}`
 notifications `io.github.shdavlatbek.hfa.broadcast.started` / `.finished` that the extension posts.
 Darwin notifications carry no payload, so the extension first writes
 `<container>/broadcast_status.json` (`{state, message?, timestamp}`); `message` is the reason a
-broadcast could not start: no App Group, no or invalid `broadcast_config.json`, hub not paired, or an
-invalid hub key. An unreachable hub is **not** such a reason: the Rust sender connects in the
-background after `hfa_ext_sender_start` returned (see Known limitations).
+broadcast could not start: no App Group, no or invalid `broadcast_config.json`, hub not paired (its key
+is not in the trust store), no `hub_host`, or an invalid hub key; or why it ended later: the hub refused
+this device (`hfa_ext_sender_state` reported `failed`, e.g. pairing required). An unreachable hub is
+**not** such a reason: the Rust sender keeps reconnecting in the background.
 
 ## Broadcast extension `HfaBroadcast`
 
@@ -54,6 +55,10 @@ background after `hfa_ext_sender_start` returned (see Known limitations).
   into reused storage and calls `hfa_ext_push_pcm` with the buffer's rate and channel count (Rust
   resamples to 48 kHz stereo). `.video` and `.audioMic` are ignored. A lock serializes pushes and
   the stop, so the handle is never used concurrently or after it was freed.
+- While the sender runs, a 1 s timer polls `hfa_ext_sender_state` (under the same lock) and logs
+  state changes. On `failed` (final: pairing required, key mismatch...) it stops the sender, writes
+  `broadcast_status.json` with the reason, posts the finished notification and calls
+  `finishBroadcastWithError`.
 - `broadcastFinished` calls `hfa_ext_sender_stop`.
 - Memory: ReplayKit kills upload extensions above ~50 MB. The extension has no Flutter, no video
   processing, one reused sample buffer and the Rust sender (a 2-thread tokio runtime + Opus).
@@ -153,12 +158,15 @@ phone attached (Console.app works too).
 ## Known limitations
 
 - Rust `tracing` output of the extension is not forwarded to os_log (the extension builds hfa-ffi
-  without the `flutter` feature, whose logger does that); the Swift side logs every failure with
-  `os.Logger` (subsystem `io.github.shdavlatbek.hfa.broadcast`).
-- The C ABI reports failures only at start: if the hub disappears later, the sender keeps
-  reconnecting in the background and the app is not told (no status call in `hfa_ext.h`).
+  without the `flutter` feature, whose logger does that). It goes to
+  `<container>/hfa/broadcast.log` instead (capped at 256 KiB, one previous part kept as
+  `broadcast.log.1`); the Swift side logs every failure with `os.Logger` (subsystem
+  `io.github.shdavlatbek.hfa.broadcast`).
+- A hub that disappears later is not reported to the app: the sender keeps reconnecting
+  (`hfa_ext_sender_state` says `reconnecting`; only `failed` ends the broadcast).
 - mDNS through the Rust `mdns-sd` crate (hub advertising on iOS, or `hub_host = ""` in the
   extension) needs the restricted `com.apple.developer.networking.multicast` entitlement on
   iOS 14+ (Apple must grant it). Without it, pairing by QR/URI with an explicit host works; the
-  app should always pass `hubHost` to `writeBroadcastConfig`.
+  app must always pass `hubHost` to `writeBroadcastConfig` (the C ABI refuses an empty `hub_host`
+  on iOS with `HFA_ERR_CONFIG`).
 - App Store review of an audio-only broadcast extension is not guaranteed (docs/ROADMAP.md).

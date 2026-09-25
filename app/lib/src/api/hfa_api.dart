@@ -100,6 +100,10 @@ abstract class HfaApi {
   /// Opens a pairing window (PIN + QR URI).
   Future<PairingInfoDto> hubStartPairing();
 
+  /// The open pairing window, or null (none opened, cancelled, expired, used,
+  /// or closed by the core after 5 failed attempts; null while stopped).
+  Future<PairingInfoDto?> hubPairingStatus();
+
   /// Closes the pairing window.
   Future<void> hubCancelPairing();
 
@@ -136,6 +140,9 @@ const idleSenderStatus = SenderStatusDto(
   lossPct: 0,
   rttMs: 0,
   levelDb: -120,
+  hubGain: 1,
+  hubMuted: false,
+  hubPriority: false,
 );
 
 /// A short, human-readable message for an error thrown by [HfaApi] or the

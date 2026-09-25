@@ -66,6 +66,9 @@ class RustHfaApi implements HfaApi {
   Future<PairingInfoDto> hubStartPairing() => hub.hubStartPairing();
 
   @override
+  Future<PairingInfoDto?> hubPairingStatus() => hub.hubPairingStatus();
+
+  @override
   Future<void> hubCancelPairing() => hub.hubCancelPairing();
 
   @override

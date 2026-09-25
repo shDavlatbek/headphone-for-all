@@ -453,6 +453,7 @@ class FakeHfaApi implements HfaApi {
     port: _hubRunning ? settings.port : 0,
     deviceName: appInfo.deviceName,
     sourceCount: _hubRunning ? _sources.length : 0,
+    advertised: _hubRunning,
   );
 
   @override
@@ -547,6 +548,20 @@ class FakeHfaApi implements HfaApi {
     return info;
   }
 
+  /// Makes the core close the pairing window, as it does after 5 failed
+  /// attempts (no event says so).
+  void closePairingWindow() => pairing = null;
+
+  @override
+  Future<PairingInfoDto?> hubPairingStatus() async {
+    calls.add('hubPairingStatus');
+    if (!_hubRunning) return null;
+    final info = pairing;
+    if (info == null) return null;
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    return info.expiresAtUnix > now ? info : null;
+  }
+
   @override
   Future<void> hubCancelPairing() async {
     calls.add('hubCancelPairing');
@@ -623,6 +638,9 @@ class FakeHfaApi implements HfaApi {
         lossPct: 0,
         rttMs: 0,
         levelDb: -120,
+        hubGain: 1,
+        hubMuted: false,
+        hubPriority: false,
       ),
     );
     if (!known && secret.isEmpty) {
@@ -634,6 +652,9 @@ class FakeHfaApi implements HfaApi {
           lossPct: 0,
           rttMs: 0,
           levelDb: -120,
+          hubGain: 1,
+          hubMuted: false,
+          hubPriority: false,
         ),
       );
       return;
@@ -657,6 +678,9 @@ class FakeHfaApi implements HfaApi {
         lossPct: 0.2,
         rttMs: 4.5,
         levelDb: -20,
+        hubGain: 1,
+        hubMuted: false,
+        hubPriority: false,
       ),
     );
     if (_demo) _startDemoTimer();
@@ -727,6 +751,9 @@ class FakeHfaApi implements HfaApi {
             lossPct: (math.sin(_tick / 7) + 1) * 0.4,
             rttMs: 3 + (math.cos(_tick / 5) + 1) * 2,
             levelDb: -22 + math.sin(_tick / 2) * 10,
+            hubGain: status.hubGain,
+            hubMuted: status.hubMuted,
+            hubPriority: status.hubPriority,
           ),
         );
       }

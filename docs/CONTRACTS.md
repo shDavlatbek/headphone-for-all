@@ -1826,6 +1826,60 @@ the version comes from `app/pubspec.yaml` without the `+build` part.
 - macOS: `macos/build-dmg.sh` → `Headphone_for_All-<ver>-macos.dmg` (create-dmg or hdiutil; optional Developer ID
   signing with the hardened runtime and `notarytool` notarization, credentials only from the environment).
 
+### 8.11 Refinements made by `fix/ffi-cli` (the code in `core/hfa-ffi` and `core/hfa-cli` is authoritative)
+
+These supersede the matching statements of §8.5 and the "Open" list of §8.9.
+
+**flutter_rust_bridge API (bindings regenerated).**
+- **`SenderStatusDto` gains `hub_gain: f32`, `hub_muted: bool`, `hub_priority: bool`**: what the hub applies to
+  this device's stream (`SenderEvent::HubControl`, folded by `sender_meta::SenderMeta`; defaults 1.0 / false / false,
+  also in the `idle` status). A sender muted on the hub no longer looks like a normal stream.
+- **New `hub_pairing_status() -> Option<PairingInfoDto>`** (`HubHandle::current_pairing`): the open window, or
+  `None` (never opened, cancelled, expired, used, or closed by the core after 5 failed attempts; `None` while the
+  hub is stopped). `PairingFailed` does not say whether the window closed, so the app's `PairingController.onFailed`
+  asks and switches to `failed` ("the hub closed this pairing window after too many failed attempts") when it is
+  gone. Dart: `HfaApi.hubPairingStatus()`; `FakeHfaApi.closePairingWindow()` simulates the core closing it.
+- **`HubStatusDto` gains `advertised: bool` and `advertise_error: Option<String>`.** The manager now owns the
+  mDNS `Advertiser` (it starts the engine with `HubConfig.advertise = false`, then `Advertiser::start` with the
+  device name, device id, bound port and platform, exactly what the engine did). A failure no longer disappears in a
+  log line: the status carries it, and a `HubEventDto::Error` ("Other devices cannot find this hub automatically
+  ...") is sent. `hub_stop` stops advertising before it stops the engine. (iOS discovery itself, i.e. `browse()` and
+  advertising without the multicast entitlement, is hfa-core's: a native Bonjour backend.)
+
+**`hfa send` (hfa-cli, §7).** Loads this device's identity and refuses, before anything starts, a target that is
+this device: `--uri` whose `hub_id` is the own key, `--hub <own device id>`, or a `--hub` name that discovery
+resolves to the own device id ("that is this device's own hub ..."). A typed `--to <own address>` is caught only by
+the engine's own-key check in the handshake (hfa-core).
+
+**Event subscriptions (`manager.rs`).** `sender_events` computes the current status and joins the subscription set
+under the set's lock (`SinkSet::add_with_initial`), and `sender_start` fills the sender slot before the forwarder can
+relay anything (`broadcast_then`), so a status change can no longer fall between the initial status and the
+subscription (e.g. a final `failed` that would leave the stream at `pairing`). Lock order: sinks → state → meta.
+
+**C ABI (`c_api.rs`, `hfa_ext.h`).**
+- **Trust, not just a key.** `hfa_ext_sender_start` requires the resolved hub key (`hub_key`, or the key of the
+  trusted `hub_device_id`) to be **in the trust store**; a key that is merely known (a scanned URI whose pairing
+  never completed, a hub forgotten since) → `HFA_ERR_CONFIG` "the hub is not paired ...". Before, such a key
+  started a sender that asked for pairing and failed silently in the background.
+- **No mDNS on iOS.** On iOS an empty `hub_host` is refused with `HFA_ERR_CONFIG` ("hub_host is required"): the
+  extension has no multicast entitlement, so discovery by `hub_device_id` could never succeed.
+- **New `int32_t hfa_ext_sender_state(HfaExtSender *handle, char *buf, uint32_t len)`.** Writes a NUL-terminated
+  JSON object `{"state": "connecting"|"pairing"|"streaming"|"reconnecting"|"stopped"|"failed", "error":
+  <failure reason when failed, else the last non-fatal error>|null, "hub_name": String|null, "bitrate", "loss_pct",
+  "rtt_ms", "level_db", "hub_gain", "hub_muted", "hub_priority"}` (state and metrics from `SenderHandle::status()`,
+  the rest folded from the engine's events by a task on the handle's runtime). Returns the JSON length without
+  the NUL, `snprintf`-style: if it is `>= len` only an empty string was written; negative = `HFA_ERR_*`. `failed`
+  is final. It needs only shared access, and so does `hfa_ext_push_pcm` now (the converter has its own lock):
+  the two may run concurrently for one handle; neither may overlap `hfa_ext_sender_stop`.
+- **`SampleHandler`** polls it every second (under its lock). On `failed` it stops the sender, writes
+  `broadcast_status.json` `{state: "finished", message: <reason and what to do>}`, posts the finished Darwin
+  notification and calls `finishBroadcastWithError`, so the app and the user learn why nothing plays.
+- **Extension log file.** The extension's hfa-ffi build has no `flutter` feature and so no console logger; on iOS
+  without `flutter`, the C ABI now installs a `tracing-subscriber` `fmt` subscriber (no ANSI, `RUST_LOG` or `info`)
+  writing to **`<data_dir>/broadcast.log`** (the App Group's `hfa` directory), rotated at 256 KiB to
+  `broadcast.log.1`. No new dependency (a file writer, not the `oslog` crate, whose C shim would break the Linux
+  `cargo check --target aarch64-apple-ios --no-default-features`). Other targets keep `init_tracing`.
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |

@@ -371,6 +371,9 @@ class SenderController extends Notifier<SenderState> {
           lossPct: 0,
           rttMs: 0,
           levelDb: -120,
+          hubGain: 1,
+          hubMuted: false,
+          hubPriority: false,
         ),
       );
     } finally {

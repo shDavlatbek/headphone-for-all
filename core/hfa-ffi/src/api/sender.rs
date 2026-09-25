@@ -108,6 +108,12 @@ pub struct SenderStatusDto {
     pub rtt_ms: f32,
     /// Capture level, dBFS (-120 = silence).
     pub level_db: f32,
+    /// Linear gain the hub applies to this stream (1.0 = unchanged; set on the hub).
+    pub hub_gain: f32,
+    /// The hub muted this stream: it is not heard there although it is sent.
+    pub hub_muted: bool,
+    /// The hub made this stream a priority source (it ducks the others).
+    pub hub_priority: bool,
 }
 
 /// Browses for hubs until `stop_discovery` or until the Dart stream is cancelled. A new call

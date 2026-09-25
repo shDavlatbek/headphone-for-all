@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use hfa_core::config::SETTINGS_FILE;
 use hfa_core::{
-    HubConfig, HubEngine, HubEvent, HubHandle, Identity, SenderConfig, SenderEngine, SenderEvent,
-    SenderHandle, SenderState, SenderStatus, Settings, TrustStore,
+    Advertiser, HubConfig, HubEngine, HubEvent, HubHandle, Identity, SenderConfig, SenderEngine,
+    SenderEvent, SenderHandle, SenderState, Settings, TrustStore,
 };
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
@@ -45,6 +45,7 @@ use crate::error::{FfiError, Result};
 use crate::feeds;
 use crate::hub_target::{self, HubRequest};
 use crate::runtime::{block_on, build_runtime};
+use crate::sender_meta::SenderMeta;
 
 /// Device buffer size asked from the hub output (ms).
 pub const OUTPUT_BUFFER_MS: u32 = 20;
@@ -87,9 +88,28 @@ impl<T: Clone> SinkSet<T> {
         self.sinks.lock().push(sink);
     }
 
+    /// Delivers `initial()` to `sink` and adds it, both under the set's lock, so that a
+    /// concurrent [`SinkSet::broadcast`] either happened before `initial()` was computed (and
+    /// is reflected in it) or is delivered after it: no change falls in between. A sink that
+    /// refuses the initial value is not kept. `initial` must not use this set.
+    fn add_with_initial(&self, sink: Box<dyn EventSink<T>>, initial: impl FnOnce() -> T) {
+        let mut sinks = self.sinks.lock();
+        if sink.deliver(initial()) {
+            sinks.push(sink);
+        }
+    }
+
     /// Delivers `value` to every subscription, dropping the closed ones.
     fn broadcast(&self, value: &T) {
         self.sinks.lock().retain(|s| s.deliver(value.clone()));
+    }
+
+    /// [`SinkSet::broadcast`], then runs `then` before any other broadcast or new
+    /// subscription can happen. `then` must not use this set.
+    fn broadcast_then<R>(&self, value: &T, then: impl FnOnce() -> R) -> R {
+        let mut sinks = self.sinks.lock();
+        sinks.retain(|s| s.deliver(value.clone()));
+        then()
     }
 
     /// Number of live subscriptions.
@@ -105,40 +125,18 @@ struct AppContext {
     identity: Identity,
 }
 
-/// Sender facts learned from its events (the handle's status has no hub name or errors).
-#[derive(Debug, Clone)]
-struct SenderMeta {
-    status: SenderStatus,
-    hub_name: Option<String>,
-    last_error: Option<String>,
-}
-
-impl SenderMeta {
-    fn dto(&self) -> SenderStatusDto {
-        convert::sender_status_dto(
-            &self.status,
-            self.hub_name.as_deref(),
-            self.last_error.as_deref(),
-        )
-    }
-
-    /// Folds one engine event into the snapshot.
-    fn apply(&mut self, event: SenderEvent) {
-        match event {
-            SenderEvent::StateChanged(state) => self.status.state = state,
-            SenderEvent::Connected { name, .. } | SenderEvent::Paired { name, .. } => {
-                self.hub_name = Some(name);
-            }
-            SenderEvent::Status(status) => self.status = status,
-            SenderEvent::Error(message) => self.last_error = Some(message),
-            SenderEvent::HubControl { .. } => {}
-        }
-    }
+/// The status to send for a sender's folded events.
+fn meta_dto(meta: &SenderMeta) -> SenderStatusDto {
+    convert::sender_status_dto(&meta.status, meta)
 }
 
 struct HubSlot {
     handle: HubHandle,
     forwarder: JoinHandle<()>,
+    /// The mDNS announcement, owned here (not by the engine) so that a failure is visible.
+    advertiser: Option<Advertiser>,
+    /// Why advertising failed, if it did.
+    advertise_error: Option<String>,
 }
 
 struct SenderSlot {
@@ -295,15 +293,16 @@ impl EngineManager {
     /// See `api::hub::hub_start`.
     pub(crate) fn hub_start(&self) -> Result<HubStatusDto> {
         let _ops = self.lifecycle.lock();
-        let settings = {
+        let (settings, device_id) = {
             let st = self.state.lock();
             let app = st.app.as_ref().ok_or(FfiError::NotInitialized)?;
             if st.hub.is_some() {
                 drop(st);
                 return Ok(self.hub_status());
             }
-            app.settings.clone()
+            (app.settings.clone(), app.identity.device_id.clone())
         };
+        let name = settings.device_name.clone();
         // cpal's AAudio output panics without the context set by `NativeBridge.init`.
         #[cfg(target_os = "android")]
         crate::android::ensure_audio_context()?;
@@ -313,7 +312,8 @@ impl EngineManager {
             HubEngine::start(HubConfig {
                 settings,
                 output,
-                advertise: true,
+                // Advertised below, so that a failure can be reported.
+                advertise: false,
             }),
         )??;
         // Subscribe before anything else so that no early event is lost.
@@ -321,8 +321,35 @@ impl EngineManager {
             handle.events(),
             Arc::clone(&self.hub_sinks),
         ));
+        let (advertiser, advertise_error) = {
+            let _rt = self.runtime.enter();
+            match Advertiser::start(
+                &name,
+                &device_id,
+                handle.local_port(),
+                hfa_core::platform_name(),
+            ) {
+                Ok(a) => (Some(a), None),
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot advertise the hub over mDNS");
+                    let message = e.to_string();
+                    self.hub_sinks.broadcast(&HubEventDto::Error {
+                        message: format!(
+                            "Other devices cannot find this hub automatically ({message}): \
+                             enter its address on the sending device."
+                        ),
+                    });
+                    (None, Some(message))
+                }
+            }
+        };
         tracing::info!(port = handle.local_port(), "hub started");
-        self.state.lock().hub = Some(HubSlot { handle, forwarder });
+        self.state.lock().hub = Some(HubSlot {
+            handle,
+            forwarder,
+            advertiser,
+            advertise_error,
+        });
         Ok(self.hub_status())
     }
 
@@ -331,6 +358,12 @@ impl EngineManager {
         let _ops = self.lifecycle.lock();
         let slot = self.state.lock().hub.take();
         if let Some(slot) = slot {
+            // Stop announcing a hub that is going away first.
+            if let Some(advertiser) = slot.advertiser {
+                if let Err(e) = advertiser.stop() {
+                    tracing::debug!(error = %e, "mDNS advertiser shutdown");
+                }
+            }
             let stopped = block_on(&self.runtime, slot.handle.stop());
             // Relays the last source updates, then ends (the engine's channel is closed).
             block_on(
@@ -357,6 +390,8 @@ impl EngineManager {
                 port: slot.handle.local_port(),
                 device_name,
                 source_count: u32::try_from(slot.handle.sources().len()).unwrap_or(u32::MAX),
+                advertised: slot.advertiser.is_some(),
+                advertise_error: slot.advertise_error.clone(),
             },
             None => convert::stopped_hub_status(device_name),
         }
@@ -412,6 +447,15 @@ impl EngineManager {
     /// See `api::hub::hub_start_pairing`.
     pub(crate) fn hub_start_pairing(&self) -> Result<PairingInfoDto> {
         self.with_hub(|h| Ok(convert::pairing_info_dto(&h.start_pairing())))
+    }
+
+    /// See `api::hub::hub_pairing_status`.
+    pub(crate) fn hub_pairing_status(&self) -> Option<PairingInfoDto> {
+        let st = self.state.lock();
+        let slot = st.hub.as_ref()?;
+        slot.handle
+            .current_pairing()
+            .map(|p| convert::pairing_info_dto(&p))
     }
 
     /// See `api::hub::hub_cancel_pairing`.
@@ -530,25 +574,24 @@ impl EngineManager {
                 // source of the hub name) is not lost.
                 let events = handle.events();
                 // A capture fallback warning (macOS) is shown as the last non-fatal error.
-                let meta = Arc::new(Mutex::new(SenderMeta {
-                    status: handle.status(),
-                    hub_name: None,
-                    last_error: warning,
-                }));
-                let initial = meta.lock().dto();
-                self.sender_sinks.broadcast(&initial);
-                let forwarder = self.runtime.spawn(forward_sender_events(
-                    events,
-                    Arc::clone(&meta),
-                    Arc::clone(&self.sender_sinks),
-                ));
-                tracing::info!(source = %capture_target, "sender started");
-                self.state.lock().sender = Some(SenderSlot {
-                    handle,
-                    forwarder,
-                    meta,
-                    feed_id,
+                let meta = Arc::new(Mutex::new(SenderMeta::new(handle.status(), warning)));
+                let initial = meta_dto(&meta.lock());
+                // The slot is filled before the forwarder can relay anything, so a
+                // subscription made meanwhile (`sender_events`) sees this sender.
+                self.sender_sinks.broadcast_then(&initial, || {
+                    let forwarder = self.runtime.spawn(forward_sender_events(
+                        events,
+                        Arc::clone(&meta),
+                        Arc::clone(&self.sender_sinks),
+                    ));
+                    self.state.lock().sender = Some(SenderSlot {
+                        handle,
+                        forwarder,
+                        meta,
+                        feed_id,
+                    });
                 });
+                tracing::info!(source = %capture_target, "sender started");
                 Ok(())
             }
             Err(e) => {
@@ -624,23 +667,17 @@ impl EngineManager {
     pub(crate) fn sender_status(&self) -> SenderStatusDto {
         let st = self.state.lock();
         match &st.sender {
-            Some(slot) => {
-                let meta = slot.meta.lock();
-                convert::sender_status_dto(
-                    &slot.handle.status(),
-                    meta.hub_name.as_deref(),
-                    meta.last_error.as_deref(),
-                )
-            }
+            Some(slot) => convert::sender_status_dto(&slot.handle.status(), &slot.meta.lock()),
             None => convert::idle_sender_status(),
         }
     }
 
     /// See `api::sender::sender_events`.
     pub(crate) fn sender_events(&self, sink: Box<dyn EventSink<SenderStatusDto>>) {
-        if sink.deliver(self.sender_status()) {
-            self.sender_sinks.add(sink);
-        }
+        // Lock order: sinks, then state, then a sender's meta. The forwarder releases the
+        // meta lock before it broadcasts, and nobody broadcasts while holding state or meta.
+        self.sender_sinks
+            .add_with_initial(sink, || self.sender_status());
     }
 }
 
@@ -723,7 +760,7 @@ async fn forward_sender_events(
                 let dto = {
                     let mut meta = meta.lock();
                     meta.apply(event);
-                    meta.dto()
+                    meta_dto(&meta)
                 };
                 sinks.broadcast(&dto);
             }
@@ -739,6 +776,7 @@ async fn forward_sender_events(
 mod tests {
     use super::*;
     use crate::api::sender::CaptureSourceDto;
+    use hfa_core::SenderStatus;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test sink recording what it receives; closes after `capacity` deliveries.
@@ -843,6 +881,8 @@ mod tests {
             m.hub_cancel_pairing(),
             Err(FfiError::HubNotRunning)
         ));
+        assert_eq!(m.hub_pairing_status(), None);
+        assert!(!m.hub_status().advertised);
         // Gain validation happens before the hub lookup.
         for bad in [-0.1, 4.1, f32::NAN, f32::INFINITY] {
             assert!(matches!(
@@ -872,6 +912,26 @@ mod tests {
         // A sink that is already closed is not kept.
         m.sender_events(Box::new(Recorder::<SenderStatusDto>::new(0)));
         assert_eq!(m.sender_sinks.len(), 1);
+    }
+
+    /// A broadcast racing a new subscription is delivered after the initial value.
+    #[test]
+    fn no_change_falls_between_the_snapshot_and_the_subscription() {
+        let set = Arc::new(SinkSet::new());
+        let rec = Recorder::new(10);
+        let mut racer = None;
+        set.add_with_initial(Box::new(rec.clone()), || {
+            let set = Arc::clone(&set);
+            // Blocks on the set's lock until the subscription is in place.
+            racer = Some(std::thread::spawn(move || set.broadcast(&2)));
+            std::thread::sleep(Duration::from_millis(50));
+            1
+        });
+        racer.expect("spawned").join().expect("racer");
+        assert_eq!(*rec.got.lock(), vec![1, 2]);
+        // A closed sink is not kept.
+        set.add_with_initial(Box::new(Recorder::<i32>::new(0)), || 3);
+        assert_eq!(set.len(), 1);
     }
 
     #[test]
@@ -935,11 +995,7 @@ mod tests {
         let m = EngineManager::new().expect("manager");
         let rec = Recorder::new(1000);
         m.sender_sinks.add(Box::new(rec.clone()));
-        let meta = Arc::new(Mutex::new(SenderMeta {
-            status: SenderStatus::default(),
-            hub_name: None,
-            last_error: None,
-        }));
+        let meta = Arc::new(Mutex::new(SenderMeta::new(SenderStatus::default(), None)));
         let (tx, rx) = broadcast::channel(512);
         let task = m.runtime.spawn(forward_sender_events(
             rx,
@@ -995,11 +1051,7 @@ mod tests {
         let m = EngineManager::new().expect("manager");
         let rec = Recorder::new(10);
         m.sender_sinks.add(Box::new(rec.clone()));
-        let meta = Arc::new(Mutex::new(SenderMeta {
-            status: SenderStatus::default(),
-            hub_name: None,
-            last_error: None,
-        }));
+        let meta = Arc::new(Mutex::new(SenderMeta::new(SenderStatus::default(), None)));
         let (tx, rx) = broadcast::channel(16);
         let task = m.runtime.spawn(forward_sender_events(
             rx,

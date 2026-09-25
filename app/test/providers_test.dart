@@ -241,6 +241,27 @@ void main() {
       },
     );
 
+    test(
+      'shows that the core closed the window after failed attempts',
+      () async {
+        final fake = FakeHfaApi();
+        final c = containerFor(fake);
+        c.listen(hubControllerProvider, (_, _) {});
+        c.listen(pairingControllerProvider, (_, _) {});
+        await c.read(hubControllerProvider.notifier).start();
+        await c.read(pairingControllerProvider.notifier).start();
+
+        // The fifth wrong PIN: the core closes the window without an event.
+        fake.closePairingWindow();
+        fake.emitHubEvent(const HubEventDto.pairingFailed(reason: 'wrong PIN'));
+        await settle();
+        final state = c.read(pairingControllerProvider);
+        expect(state.phase, PairingPhase.failed);
+        expect(state.message, contains('closed this pairing window'));
+        expect(fake.calls, contains('hubPairingStatus'));
+      },
+    );
+
     test('fails to open while the hub is stopped', () async {
       final c = containerFor(FakeHfaApi());
       c.listen(pairingControllerProvider, (_, _) {});
@@ -381,6 +402,9 @@ void main() {
             lossPct: 0,
             rttMs: 0,
             levelDb: 0,
+            hubGain: 1,
+            hubMuted: false,
+            hubPriority: false,
           ),
         );
       final c = containerFor(fake);
@@ -599,6 +623,9 @@ void main() {
           lossPct: 0,
           rttMs: 0,
           levelDb: -120,
+          hubGain: 1,
+          hubMuted: false,
+          hubPriority: false,
         ),
       );
       await started;

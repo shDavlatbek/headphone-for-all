@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -127,13 +129,38 @@ class PairingController extends Notifier<PairingState> {
     state = PairingState(phase: PairingPhase.completed, pairedName: name);
   }
 
-  /// A pairing attempt failed; the window stays open (up to 5 attempts).
+  /// A pairing attempt failed. The window stays open for more attempts until
+  /// the core closes it after 5 failures, which no event reports, so the core
+  /// is asked whether it is still open.
   void onFailed(String reason) {
     if (state.phase != PairingPhase.waiting) return;
     state = PairingState(
       phase: PairingPhase.waiting,
       info: state.info,
       message: reason,
+    );
+    unawaited(_checkStillOpen(_generation, reason));
+  }
+
+  Future<void> _checkStillOpen(int generation, String reason) async {
+    final PairingInfoDto? open;
+    try {
+      open = await ref.read(hfaApiProvider).hubPairingStatus();
+    } catch (e) {
+      debugPrint('pairing status: ${describeError(e)}');
+      return;
+    }
+    if (!ref.mounted ||
+        generation != _generation ||
+        state.phase != PairingPhase.waiting ||
+        open != null) {
+      return;
+    }
+    state = PairingState(
+      phase: PairingPhase.failed,
+      message:
+          '$reason. The hub closed this pairing window after too many '
+          'failed attempts: open a new one.',
     );
   }
 }

@@ -181,7 +181,7 @@ headphone-for-all/
 
 - Unit tests: packet (de)serialization, jitter buffer reorder/loss, drift controller convergence (simulated
   clocks at ±200 ppm), limiter.
-- Loopback integration test: `hfa-cli send --tone 440` → `hfa-cli hub --out wav` on localhost, with simulated
+- Loopback integration test: `hfa send --source tone:440` → `hfa hub --out wav:<path>` on localhost, with simulated
   loss and jitter (`tc netem` on Linux). Check the output frequency and continuity.
 - Latency measurement: a click track on the sender, and a mic or loopback on the hub, to measure glass-to-glass latency.
 - Device matrix for manual QA: the Windows/macOS/Linux/Android/iOS × hub/sender combinations listed in the roadmap.

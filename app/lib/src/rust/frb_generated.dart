@@ -71,7 +71,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => -673063887;
+  int get rustContentHash => 1934918521;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -92,6 +92,8 @@ abstract class RustLibApi extends BaseApi {
   Future<void> crateApiHubHubCancelPairing();
 
   Stream<HubEventDto> crateApiHubHubEvents();
+
+  Future<PairingInfoDto?> crateApiHubHubPairingStatus();
 
   Future<void> crateApiHubHubSetGain({
     required int streamId,
@@ -303,6 +305,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "hub_events", argNames: ["sink"]);
 
   @override
+  Future<PairingInfoDto?> crateApiHubHubPairingStatus() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 6,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_opt_box_autoadd_pairing_info_dto,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiHubHubPairingStatusConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiHubHubPairingStatusConstMeta =>
+      const TaskConstMeta(debugName: "hub_pairing_status", argNames: []);
+
+  @override
   Future<void> crateApiHubHubSetGain({
     required int streamId,
     required double gain,
@@ -316,7 +345,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 6,
+            funcId: 7,
             port: port_,
           );
         },
@@ -346,7 +375,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 7,
+            funcId: 8,
             port: port_,
           );
         },
@@ -378,7 +407,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 9,
             port: port_,
           );
         },
@@ -412,7 +441,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 9,
+            funcId: 10,
             port: port_,
           );
         },
@@ -441,7 +470,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 10,
+            funcId: 11,
             port: port_,
           );
         },
@@ -468,7 +497,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 11,
+            funcId: 12,
             port: port_,
           );
         },
@@ -495,7 +524,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 12,
+            funcId: 13,
             port: port_,
           );
         },
@@ -522,7 +551,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 13,
+            funcId: 14,
             port: port_,
           );
         },
@@ -549,7 +578,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 14,
+            funcId: 15,
             port: port_,
           );
         },
@@ -581,7 +610,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 15,
+            funcId: 16,
             port: port_,
           );
         },
@@ -610,7 +639,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 16,
+            funcId: 17,
             port: port_,
           );
         },
@@ -637,7 +666,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 17,
+            funcId: 18,
             port: port_,
           );
         },
@@ -664,7 +693,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 18,
+            funcId: 19,
             port: port_,
           );
         },
@@ -692,7 +721,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 19,
+            funcId: 20,
             port: port_,
           );
         },
@@ -722,7 +751,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             pdeCallFfi(
               generalizedFrbRustBinding,
               serializer,
-              funcId: 20,
+              funcId: 21,
               port: port_,
             );
           },
@@ -752,7 +781,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 21,
+            funcId: 22,
             port: port_,
           );
         },
@@ -779,7 +808,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 22,
+            funcId: 23,
             port: port_,
           );
         },
@@ -806,7 +835,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 23,
+            funcId: 24,
             port: port_,
           );
         },
@@ -833,7 +862,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 24,
+            funcId: 25,
             port: port_,
           );
         },
@@ -860,7 +889,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 25,
+            funcId: 26,
             port: port_,
           );
         },
@@ -888,7 +917,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 26,
+            funcId: 27,
             port: port_,
           );
         },
@@ -966,6 +995,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   HubInfoDto dco_decode_box_autoadd_hub_info_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_hub_info_dto(raw);
+  }
+
+  @protected
+  PairingInfoDto dco_decode_box_autoadd_pairing_info_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_pairing_info_dto(raw);
   }
 
   @protected
@@ -1105,13 +1140,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   HubStatusDto dco_decode_hub_status_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 4)
-      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
     return HubStatusDto(
       running: dco_decode_bool(arr[0]),
       port: dco_decode_u_16(arr[1]),
       deviceName: dco_decode_String(arr[2]),
       sourceCount: dco_decode_u_32(arr[3]),
+      advertised: dco_decode_bool(arr[4]),
+      advertiseError: dco_decode_opt_String(arr[5]),
     );
   }
 
@@ -1155,6 +1192,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   String? dco_decode_opt_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_String(raw);
+  }
+
+  @protected
+  PairingInfoDto? dco_decode_opt_box_autoadd_pairing_info_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_pairing_info_dto(raw);
   }
 
   @protected
@@ -1208,8 +1251,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   SenderStatusDto dco_decode_sender_status_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 7)
-      throw Exception('unexpected arr length: expect 7 but see ${arr.length}');
+    if (arr.length != 10)
+      throw Exception('unexpected arr length: expect 10 but see ${arr.length}');
     return SenderStatusDto(
       state: dco_decode_String(arr[0]),
       error: dco_decode_opt_String(arr[1]),
@@ -1218,6 +1261,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       lossPct: dco_decode_f_32(arr[4]),
       rttMs: dco_decode_f_32(arr[5]),
       levelDb: dco_decode_f_32(arr[6]),
+      hubGain: dco_decode_f_32(arr[7]),
+      hubMuted: dco_decode_bool(arr[8]),
+      hubPriority: dco_decode_bool(arr[9]),
     );
   }
 
@@ -1364,6 +1410,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   HubInfoDto sse_decode_box_autoadd_hub_info_dto(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_hub_info_dto(deserializer));
+  }
+
+  @protected
+  PairingInfoDto sse_decode_box_autoadd_pairing_info_dto(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_pairing_info_dto(deserializer));
   }
 
   @protected
@@ -1527,11 +1581,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_port = sse_decode_u_16(deserializer);
     var var_deviceName = sse_decode_String(deserializer);
     var var_sourceCount = sse_decode_u_32(deserializer);
+    var var_advertised = sse_decode_bool(deserializer);
+    var var_advertiseError = sse_decode_opt_String(deserializer);
     return HubStatusDto(
       running: var_running,
       port: var_port,
       deviceName: var_deviceName,
       sourceCount: var_sourceCount,
+      advertised: var_advertised,
+      advertiseError: var_advertiseError,
     );
   }
 
@@ -1612,6 +1670,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  PairingInfoDto? sse_decode_opt_box_autoadd_pairing_info_dto(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_pairing_info_dto(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   PairingInfoDto sse_decode_pairing_info_dto(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_pin = sse_decode_String(deserializer);
@@ -1676,6 +1747,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_lossPct = sse_decode_f_32(deserializer);
     var var_rttMs = sse_decode_f_32(deserializer);
     var var_levelDb = sse_decode_f_32(deserializer);
+    var var_hubGain = sse_decode_f_32(deserializer);
+    var var_hubMuted = sse_decode_bool(deserializer);
+    var var_hubPriority = sse_decode_bool(deserializer);
     return SenderStatusDto(
       state: var_state,
       error: var_error,
@@ -1684,6 +1758,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       lossPct: var_lossPct,
       rttMs: var_rttMs,
       levelDb: var_levelDb,
+      hubGain: var_hubGain,
+      hubMuted: var_hubMuted,
+      hubPriority: var_hubPriority,
     );
   }
 
@@ -1879,6 +1956,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_pairing_info_dto(
+    PairingInfoDto self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_pairing_info_dto(self, serializer);
+  }
+
+  @protected
   void sse_encode_box_autoadd_sender_start_dto(
     SenderStartDto self,
     SseSerializer serializer,
@@ -2026,6 +2112,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_u_16(self.port, serializer);
     sse_encode_String(self.deviceName, serializer);
     sse_encode_u_32(self.sourceCount, serializer);
+    sse_encode_bool(self.advertised, serializer);
+    sse_encode_opt_String(self.advertiseError, serializer);
   }
 
   @protected
@@ -2100,6 +2188,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_box_autoadd_pairing_info_dto(
+    PairingInfoDto? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_pairing_info_dto(self, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_pairing_info_dto(
     PairingInfoDto self,
     SseSerializer serializer,
@@ -2153,6 +2254,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_f_32(self.lossPct, serializer);
     sse_encode_f_32(self.rttMs, serializer);
     sse_encode_f_32(self.levelDb, serializer);
+    sse_encode_f_32(self.hubGain, serializer);
+    sse_encode_bool(self.hubMuted, serializer);
+    sse_encode_bool(self.hubPriority, serializer);
   }
 
   @protected

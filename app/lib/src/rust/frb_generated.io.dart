@@ -53,6 +53,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   HubInfoDto dco_decode_box_autoadd_hub_info_dto(dynamic raw);
 
   @protected
+  PairingInfoDto dco_decode_box_autoadd_pairing_info_dto(dynamic raw);
+
+  @protected
   SenderStartDto dco_decode_box_autoadd_sender_start_dto(dynamic raw);
 
   @protected
@@ -105,6 +108,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   String? dco_decode_opt_String(dynamic raw);
+
+  @protected
+  PairingInfoDto? dco_decode_opt_box_autoadd_pairing_info_dto(dynamic raw);
 
   @protected
   PairingInfoDto dco_decode_pairing_info_dto(dynamic raw);
@@ -169,6 +175,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   HubInfoDto sse_decode_box_autoadd_hub_info_dto(SseDeserializer deserializer);
 
   @protected
+  PairingInfoDto sse_decode_box_autoadd_pairing_info_dto(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   SenderStartDto sse_decode_box_autoadd_sender_start_dto(
     SseDeserializer deserializer,
   );
@@ -229,6 +240,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
+
+  @protected
+  PairingInfoDto? sse_decode_opt_box_autoadd_pairing_info_dto(
+    SseDeserializer deserializer,
+  );
 
   @protected
   PairingInfoDto sse_decode_pairing_info_dto(SseDeserializer deserializer);
@@ -302,6 +318,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_hub_info_dto(
     HubInfoDto self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_pairing_info_dto(
+    PairingInfoDto self,
     SseSerializer serializer,
   );
 
@@ -388,6 +410,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_opt_box_autoadd_pairing_info_dto(
+    PairingInfoDto? self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_pairing_info_dto(

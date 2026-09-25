@@ -12,7 +12,8 @@ part 'hub.freezed.dart';
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`
 
 /// Starts the hub (output from the settings, mDNS advertising on). Idempotent: returns the
-/// status of the running hub.
+/// status of the running hub. A failure to advertise does not fail the start: it shows in
+/// `HubStatusDto.advertised` / `advertise_error` and as a `HubEventDto::Error`.
 Future<HubStatusDto> hubStart() => RustLib.instance.api.crateApiHubHubStart();
 
 /// Stops the hub (no-op if it is not running).
@@ -50,6 +51,12 @@ Future<void> hubSetMasterGain({required double gain}) =>
 /// Opens a pairing window (5 minutes, one-time PIN and token).
 Future<PairingInfoDto> hubStartPairing() =>
     RustLib.instance.api.crateApiHubHubStartPairing();
+
+/// The open pairing window, or `None`: none was opened, it was cancelled, it expired, a
+/// sender paired, or the hub closed it after 5 failed attempts (a `PairingFailed` event does
+/// not say which). `None` while the hub is stopped.
+Future<PairingInfoDto?> hubPairingStatus() =>
+    RustLib.instance.api.crateApiHubHubPairingStatus();
 
 /// Closes the pairing window.
 Future<void> hubCancelPairing() =>
@@ -113,11 +120,21 @@ class HubStatusDto {
   /// Number of current streams.
   final int sourceCount;
 
+  /// The hub is announced over mDNS, so senders on the network can find it. `false` while
+  /// stopped, or when advertising failed (see `advertise_error`): senders must then enter
+  /// the hub's address.
+  final bool advertised;
+
+  /// Why advertising failed (e.g. no multicast on iOS without the entitlement), if it did.
+  final String? advertiseError;
+
   const HubStatusDto({
     required this.running,
     required this.port,
     required this.deviceName,
     required this.sourceCount,
+    required this.advertised,
+    this.advertiseError,
   });
 
   @override
@@ -125,7 +142,9 @@ class HubStatusDto {
       running.hashCode ^
       port.hashCode ^
       deviceName.hashCode ^
-      sourceCount.hashCode;
+      sourceCount.hashCode ^
+      advertised.hashCode ^
+      advertiseError.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -135,7 +154,9 @@ class HubStatusDto {
           running == other.running &&
           port == other.port &&
           deviceName == other.deviceName &&
-          sourceCount == other.sourceCount;
+          sourceCount == other.sourceCount &&
+          advertised == other.advertised &&
+          advertiseError == other.advertiseError;
 }
 
 /// An open pairing window. Show `pin` and a QR code of `uri`.
