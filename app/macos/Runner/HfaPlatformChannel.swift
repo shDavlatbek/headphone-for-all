@@ -2,7 +2,8 @@
 //
 // On macOS the Rust core captures system audio itself (Core Audio process taps, macOS 14.2+) and
 // plays the hub mix through Core Audio, so the channel only provides the data directory and
-// reports whether capture can work on this macOS version. Every other method is a no-op.
+// reports whether capture can work on this macOS version. `startHubService` / `stopHubService`
+// hold an App Nap opt-out while the hub runs; every other method is a no-op.
 // The event channel is not registered: Dart listens to it only on Android and iOS.
 
 import FlutterMacOS
@@ -15,6 +16,7 @@ import Foundation
 /// | `getDataDir` | `~/Library/Application Support/<bundle id>/hfa` (inside the sandbox container) |
 /// | `captureSupport` | `{supported, reason}`: taps need macOS 14.2+ |
 /// | `startSystemCapture` | `false` (Rust captures directly) |
+/// | `startHubService` / `stopHubService` | begin / end a `ProcessInfo` activity (no App Nap, no idle sleep) |
 /// | anything else of §8.3 | no-op (`nil`) |
 enum HfaPlatformChannel {
   /// Name of the method channel.
@@ -23,8 +25,11 @@ enum HfaPlatformChannel {
   /// First macOS version with Core Audio process taps (`AudioHardwareCreateProcessTap`).
   static let tapMinimumVersion = OperatingSystemVersion(majorVersion: 14, minorVersion: 2, patchVersion: 0)
 
-  /// Registers the method channel on `messenger`. The handler holds no state, so nothing has to
-  /// be kept alive: the messenger retains the handler block.
+  /// Activity token held while the hub runs (main thread only), see `setHubActivity(_:)`.
+  private static var hubActivity: NSObjectProtocol?
+
+  /// Registers the method channel on `messenger`. The handler's only state is `hubActivity`, so
+  /// nothing has to be kept alive: the messenger retains the handler block.
   static func register(messenger: FlutterBinaryMessenger) {
     let channel = FlutterMethodChannel(name: methodChannelName, binaryMessenger: messenger)
     channel.setMethodCallHandler { call, result in
@@ -35,12 +40,36 @@ enum HfaPlatformChannel {
         result(captureSupport())
       case "startSystemCapture":
         result(false)
-      case "stopSystemCapture", "startHubService", "stopHubService", "acquireMulticastLock",
-        "releaseMulticastLock", "writeBroadcastConfig":
+      case "startHubService":
+        setHubActivity(true)
+        result(nil)
+      case "stopHubService":
+        setHubActivity(false)
+        result(nil)
+      case "stopSystemCapture", "acquireMulticastLock", "releaseMulticastLock",
+        "writeBroadcastConfig":
         result(nil)
       default:
         result(FlutterMethodNotImplemented)
       }
+    }
+  }
+
+  /// Begins (`true`) or ends the hub's activity assertion; idempotent.
+  ///
+  /// While the hub runs its window is usually hidden to the tray, and App Nap throttles the timers
+  /// and lowers the CPU and I/O priority of an app without visible windows. `.userInitiated`
+  /// (which also disables idle system sleep, as audio playback does) and `.latencyCritical` keep
+  /// the hub's network, jitter-buffer and mixer threads on time.
+  static func setHubActivity(_ active: Bool) {
+    if active {
+      guard hubActivity == nil else { return }
+      hubActivity = ProcessInfo.processInfo.beginActivity(
+        options: [.userInitiated, .latencyCritical],
+        reason: "Headphone for All hub: receiving and playing audio")
+    } else if let activity = hubActivity {
+      ProcessInfo.processInfo.endActivity(activity)
+      hubActivity = nil
     }
   }
 

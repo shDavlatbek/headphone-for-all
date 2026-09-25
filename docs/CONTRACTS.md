@@ -1610,6 +1610,13 @@ podspec. A new Apple-side dependency that calls another required-reason API must
 fails early without `cargo` or `cmake`, and runs `cargo rustc --locked`. cargokit's `build_pod.sh` (app/rust_builder)
 is unchanged; app/ios/README.md says how to build from the Xcode GUI.
 
+**macOS hub activity.** `startHubService` / `stopHubService` (which the Dart hub controller calls on every
+platform) now begin / end a `ProcessInfo` activity (`.userInitiated` + `.latencyCritical`, idempotent) instead of
+doing nothing, so App Nap cannot throttle a hub whose window is hidden to the tray, and idle sleep is held off while
+it runs. A sender has no such native call yet: if a Mac test shows App Nap throttling a process-tap sender with the
+window hidden (Activity Monitor's "App Nap" column), add `beginStreaming` / `endStreaming` around `senderStart` /
+`senderStop` in Dart backed by the same kind of activity.
+
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 
 **Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).
