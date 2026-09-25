@@ -791,6 +791,7 @@ reuses the pairing the app already did. Pairing never happens inside the extensi
 **JNI for Android** (`src/android.rs`, `#[cfg(target_os = "android")]`). The class is `io.github.shdavlatbek.hfa.NativeBridge`:
 
 ```
+external fun init(context: Context): Int   // once per process, before any audio output (added by feat/android, §8.7)
 external fun pushPcm(feedId: Int, data: FloatArray, frames: Int, channels: Int, sampleRate: Int): Int   // 0 = ok
 external fun pushPcm16(feedId: Int, data: ShortArray, frames: Int, channels: Int, sampleRate: Int): Int
 ```
@@ -1036,11 +1037,14 @@ Clean up after local builds: `rm -rf app/build app/.dart_tool/flutter_build app/
 
 **Layout.** Kotlin package `io.github.shdavlatbek.hfa`: `MainActivity` (channels), `CaptureCoordinator` (runs the
 capture flow), `CaptureService`, `HubService`, `NativeBridge`, `PlatformEvents` (event sink), `Notifications`,
-`SystemLocks`. Pure logic without Android types lives in `io.github.shdavlatbek.hfa.capture` (`CaptureRequest`,
-`CaptureStateMachine`, `CaptureLoop` + `PushPolicy` + `HfaCode`, `PcmFormat`, `PlatformEvent`, `CaptureSupport`) and
+`SystemLocks`, `HfaApplication` (process setup). Pure logic without Android types lives in `io.github.shdavlatbek.hfa.capture` (`CaptureRequest`,
+`CaptureStateMachine`, `CaptureLoop` + `PushPolicy` + `HfaCode`, `PcmFormat`, `PlatformEvent`, `CaptureSupport`,
+`OwnedSlot`) and
 has JVM unit tests in `app/android/app/src/test` (JUnit 4). From `app/android` (after `flutter pub get` / a Flutter
 build generated `gradlew` and `local.properties`): `./gradlew -Ptarget-platform=android-arm64 :app:testDebugUnitTest
-:app:lintDebug` — without `-Ptarget-platform`, cargokit also builds the Rust core for armv7 and x86_64 (debug). Lint:
+:app:lintDebug` — without `-Ptarget-platform`, cargokit also builds the Rust core for armv7 and x86_64 (debug). On a
+tight disk, `CARGO_PROFILE_DEV_DEBUG=0` keeps cargokit's debug build (its own `--target-dir` under `app/build`) at
+~0.6 GB instead of ~1.5 GB. Lint:
 0 errors; the only warning is "newer Gradle available" (versions stay as `flutter create` set them).
 
 - `MainActivity` extends **`FlutterFragmentActivity`** (a `ComponentActivity`), so the permission and consent dialogs
@@ -1048,6 +1052,15 @@ build generated `gradlew` and `local.properties`): `./gradlew -Ptarget-platform=
 - `NativeBridge` is a Kotlin `object`; `pushPcm` / `pushPcm16` are `@JvmStatic external` (static natives, same JNI
   names; the Rust side ignores the second JNI argument). `NativeBridge.loadError` is `null` once `libhfa_ffi.so` is
   loaded (checked before a capture starts, so a missing library is a `captureError`, not a crash).
+- **`NativeBridge.init(context): Int`** (JNI `Java_io_github_shdavlatbek_hfa_NativeBridge_init`, in
+  `core/hfa-ffi/src/android.rs`; a small change outside `app/android`, required for the hub): stores the `JavaVM` and a
+  leaked global reference to the application context in the `ndk-context` crate, which cpal's AAudio backend reads
+  (`build_output_stream`, device listing). Nothing else sets it in a Flutter app, so without it the Android hub's
+  headphone output panicked on the `hfa-cpal-out` thread. Idempotent (a mutex + flag: `initialize_android_context`
+  may run once); `0` ok, `-1` null context, `-3` JNI error, `-5` panic. The manifest's application class is
+  **`HfaApplication`**, whose `onCreate` calls it before any Flutter engine exists. On Android `hub_start` and
+  `list_output_devices` first check that it ran and otherwise fail with `FfiError::Internal("the Android context is
+  not initialized ...")` instead of panicking inside cpal.
 
 **`startSystemCapture({feedId, sampleRate, channels})`.**
 - Arguments: `feedId` any unsigned 32-bit value (Dart `int`, passed to JNI with the same bits), `sampleRate`
@@ -1072,7 +1085,13 @@ notification's Stop action ("Stopped from the notification") or `MediaProjection
 system ended the projection, e.g. the Android 15 QPR1+ status-bar chip or screen lock). `captureError` when recording
 fails after the start (`AudioRecord.read` error, engine refusal) or the start failed. `stopSystemCapture` emits
 nothing. Every capture carries a session number, so late reports of a replaced or stopped capture are ignored. Events
-sent while no Dart listener exists are dropped.
+sent while no Dart listener exists are dropped. Each Flutter engine registers its own stream handler
+(`PlatformEvents.handlerFor(messenger)`); the process-wide sink belongs to the engine that listened last, and only
+that engine's `onCancel` / `cleanUpFlutterEngine` clears it (`OwnedSlot`), so an old engine's late cancel cannot
+silence a new UI.
+- A capture service whose start reaches `onServiceStarted` after its session became stale (stopped or timed out while
+  starting, or replaced) tears itself down (`CaptureCoordinator.onServiceStarted` returns
+  `CaptureStateMachine.isCurrentCapture(session)`), so it never keeps recording if its stop command was not delivered.
 
 **Services.** Both are `exported=false`, `START_NOT_STICKY`, and are stopped with an explicit stop command
 (`startService(ACTION_STOP)` + `stopSelf(startId)`), never `stopService`: stopping a service started with
