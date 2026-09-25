@@ -181,36 +181,7 @@ pub(crate) fn spawn(
     commands: Receiver<EncoderCommand>,
     events: UnboundedSender<EncoderEvent>,
 ) -> Result<JoinHandle<()>, CoreError> {
-    let ch = usize::from(input.channels.max(1));
-    let block_frames = input.frames_for_ms(READ_BLOCK_MS).max(1);
-    let resampler = if input.sample_rate == AudioFormat::INTERNAL.sample_rate {
-        None
-    } else {
-        Some(StreamResampler::new(
-            2,
-            input.sample_rate,
-            AudioFormat::INTERNAL.sample_rate,
-            input.frames_for_ms(10).max(1),
-        )?)
-    };
-    let frame_len = AudioFormat::INTERNAL.samples_for_ms(params.frame_ms);
-    let mut worker = EncoderThread {
-        params,
-        shared,
-        commands,
-        events,
-        source,
-        input,
-        raw: vec![0.0; block_frames * ch],
-        stereo: Vec::with_capacity(block_frames * 2),
-        resampler,
-        fifo: Vec::with_capacity(frame_len * (MAX_FIFO_FRAMES + 4)),
-        frame: vec![0.0; frame_len],
-        meter: LevelMeter::new(),
-        stream: None,
-        silent_for: Duration::ZERO,
-        last_input: Instant::now(),
-    };
+    let mut worker = EncoderThread::new(source, input, params, shared, commands, events)?;
     let mut capture = capture;
     thread::Builder::new()
         .name("hfa-encoder".into())
@@ -222,23 +193,69 @@ pub(crate) fn spawn(
 }
 
 impl EncoderThread {
+    fn new(
+        source: PcmSource,
+        input: AudioFormat,
+        params: EncoderParams,
+        shared: Arc<EncoderShared>,
+        commands: Receiver<EncoderCommand>,
+        events: UnboundedSender<EncoderEvent>,
+    ) -> Result<Self, CoreError> {
+        let ch = usize::from(input.channels.max(1));
+        let block_frames = input.frames_for_ms(READ_BLOCK_MS).max(1);
+        let resampler = if input.sample_rate == AudioFormat::INTERNAL.sample_rate {
+            None
+        } else {
+            Some(StreamResampler::new(
+                2,
+                input.sample_rate,
+                AudioFormat::INTERNAL.sample_rate,
+                input.frames_for_ms(10).max(1),
+            )?)
+        };
+        let frame_len = AudioFormat::INTERNAL.samples_for_ms(params.frame_ms);
+        Ok(Self {
+            params,
+            shared,
+            commands,
+            events,
+            source,
+            input,
+            raw: vec![0.0; block_frames * ch],
+            stereo: Vec::with_capacity(block_frames * 2),
+            resampler,
+            fifo: Vec::with_capacity(frame_len * (MAX_FIFO_FRAMES + 4)),
+            frame: vec![0.0; frame_len],
+            meter: LevelMeter::new(),
+            stream: None,
+            silent_for: Duration::ZERO,
+            last_input: Instant::now(),
+        })
+    }
+
     fn run(&mut self) {
         let idle = Duration::from_millis(u64::from(self.params.frame_ms)) / 4;
         while !self.shared.stop.load(Ordering::Acquire) {
-            self.handle_commands();
-            let got_input = self.read_input();
-            while self.fifo.len() >= self.frame.len() {
-                let n = self.frame.len();
-                self.frame.copy_from_slice(&self.fifo[..n]);
-                self.fifo.drain(..n);
-                self.process_frame(Instant::now());
-            }
-            self.dtx_housekeeping(Instant::now());
-            if !got_input {
+            if !self.step() {
                 thread::sleep(idle);
             }
         }
         self.stream = None;
+    }
+
+    /// One loop iteration: commands, input, complete frames, DTX. Returns `false` if there
+    /// was no input (the caller then sleeps).
+    fn step(&mut self) -> bool {
+        self.handle_commands();
+        let got_input = self.read_input();
+        while self.fifo.len() >= self.frame.len() {
+            let n = self.frame.len();
+            self.frame.copy_from_slice(&self.fifo[..n]);
+            self.fifo.drain(..n);
+            self.process_frame(Instant::now());
+        }
+        self.dtx_housekeeping(Instant::now());
+        got_input
     }
 
     fn warn(&self, message: String) {
@@ -501,4 +518,91 @@ fn encode_and_send(st: &mut Stream, frame: &[f32], mut flags: u8) -> Result<(), 
     st.prev.extend_from_slice(primary);
     st.prev_seq = Some(seq);
     sent.map(drop).map_err(Failure::Fatal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::MediaDemux;
+    use hfa_audio::SineGenerator;
+    use tokio::net::UdpSocket;
+
+    /// A 44.1 kHz mono capture (folded to stereo, resampled) streamed with redundancy: every
+    /// datagram after the first carries the previous frame, and the loop allocates nothing
+    /// after warm-up.
+    #[tokio::test]
+    async fn encodes_with_redundancy_without_allocating() {
+        let input = AudioFormat::new(44_100, 1);
+        let (mut sink, source) = hfa_capture::pcm_ring_with_channels(44_100, 1);
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut worker = EncoderThread::new(
+            source,
+            input,
+            EncoderParams {
+                frame_ms: 10,
+                fec: true,
+            },
+            Arc::new(EncoderShared::new()),
+            cmd_rx,
+            ev_tx,
+        )
+        .expect("worker");
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let media = MediaSender::new(socket, receiver.local_addr().expect("addr"), 99);
+        let mut demux = MediaDemux::new();
+        assert!(demux.add_stream(99, media.key()));
+        worker.start_stream(
+            media,
+            Adaptation {
+                redundancy: true,
+                bitrate: 128_000,
+                expected_loss: 5,
+            },
+        );
+
+        let mut tone = SineGenerator::new(440.0, 0.25, input);
+        let mut block = vec![0.0f32; 441];
+        let mut feed_and_step = |worker: &mut EncoderThread| {
+            tone.fill(&mut block);
+            sink.push(&block);
+            worker.step();
+        };
+        for _ in 0..20 {
+            feed_and_step(&mut worker);
+        }
+        let allocations = crate::test_alloc::count_allocs(|| {
+            for _ in 0..50 {
+                feed_and_step(&mut worker);
+            }
+        });
+        assert_eq!(allocations, 0);
+        let sent = worker.shared.packets_sent.load(Ordering::Relaxed);
+        assert!(sent >= 60, "{sent} packets");
+
+        let mut buf = vec![0u8; 2048];
+        let mut prev_primary: Option<Vec<u8>> = None;
+        let mut checked = 0;
+        while let Ok(Ok((n, _))) =
+            tokio::time::timeout(Duration::from_millis(100), receiver.recv_from(&mut buf)).await
+        {
+            let (header, payload) = demux.open(&buf[..n]).expect("authentic");
+            let p = payload::parse(&payload).expect("container");
+            match &prev_primary {
+                None => {
+                    assert_eq!(header.seq, 0);
+                    assert!(!header.has_flag(FLAG_FEC) && p.redundant.is_none());
+                }
+                Some(prev) => {
+                    assert!(header.has_flag(FLAG_FEC), "seq {}", header.seq);
+                    assert_eq!(p.redundant, Some(prev.as_slice()));
+                    checked += 1;
+                }
+            }
+            assert_eq!(header.timestamp, header.seq * 480);
+            prev_primary = Some(p.primary.to_vec());
+        }
+        assert!(checked >= 50, "{checked} redundant packets checked");
+    }
 }

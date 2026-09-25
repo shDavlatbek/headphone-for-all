@@ -99,6 +99,17 @@ pub async fn start_sender(
     freq_hz: f32,
     secret: Option<String>,
 ) -> TestSender {
+    start_sender_with_frame(dev, hub_port, freq_hz, secret, 10).await
+}
+
+/// Like [`start_sender`] with an Opus frame duration of `frame_ms` (10 or 20).
+pub async fn start_sender_with_frame(
+    dev: &Device,
+    hub_port: u16,
+    freq_hz: f32,
+    secret: Option<String>,
+    frame_ms: u32,
+) -> TestSender {
     let (capture, warning) =
         hfa_core::sender::open_capture(&CaptureTarget::Tone { freq_hz }).expect("tone");
     assert!(warning.is_none());
@@ -107,7 +118,10 @@ pub async fn start_sender(
             host: "127.0.0.1".into(),
             port: hub_port,
         },
-        settings: dev.settings(0),
+        settings: Settings {
+            frame_ms,
+            ..dev.settings(0)
+        },
         capture,
         label: format!("Tone {freq_hz}"),
         expected_hub_key: None,

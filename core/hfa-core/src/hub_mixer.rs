@@ -929,6 +929,87 @@ mod tests {
     }
 
     #[test]
+    fn mixer_ticks_do_not_allocate_after_warm_up() {
+        use hfa_capture::output_file::NullOutput;
+        let format = AudioFormat::INTERNAL;
+        let (sink, _source) = output_ring(format);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (events, _) = broadcast::channel(8);
+        let mut worker = MixerThread {
+            streams: Vec::with_capacity(MAX_STREAMS),
+            mixer: Mixer::new(MixerConfig::default(), MIX_FRAMES),
+            mix: vec![0.0; MIX_SAMPLES],
+            output: OutputStage::new(
+                Box::new(NullOutput::new(format, 10)),
+                sink,
+                Arc::new(AtomicU32::new(0)),
+            ),
+            commands: rx,
+            events,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let mut shared = Vec::new();
+        for (id, frame_ms) in [(1u32, 10u32), (2, 20)] {
+            let jb = JitterBuffer::new(JitterConfig {
+                frame_ms,
+                min_target_ms: 20,
+                max_target_ms: 100,
+                initial_target_ms: 20,
+                capacity: 256,
+            });
+            let s = Arc::new(StreamShared::new(jb));
+            let mix =
+                MixStream::new(id, Arc::clone(&s), frame_ms, Controls::default()).expect("stream");
+            worker.mixer.add_source(id);
+            worker.streams.push(mix);
+            shared.push((s, frame_ms));
+        }
+        // 2 s of packets for both streams (a 10 ms and a 20 ms one), pushed up front.
+        let t0 = Instant::now();
+        for (s, frame_ms) in &shared {
+            let mut enc = OpusEncoder::new(OpusConfig {
+                frame_ms: *frame_ms,
+                ..OpusConfig::default()
+            })
+            .expect("encoder");
+            let mut tone = SineGenerator::new(440.0, 0.25, AudioFormat::INTERNAL);
+            let mut pcm = vec![0.0; AudioFormat::INTERNAL.samples_for_ms(*frame_ms)];
+            for seq in 0..(2000 / frame_ms) {
+                tone.fill(&mut pcm);
+                let mut buf = vec![0u8; 1275];
+                let n = enc.encode(&pcm, &mut buf).expect("encode");
+                let mut payload = Vec::new();
+                assert!(payload::write(&buf[..n], None, &mut payload));
+                let h = MediaHeader {
+                    flags: 0,
+                    stream_id: 0,
+                    seq,
+                    timestamp: seq * frame_ms * 48,
+                };
+                s.state
+                    .lock()
+                    .on_datagram(&h, payload, u64::from(seq * frame_ms) * 1000, t0);
+            }
+        }
+        for _ in 0..30 {
+            worker.tick();
+            let (mix, output) = (&worker.mix, &mut worker.output);
+            output.write(mix);
+        }
+        let allocations = crate::test_alloc::count_allocs(|| {
+            for _ in 0..100 {
+                worker.tick();
+                let (mix, output) = (&worker.mix, &mut worker.output);
+                output.write(mix);
+            }
+        });
+        assert_eq!(allocations, 0);
+        for (s, _) in &shared {
+            assert!(s.state.lock().mix.played > 50);
+        }
+    }
+
+    #[test]
     fn mixer_thread_paces_output_and_mixes_streams() {
         use hfa_capture::output_file::NullOutput;
         let format = AudioFormat::INTERNAL;

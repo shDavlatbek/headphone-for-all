@@ -81,6 +81,62 @@ const _: () = {
     assert_send::<PairingAttempt<'static>>();
 };
 
+/// Allocation counting for the real-time path tests (`hub_mixer`, `sender_encoder`): a
+/// global allocator that counts the current thread's allocations while a probe is active.
+#[cfg(test)]
+pub(crate) mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct Counting;
+
+    thread_local! {
+        static TRACKING: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn note() {
+        if TRACKING.try_with(|t| t.get()).unwrap_or(false) {
+            let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+        }
+    }
+
+    // SAFETY: forwards every call to the system allocator; only adds a counter.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            note();
+            // SAFETY: same contract as the caller's.
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: same contract as the caller's.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            note();
+            // SAFETY: same contract as the caller's.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            note();
+            // SAFETY: same contract as the caller's.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: Counting = Counting;
+
+    /// Runs `f` and returns how many allocations it made on this thread.
+    pub(crate) fn count_allocs(f: impl FnOnce()) -> usize {
+        let before = ALLOCATIONS.with(Cell::get);
+        TRACKING.with(|t| t.set(true));
+        f();
+        TRACKING.with(|t| t.set(false));
+        ALLOCATIONS.with(Cell::get) - before
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

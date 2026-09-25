@@ -69,7 +69,7 @@ async fn paired_tone_sender_reaches_the_wav() {
     assert!(dropout < 60.0, "dropout of {dropout} ms");
 }
 
-/// Two senders at once: both tones are in the mix.
+/// Two senders at once (10 ms and 20 ms frames): both tones are in the mix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_senders_are_mixed() {
     let _serial = serial().await;
@@ -82,10 +82,11 @@ async fn two_senders_are_mixed() {
     let pin = hub.hub.start_pairing().pin;
     let mut a = start_sender(&dev_a, port, 440.0, Some(pin)).await;
     wait_state(&mut a, START_TIMEOUT, SenderState::Streaming).await;
-    // A pairing window is single-use: open a new one for the second device.
+    // A pairing window is single-use: open a new one for the second device, which also uses
+    // 20 ms frames (the mixer ticks every 10 ms).
     let dev_b = Device::new("B");
     let pin = hub.hub.start_pairing().pin;
-    let mut b = start_sender(&dev_b, port, 1000.0, Some(pin)).await;
+    let mut b = start_sender_with_frame(&dev_b, port, 1000.0, Some(pin), 20).await;
     wait_state(&mut b, START_TIMEOUT, SenderState::Streaming).await;
     let t_both = hub.started.elapsed().as_secs_f64();
 
