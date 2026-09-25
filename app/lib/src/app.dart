@@ -6,6 +6,7 @@ import 'screens/home_screen.dart';
 import 'screens/hub_screen.dart';
 import 'screens/sender_screen.dart';
 import 'screens/settings_screen.dart';
+import 'state/app_prefs.dart';
 import 'state/core_providers.dart';
 import 'state/hub_controller.dart';
 import 'state/navigation.dart';
@@ -114,6 +115,8 @@ class AppShell extends ConsumerWidget {
     ref.listen(hubControllerProvider.select((h) => h.error), (_, error) {
       if (error != null) showMessage(context, error);
     });
+    // Loaded at launch: it starts the hub if the user asked for that.
+    ref.listen(appPrefsProvider, (_, _) {});
 
     Widget badged(IconData icon, AppSection s) {
       final on =

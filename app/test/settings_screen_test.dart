@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/models/hub_target.dart';
+import 'package:headphone_for_all/src/state/app_prefs.dart';
 import 'package:headphone_for_all/src/state/hub_controller.dart';
 import 'package:headphone_for_all/src/state/sender_controller.dart';
 import 'package:headphone_for_all/src/state/navigation.dart';
@@ -116,6 +117,19 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(fake.calls.where((c) => c == 'senderStart'), hasLength(starts + 1));
     expect(container.read(senderControllerProvider).isLive, isTrue);
+    await unmount(tester);
+  });
+
+  testWidgets('the start-on-launch switch applies at once', (tester) async {
+    final container = await pumpApp(
+      tester,
+      FakeHfaApi(),
+      section: AppSection.settings,
+    );
+    expect(container.read(appPrefsProvider).startHubOnLaunch, isFalse);
+    await tester.tap(find.byKey(const Key('start-hub-on-launch')));
+    await tester.pumpAndSettle();
+    expect(container.read(appPrefsProvider).startHubOnLaunch, isTrue);
     await unmount(tester);
   });
 

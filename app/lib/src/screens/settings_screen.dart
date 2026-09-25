@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/hfa_api.dart';
+import '../state/app_prefs.dart';
 import '../state/core_providers.dart';
 import '../state/hub_controller.dart';
 import '../state/sender_controller.dart';
@@ -57,6 +58,8 @@ class SettingsScreen extends ConsumerWidget {
         children: [
           // Re-created when the saved settings change (e.g. after a save).
           SettingsForm(key: ValueKey(s), initial: s),
+          const SizedBox(height: 16),
+          const StartupCard(),
           const SizedBox(height: 16),
           const TrustedDevicesCard(),
         ],
@@ -344,6 +347,30 @@ class _OutputPicker extends ConsumerWidget {
           onChanged: onChanged,
         );
       },
+    );
+  }
+}
+
+/// Preferences of the app itself (applied immediately, no Save).
+class StartupCard extends ConsumerWidget {
+  /// Creates the card.
+  const StartupCard({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final prefs = ref.watch(appPrefsProvider);
+    return Card(
+      child: SwitchListTile(
+        key: const Key('start-hub-on-launch'),
+        secondary: const Icon(Icons.power_settings_new),
+        title: const Text('Start the hub when the app opens'),
+        subtitle: const Text(
+          'For the device your headphone is connected to, e.g. a PC that '
+          'opens the app at sign-in.',
+        ),
+        value: prefs.startHubOnLaunch,
+        onChanged: ref.read(appPrefsProvider.notifier).setStartHubOnLaunch,
+      ),
     );
   }
 }

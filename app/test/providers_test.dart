@@ -7,6 +7,7 @@ import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/models/hub_target.dart';
 import 'package:headphone_for_all/src/models/source_choice.dart';
 import 'package:headphone_for_all/src/platform/native_channel.dart';
+import 'package:headphone_for_all/src/state/app_prefs.dart';
 import 'package:headphone_for_all/src/state/core_providers.dart';
 import 'package:headphone_for_all/src/state/discovery_controller.dart';
 import 'package:headphone_for_all/src/state/hub_address_book.dart';
@@ -875,6 +876,58 @@ void main() {
       await fake.stopDiscovery(); // e.g. another caller stopped it
       await settle();
       expect(c.read(discoveryControllerProvider).error, contains('refresh'));
+    });
+  });
+
+  group('AppPrefs', () {
+    test(
+      'the hub starts on launch when asked, and the choice is kept',
+      () async {
+        final dir = await Directory.systemTemp.createTemp('hfa_prefs_');
+        addTearDown(() => dir.delete(recursive: true));
+        ProviderContainer launch(FakeHfaApi fake) {
+          final c = ProviderContainer.test(
+            overrides: [
+              ...overridesFor(fake),
+              dataDirProvider.overrideWithValue(dir.path),
+            ],
+            retry: (retryCount, error) => null,
+          );
+          c.listen(hubControllerProvider, (_, _) {});
+          c.listen(appPrefsProvider, (_, _) {});
+          return c;
+        }
+
+        var fake = FakeHfaApi();
+        var c = launch(fake);
+        await c.read(appPrefsProvider.notifier).flush();
+        expect(fake.hubRunning, isFalse);
+        c.read(appPrefsProvider.notifier).setStartHubOnLaunch(true);
+        await c.read(appPrefsProvider.notifier).flush();
+        // Only at launch: switching it on does not start the hub now.
+        expect(fake.hubRunning, isFalse);
+        c.dispose();
+
+        fake = FakeHfaApi();
+        c = launch(fake);
+        await c.read(appPrefsProvider.notifier).flush();
+        expect(c.read(appPrefsProvider).startHubOnLaunch, isTrue);
+        expect(fake.hubRunning, isTrue);
+        expect(c.read(hubControllerProvider).running, isTrue);
+        c.dispose();
+      },
+    );
+
+    test('a broken prefs file means the defaults', () {
+      expect(AppPrefs.fromJson('nonsense').startHubOnLaunch, isFalse);
+      expect(
+        AppPrefs.fromJson({'startHubOnLaunch': 'yes'}).startHubOnLaunch,
+        isFalse,
+      );
+      expect(
+        AppPrefs.fromJson({'startHubOnLaunch': true}).startHubOnLaunch,
+        isTrue,
+      );
     });
   });
 

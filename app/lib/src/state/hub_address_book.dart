@@ -8,13 +8,13 @@
 library;
 
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/hub_target.dart';
+import '../util/json_file.dart';
 import 'core_providers.dart';
 
 /// File name of the address book inside the data directory.
@@ -22,14 +22,8 @@ const hubAddressFile = 'hub_addresses.json';
 
 /// Parses the address book file; entries that do not fit are skipped.
 @visibleForTesting
-Map<String, HubAddress> parseHubAddresses(String text) {
+Map<String, HubAddress> parseHubAddresses(Object? json) {
   final result = <String, HubAddress>{};
-  final Object? json;
-  try {
-    json = jsonDecode(text);
-  } on FormatException {
-    return result;
-  }
   if (json is! Map) return result;
   for (final entry in json.entries) {
     final key = entry.key;
@@ -82,8 +76,7 @@ class HubAddressBook extends Notifier<Map<String, HubAddress>> {
     final file = _file;
     if (file == null) return;
     try {
-      if (!await file.exists()) return;
-      final loaded = parseHubAddresses(await file.readAsString());
+      final loaded = parseHubAddresses(await readJsonFile(file));
       if (!ref.mounted) return;
       // Addresses remembered meanwhile win.
       state = {...loaded, ...state};
@@ -112,16 +105,14 @@ class HubAddressBook extends Notifier<Map<String, HubAddress>> {
   void _save() {
     final file = _file;
     if (file == null) return;
-    final json = jsonEncode({
+    final json = {
       for (final e in state.entries)
         e.key: {'host': e.value.host, 'port': e.value.port},
-    });
-    // One write at a time, in order; each writes a temp file and renames it.
+    };
+    // One write at a time, in order.
     _saving = _saving.then((_) async {
       try {
-        final tmp = File('${file.path}.tmp');
-        await tmp.writeAsString(json, flush: true);
-        await tmp.rename(file.path);
+        await writeJsonFile(file, json);
       } catch (e) {
         debugPrint('hub addresses: $e');
       }
