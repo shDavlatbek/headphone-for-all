@@ -388,27 +388,14 @@ class TrustedDevicesCard extends ConsumerWidget {
     final ok = await showConfirmDialog(
       context,
       title: 'Forget ${peer.name}?',
-      message: ref.read(hubControllerProvider).running
-          ? 'It will need a new PIN to connect again. The hub restarts to '
-                'apply this, so every device reconnects.'
-          : 'It will need a new PIN to connect again.',
+      message: 'It will need a new PIN to connect again.',
       confirmLabel: 'Forget',
     );
     if (!ok) return;
     try {
-      final restarted = await ref
-          .read(trustedPeersProvider.notifier)
-          .forget(peer.deviceId);
+      await ref.read(trustedPeersProvider.notifier).forget(peer.deviceId);
       if (!context.mounted) return;
-      final hubError = ref.read(hubControllerProvider).error;
-      showMessage(
-        context,
-        !restarted
-            ? 'Forgot ${peer.name}.'
-            : hubError == null
-            ? 'Forgot ${peer.name}. The hub restarted.'
-            : 'Forgot ${peer.name}, but the hub did not restart: $hubError',
-      );
+      showMessage(context, 'Forgot ${peer.name}.');
     } catch (e) {
       if (context.mounted) showMessage(context, describeError(e));
     }

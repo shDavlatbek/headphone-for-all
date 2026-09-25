@@ -4,7 +4,8 @@
 //!
 //! - [`api`]: the `flutter_rust_bridge` v2 API used by the Flutter app. It is backed by one
 //!   global engine manager (`manager.rs`) that owns a tokio runtime, the loaded settings and
-//!   identity, and at most one hub and one sender (the trust store is re-read on every use).
+//!   identity, and at most one hub and one sender (trust goes through the shared
+//!   per-directory `TrustStore`).
 //! - [`c_api`]: a small C ABI for the iOS ReplayKit broadcast extension (sender only; no
 //!   Flutter in the extension). Header: `include/hfa_ext.h`.
 //! - `android` (Android only): JNI exports for the Kotlin capture service, pushing PCM into an

@@ -1070,8 +1070,8 @@ Modules:
   connections with `Bye("this device is no longer trusted by the hub")` (their reconnect then needs pairing). The
   **sender** re-reads it every 5 pings and, if its pinned hub is no longer trusted, ends with the final error
   `PairingRequired` (`Failed("pairing required")`). This resolves the §8.5 "Known limit" (a running engine's own
-  copy) without a `TrustStore` field in `HubConfig`/`SenderConfig`; the app's hub restart after a forget (§8.7) is
-  no longer needed, but harmless.
+  copy) without a `TrustStore` field in `HubConfig`/`SenderConfig`; the app's hub restart after a forget (§8.7) was
+  removed at integration (§8.12).
 - **Capture failure (cross-crate addition to `hfa-capture`, made by `fix/core-engine`).** New default method
   **`CaptureSource::error(&self) -> Option<String>`** (default `None`; backward compatible): `Some(reason)` once a
   started capture failed for good and delivers nothing any more. Implemented by WASAPI (the worker thread gave up:
@@ -1344,10 +1344,10 @@ Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `
 - **Trust is never cached by the manager.** `HubConfig` / `SenderConfig` carry no `TrustStore`: each engine loads its
   own from `settings.data_dir` and saves the pairings it makes. So `trusted_peers`, `forget_peer`, the key pinning of
   `sender_start` and the `trusted` flag of discovery events (per event) load `trusted.json` afresh; a snapshot from
-  `init_app` would miss those pairings, and `forget_peer` saving it would erase them. Known limit: a *running*
-  engine's own copy does not see a `forget_peer` until it restarts (and a later save by that engine could bring the
-  forgotten peer back). Fixing that needs a shared `TrustStore` field in `HubConfig` / `SenderConfig` (open contract
-  change for feat/core-engine); the UI should restart a running hub after forgetting a peer.
+  `init_app` would miss those pairings, and `forget_peer` saving it would erase them. *(Superseded by §6.4/§6.5:)*
+  `TrustStore::load` now returns the process's one shared store per data directory, so the manager, the hub and
+  the sender all use the same list, and a `forget_peer` reaches running engines at once (the hub disconnects that
+  sender; a sender to that hub ends with `PairingRequired`). No hub restart is needed after forgetting a peer.
 
 **flutter_rust_bridge API** (Dart names: `initApp`, `hubStart`, ...; errors are `AnyhowException` with the
 `FfiError` message).
@@ -1580,8 +1580,8 @@ method call proved the native side exists** — listening to an unregistered `Ev
   merged by `stream_id` keeping arrival order. Mixer controls are optimistic and reverted if the core refuses.
   Sliders offer 0–200 % (the core accepts up to 400 %); the master gain is remembered while the hub is stopped and
   applied after `hubStart` (if that fails, the hub keeps running at unity gain and the error is shown; only a
-  failed `hubStart` itself calls `stopHubService`). **Forgetting a peer while the hub runs restarts the hub**
-  (the §8.5 trust-store limitation: the running hub would still accept the peer and could save it back); saving
+  failed `hubStart` itself calls `stopHubService`). *(Superseded by §8.12:)* forgetting a peer no longer restarts
+  the hub (the shared trust store of §6.4/§6.5 makes the running hub drop it by itself); saving
   settings with the hub running offers "Restart hub" in a snack bar.
 - Pairing sheet: `hubStartPairing` on open, `hubCancelPairing` when closed (a `hubStartPairing` that resolves
   after the sheet was closed is cancelled again); `PairingFailed` keeps the PIN visible
@@ -2065,8 +2065,8 @@ code ..."), so no broadcast config with an empty `hubHost` is written; the hub l
 the broadcast started and to check the hub, not that audio is being sent.
 
 **Trust.** "Forget" also stops a live sender whose target is the forgotten hub and drops its remembered address.
-The hub restart on "Forget" stays until the shared trust store of `fix/core-sec` / `fix/core-engine` is merged;
-then it can go (a running hub then honours a forget by itself).
+The hub is no longer restarted on "Forget" (removed at integration: with the shared trust store of §6.4/§6.5 a
+running hub drops the forgotten device by itself); `TrustedPeersController.forget` returns `Future<void>`.
 
 **Hub and pairing sheet.** Stopping the hub while the pairing sheet is open shows "The hub stopped" with Close
 (`PairingPhase.hubStopped`) instead of an endless spinner. The sheet shows the hub's address (`host:port` from the

@@ -7,11 +7,12 @@
 //! - the Dart event subscriptions (hub events and sender status), which outlive engine
 //!   restarts: a forwarder task per running engine relays its `broadcast` channel to them.
 //!
-//! Trust is never cached: the engines load their own [`TrustStore`] from
-//! `settings.data_dir` and save the pairings they make, so every trust read or change here
-//! (`trusted_peers`, `forget_peer`, `sender_start` key pinning, the discovery `trusted` flag)
-//! loads `trusted.json` afresh. A cached copy would miss pairings made since `init_app`, and
-//! saving it (`forget_peer`) would erase them.
+//! Trust is not cached here: every trust read or change (`trusted_peers`, `forget_peer`,
+//! `sender_start` key pinning, the discovery `trusted` flag) goes through
+//! [`TrustStore::load`] on `settings.data_dir`, which returns the process's one shared store
+//! for that directory (the same one the running hub and sender use) after picking up changes
+//! other processes saved. So a `forget_peer` reaches running engines at once: the hub drops
+//! the forgotten sender's connection and the sender stops streaming to a forgotten hub.
 //!
 //! Event order: a forwarder is subscribed to an engine's channel right after the engine
 //! starts, before anything else, and on stop it is drained (until the engine's channel

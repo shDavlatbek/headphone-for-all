@@ -1113,25 +1113,25 @@ void main() {
       expect(c.read(settingsControllerProvider).value?.bitrate, 96000);
     });
 
-    test('forget restarts a running hub so it drops the peer', () async {
-      final fake = FakeHfaApi(
-        trusted: [
-          const TrustedPeerDto(deviceId: 'a', name: 'A', pairedAtUnix: 1),
-        ],
-      );
-      final c = containerFor(fake);
-      c.listen(trustedPeersProvider, (_, _) {});
-      c.listen(hubControllerProvider, (_, _) {});
-      await c.read(hubControllerProvider.notifier).start();
-      fake.calls.clear();
-      final restarted = await c.read(trustedPeersProvider.notifier).forget('a');
-      expect(restarted, isTrue);
-      expect(
-        fake.calls,
-        containsAllInOrder(['forgetPeer', 'hubStop', 'hubStart']),
-      );
-      expect(c.read(hubControllerProvider).running, isTrue);
-    });
+    test(
+      'forget leaves a running hub running (the core drops the peer)',
+      () async {
+        final fake = FakeHfaApi(
+          trusted: [
+            const TrustedPeerDto(deviceId: 'a', name: 'A', pairedAtUnix: 1),
+          ],
+        );
+        final c = containerFor(fake);
+        c.listen(trustedPeersProvider, (_, _) {});
+        c.listen(hubControllerProvider, (_, _) {});
+        await c.read(hubControllerProvider.notifier).start();
+        fake.calls.clear();
+        await c.read(trustedPeersProvider.notifier).forget('a');
+        expect(fake.calls, contains('forgetPeer'));
+        expect(fake.calls, isNot(contains('hubStop')));
+        expect(c.read(hubControllerProvider).running, isTrue);
+      },
+    );
 
     test('forget stops a live sender that streams to that hub', () async {
       final fake = FakeHfaApi(trusted: [trustedPeer]);

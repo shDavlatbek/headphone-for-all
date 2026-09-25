@@ -3,7 +3,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../api/hfa_api.dart';
 import 'core_providers.dart';
 import 'hub_address_book.dart';
-import 'hub_controller.dart';
 import 'sender_controller.dart';
 
 /// The saved settings.
@@ -42,28 +41,21 @@ class TrustedPeersController extends AsyncNotifier<List<TrustedPeerDto>> {
 
   /// Removes [deviceId] from the trust store and reloads the list.
   ///
-  /// A running hub keeps its own copy of the trust store (CONTRACTS.md
-  /// §8.5): it would still accept the device and could save it back on its
-  /// next pairing. So a running hub is restarted; returns `true` then.
-  ///
-  /// A live sender streaming to that hub is stopped: its engine keeps its
-  /// own trust copy too, and sending to a forgotten hub is not what the
-  /// user asked for.
-  Future<bool> forget(String deviceId) async {
+  /// The core shares one trust store with the running engines (CONTRACTS.md
+  /// §6.4/§6.5): a running hub drops that device's connection by itself, so
+  /// it is not restarted. A live sender streaming to that hub is stopped here
+  /// too, so the UI does not wait for the core to notice.
+  Future<void> forget(String deviceId) async {
     final api = ref.read(hfaApiProvider);
     await api.forgetPeer(deviceId);
     final peers = await api.trustedPeers();
-    if (!ref.mounted) return false;
+    if (!ref.mounted) return;
     state = AsyncData(peers);
     ref.read(hubAddressBookProvider.notifier).forget(deviceId);
     final sender = ref.read(senderControllerProvider);
     if (sender.isLive && sender.target?.deviceId == deviceId) {
       await ref.read(senderControllerProvider.notifier).stop();
-      if (!ref.mounted) return false;
     }
-    if (!ref.read(hubControllerProvider).running) return false;
-    await ref.read(hubControllerProvider.notifier).restart();
-    return true;
   }
 }
 
