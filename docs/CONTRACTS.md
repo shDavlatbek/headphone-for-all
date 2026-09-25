@@ -1032,6 +1032,70 @@ flutter build windows | macos | ios   # on the matching OS (CI)
 Clean up after local builds: `rm -rf app/build app/.dart_tool/flutter_build app/android/.gradle app/android/app/build`
 (cargokit puts its own Rust target directory under `app/build`).
 
+### 8.7 Refinements made by `feat/android` (the code in `app/android` is authoritative)
+
+**Layout.** Kotlin package `io.github.shdavlatbek.hfa`: `MainActivity` (channels), `CaptureCoordinator` (runs the
+capture flow), `CaptureService`, `HubService`, `NativeBridge`, `PlatformEvents` (event sink), `Notifications`,
+`SystemLocks`. Pure logic without Android types lives in `io.github.shdavlatbek.hfa.capture` (`CaptureRequest`,
+`CaptureStateMachine`, `CaptureLoop` + `PushPolicy` + `HfaCode`, `PcmFormat`, `PlatformEvent`, `CaptureSupport`) and
+has JVM unit tests in `app/android/app/src/test` (JUnit 4). From `app/android` (after `flutter pub get` / a Flutter
+build generated `gradlew` and `local.properties`): `./gradlew -Ptarget-platform=android-arm64 :app:testDebugUnitTest
+:app:lintDebug` — without `-Ptarget-platform`, cargokit also builds the Rust core for armv7 and x86_64 (debug). Lint:
+0 errors; the only warning is "newer Gradle available" (versions stay as `flutter create` set them).
+
+- `MainActivity` extends **`FlutterFragmentActivity`** (a `ComponentActivity`), so the permission and consent dialogs
+  use the activity-result API (`RequestMultiplePermissions`, `StartActivityForResult`). Plugins work unchanged.
+- `NativeBridge` is a Kotlin `object`; `pushPcm` / `pushPcm16` are `@JvmStatic external` (static natives, same JNI
+  names; the Rust side ignores the second JNI argument). `NativeBridge.loadError` is `null` once `libhfa_ffi.so` is
+  loaded (checked before a capture starts, so a missing library is a `captureError`, not a crash).
+
+**`startSystemCapture({feedId, sampleRate, channels})`.**
+- Arguments: `feedId` any unsigned 32-bit value (Dart `int`, passed to JNI with the same bits), `sampleRate`
+  8000..=192000, `channels` 1 or 2 (what `AudioRecord` records). Anything else → `PlatformException` code
+  `invalidArgument`. The service records **exactly this format** (it must equal the `External` feed Dart registered
+  with `sender_start`; the JNI push rejects any other format with `-1`).
+- Flow: RECORD_AUDIO (+ POST_NOTIFICATIONS on API 33+, optional) → MediaProjection consent
+  (`createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())` on API 34+: whole display, no
+  single-app sharing) → `CaptureService` (foreground, type `mediaProjection`, `startForeground` before
+  `getMediaProjection`) → `AudioPlaybackCaptureConfiguration` (MEDIA, GAME, UNKNOWN) → `AudioRecord`
+  (`ENCODING_PCM_FLOAT`, else `PCM_16BIT`; buffer ≥ 2× `getMinBufferSize` and ≥ 4 chunks) → capture thread
+  (`THREAD_PRIORITY_URGENT_AUDIO`) reading **10 ms chunks** into one reused array → `pushPcm` / `pushPcm16`.
+- The result is `true` **only once the service records**. It is `false` when a permission or the consent is refused,
+  when the service fails to start (plus a `captureError` event with the reason), when it does not report within
+  10 s, when `stopSystemCapture` cancels the start, and when another start is still pending. A start while a capture
+  runs replaces it (the old one is stopped silently; new consent is needed: a MediaProjection token is single-use).
+- Push results: `0` ok; `-4` (no sender reads the feed) is dropped silently; `-1` (format rejected) ends the capture
+  at once; other codes end it after 50 in a row (0.5 s). Ends are reported as `captureError`.
+
+**Events** (`hfa/platform/events`): `captureStopped` only when the capture ended **without Dart asking** — the
+notification's Stop action ("Stopped from the notification") or `MediaProjection.Callback.onStop` (the user or the
+system ended the projection, e.g. the Android 15 QPR1+ status-bar chip or screen lock). `captureError` when recording
+fails after the start (`AudioRecord.read` error, engine refusal) or the start failed. `stopSystemCapture` emits
+nothing. Every capture carries a session number, so late reports of a replaced or stopped capture are ignored. Events
+sent while no Dart listener exists are dropped.
+
+**Services.** Both are `exported=false`, `START_NOT_STICKY`, and are stopped with an explicit stop command
+(`startService(ACTION_STOP)` + `stopSelf(startId)`), never `stopService`: stopping a service started with
+`startForegroundService` before it reached `startForeground` crashes the app. Notification channels `hfa_capture`
+("Audio streaming") and `hfa_hub` ("Hub"), importance low; the capture notification has a Stop action.
+- `startHubService` → `HubService` (type `mediaPlayback`): persistent notification, its own `MulticastLock`, a
+  partial wake lock (acquired for 2 h, renewed hourly while held) and a low-latency Wi-Fi lock. No audio focus, no
+  media session (other apps keep playing; Rust plays the mix). If the system refuses the foreground service (app in
+  background) the call fails with `PlatformException` code `serviceFailed`. `stopHubService` releases everything.
+- `CaptureService` also holds a low-latency Wi-Fi lock while it records.
+- `acquireMulticastLock` / `releaseMulticastLock`: one non-reference-counted lock owned by the activity (released when
+  the activity is destroyed). `getDataDir` creates `filesDir/hfa` (`PlatformException` code `io` if it cannot).
+  `captureSupport` → `{supported: SDK_INT >= 29, reason}`. Methods Android does not implement
+  (`writeBroadcastConfig`) answer `notImplemented` (Dart sees `MissingPluginException`).
+
+**Manifest / resources.** Permissions as listed in the WP; `uses-feature` camera, camera.autofocus, microphone and
+wifi are `required=false`. Label `@string/app_name` ("Headphone for All"). Launcher icon: adaptive
+`mipmap-anydpi/ic_launcher.xml` (vector headphone glyph + monochrome layer for themed icons; the Flutter PNG
+mipmaps were removed, minSdk 29 needs no bitmap fallback; `drawable-v21/launch_background.xml` moved to `drawable/`).
+Status-bar icon `drawable/ic_stat_headphone`.
+`app/build.gradle.kts` adds only `testImplementation("junit:junit:4.13.2")`; AGP / Kotlin / Gradle versions are
+unchanged.
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |
