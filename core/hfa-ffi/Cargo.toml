@@ -11,9 +11,14 @@ repository.workspace = true
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = ["bundled-opus"]
+default = ["bundled-opus", "flutter"]
 # Build libopus from bundled source (static). Disable to link the system libopus.
 bundled-opus = ["hfa-core/bundled-opus"]
+# The flutter_rust_bridge API (`api`, the engine manager, generated `frb_generated.rs`).
+# flutter_rust_bridge builds small C shims on Apple targets (`dart-sys`, `oslog`: need Xcode),
+# so `--no-default-features` leaves the API out for `cargo check` of Apple targets on Linux
+# (the C ABI and all engine code are still checked). Every real app build enables it.
+flutter = ["dep:flutter_rust_bridge"]
 
 [dependencies]
 hfa-proto = { workspace = true }
@@ -22,9 +27,33 @@ hfa-capture = { workspace = true }
 hfa-core = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
+thiserror = { workspace = true }
+# The flutter_rust_bridge API returns `anyhow::Result` (Dart: `AnyhowException`).
+anyhow = { workspace = true }
+base64 = { workspace = true }
+flutter_rust_bridge = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { workspace = true }
+
+# On Android and iOS there is no useful stderr: tracing events become `log` records (tracing's
+# `log` feature, used when no subscriber is installed), which flutter_rust_bridge's console
+# logger forwards to logcat / os_log.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tracing = { workspace = true, features = ["log"] }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[test]]
+name = "api_lifecycle"
+required-features = ["flutter"]
+
+[lints.rust]
+# `flutter_rust_bridge_codegen` expands the crate with `--cfg frb_expand`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

@@ -27,6 +27,8 @@ hfa-core = { path = "hfa-core", version = "0.1.0", default-features = false }
 thiserror = "2.0.21"
 anyhow = "1.0.104"
 tracing = "0.1.44"
+# `log` facade: hfa-ffi routes tracing events to logcat / os_log on mobile through it.
+log = "0.4.34"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -107,6 +109,9 @@ objc2-core-foundation = "0.3.2"
 block2 = "0.6.2"
 # Android: JNI exports in hfa-ffi (same major as cpal's Android backend).
 jni = "0.22.4"
+# Flutter <-> Rust bindings (hfa-ffi). Must equal the installed flutter_rust_bridge_codegen
+# version exactly (the generated code checks it at run time).
+flutter_rust_bridge = "=2.13.0"
 
 # --- dev ---
 proptest = "1.11.0"
