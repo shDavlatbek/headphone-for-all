@@ -33,7 +33,7 @@ pub use format::AudioFormat;
 pub use jitter::{JitterBuffer, JitterConfig, JitterStats, Pop, PushResult};
 pub use meter::{Level, LevelMeter};
 pub use mixer::{Mixer, MixerConfig, SourceId};
-pub use opus::{OpusConfig, OpusDecoder, OpusEncoder};
+pub use opus::{packet_has_fec, OpusConfig, OpusDecoder, OpusEncoder};
 pub use resample::StreamResampler;
 pub use tone::SineGenerator;
 

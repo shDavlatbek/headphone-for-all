@@ -4,11 +4,34 @@
 //!
 //! Encoder settings: `OPUS_APPLICATION_AUDIO` (or `RESTRICTED_LOWDELAY` when
 //! [`OpusConfig::low_delay`]), VBR, complexity [`ENCODER_COMPLEXITY`], in-band FEC mode 1 plus
-//! `OPUS_SET_PACKET_LOSS_PERC` when [`OpusConfig::fec`]. Note that libopus only carries in-band
-//! FEC in SILK/hybrid packets: at music bitrates the encoder stays in CELT mode until the
-//! expected loss is high enough (≈ 8 % for music), and for a CELT packet
-//! [`OpusDecoder::decode_fec`] falls back to packet-loss concealment. Both paths always return
-//! the requested number of frames.
+//! `OPUS_SET_PACKET_LOSS_PERC` when [`OpusConfig::fec`].
+//!
+//! # In-band FEC is content dependent
+//!
+//! libopus only carries in-band FEC (SILK "LBRR" data) in SILK/hybrid packets, and its mode
+//! decision depends on the *content*, not just on the settings:
+//!
+//! - **Music-like or stationary input** (tones, most music): the encoder uses CELT at the
+//!   bitrates this app uses, whatever `PACKET_LOSS_PERC` is. Measured with the bundled libopus
+//!   (440 Hz tone, 128/64/32 kbit/s, 5–30 % expected loss, 10/20 ms, even with
+//!   `OPUS_SIGNAL_VOICE` or a wideband cap) only the packets of the encoder's ~300 ms start-up
+//!   carry LBRR; afterwards none do. **Raising the expected loss does not enable FEC for such
+//!   content**, and [`OpusDecoder::decode_fec`] then degrades to packet-loss concealment.
+//! - **Speech-like input** (modulated, voiced): the encoder switches to hybrid mode with LBRR
+//!   once the expected loss is high enough (measured: none at 0–1 %, only in bursts at 5 %,
+//!   most packets at 10 %), at any bitrate.
+//!
+//! Callers that need to know can check a packet with [`packet_has_fec`]. Real protection for
+//! music needs application-level redundancy (e.g. resending the previous packet) rather than
+//! adapting `expected_loss_pct`. [`OpusDecoder::decode_fec`] and [`OpusDecoder::conceal`]
+//! always return the requested number of frames either way.
+//!
+//! # Empty packets
+//!
+//! An empty payload (a `FLAG_DTX` keep-alive) passed to [`OpusDecoder::decode`] is treated
+//! like libopus treats `len == 0`: as a lost frame, i.e. concealed. After silent input (which
+//! is when senders emit DTX) the concealment is silence, and the decoder state stays
+//! consistent for the next real packet.
 
 use std::ffi::{c_int, CStr};
 use std::ptr::NonNull;
@@ -105,6 +128,18 @@ fn plc_frames(out_len: usize, channels: u16, sample_rate: u32) -> Result<usize> 
         });
     }
     Ok(out_len / ch)
+}
+
+/// `true` if `packet` carries in-band FEC (LBRR) data that [`OpusDecoder::decode_fec`] can
+/// use to recover the frame *before* it. `false` for CELT-only, empty or malformed packets.
+/// See the module docs: for music-like content libopus normally produces no FEC.
+pub fn packet_has_fec(packet: &[u8]) -> bool {
+    if packet.is_empty() {
+        return false;
+    }
+    // SAFETY: `packet` is a readable buffer of `len` bytes (clamped to c_int, never beyond
+    // the slice); libopus only reads the TOC and frame headers within it.
+    unsafe { ffi::opus_packet_has_lbrr(packet.as_ptr(), len_c_int(packet.len())) > 0 }
 }
 
 /// Clamps a buffer length to what libopus accepts as `c_int`.
@@ -415,11 +450,12 @@ impl OpusDecoder {
     /// # Errors
     /// [`crate::AudioError::Opus`] on a corrupt packet.
     ///
-    /// An empty `packet` is rejected with `OPUS_BAD_ARG` (use [`OpusDecoder::conceal`] for a
-    /// lost frame).
+    /// An empty `packet` (a DTX keep-alive) is concealed exactly like
+    /// [`OpusDecoder::conceal`]: it writes `out.len() / channels` frames, which must then be a
+    /// non-zero multiple of 2.5 ms ([`crate::AudioError::BufferSize`] otherwise).
     pub fn decode(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize> {
         if packet.is_empty() {
-            return Err(opus_error(ffi::OPUS_BAD_ARG));
+            return self.conceal(out);
         }
         self.decode_raw(Some(packet), out, false)
     }
@@ -560,9 +596,49 @@ mod tests {
         assert!((f - 1000.0).abs() < 1.0, "decoded frequency {f}");
     }
 
+    /// Deterministic speech-like stereo signal: a 150 Hz voiced tone plus noise under a
+    /// 4 Hz "syllable" envelope. libopus classifies it as speech (hybrid mode with LBRR).
+    fn speech_like(frames: usize, fs: usize) -> Vec<Vec<f32>> {
+        let mut state: u32 = 1;
+        let mut t = 0_usize;
+        (0..frames)
+            .map(|_| {
+                let mut pcm = vec![0.0_f32; fs * 2];
+                for f in pcm.chunks_exact_mut(2) {
+                    let sec = t as f64 / 48_000.0;
+                    let env = (0.5 + 0.5 * (std::f64::consts::TAU * 4.0 * sec).sin()).powi(2);
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let noise = f64::from(state >> 8) / f64::from(1_u32 << 24) - 0.5;
+                    let v = env * (0.3 * (std::f64::consts::TAU * 150.0 * sec).sin() + 0.1 * noise);
+                    f[0] = v as f32;
+                    f[1] = v as f32;
+                    t += 1;
+                }
+                pcm
+            })
+            .collect()
+    }
+
+    /// Encodes every frame of `pcm` with `cfg`.
+    fn encode_all(cfg: OpusConfig, pcm: &[Vec<f32>]) -> Vec<Vec<u8>> {
+        let mut enc = OpusEncoder::new(cfg).unwrap();
+        pcm.iter()
+            .map(|frame| {
+                let mut p = vec![0_u8; MAX_OPUS_PACKET];
+                let n = enc.encode(frame, &mut p).unwrap();
+                p.truncate(n);
+                p
+            })
+            .collect()
+    }
+
+    fn rms_diff(a: &[f32], b: &[f32]) -> f64 {
+        let d: Vec<f32> = a.iter().zip(b).map(|(x, y)| x - y).collect();
+        rms(&d)
+    }
+
     #[test]
     fn fec_and_plc_return_frame_counts() {
-        // Low bitrate + high expected loss makes libopus use SILK/hybrid with real LBRR data.
         for cfg in [
             OpusConfig {
                 bitrate: 32_000,
@@ -572,23 +648,21 @@ mod tests {
             },
             OpusConfig::default(),
         ] {
-            let mut enc = OpusEncoder::new(cfg).unwrap();
             let mut dec = OpusDecoder::new(48_000, 2).unwrap();
-            let fs = enc.frame_samples();
+            let fs = cfg.frame_ms as usize * 48;
             let mut gen = SineGenerator::new(440.0, 0.3, AudioFormat::INTERNAL);
-            let mut pcm = vec![0.0; fs * 2];
+            let pcm: Vec<Vec<f32>> = (0..50)
+                .map(|_| {
+                    let mut f = vec![0.0; fs * 2];
+                    gen.fill(&mut f);
+                    f
+                })
+                .collect();
+            let pkts = encode_all(cfg, &pcm);
             let mut out = vec![0.0; fs * 2];
-            let mut pkts = Vec::new();
-            for _ in 0..50 {
-                gen.fill(&mut pcm);
-                let mut p = vec![0_u8; MAX_OPUS_PACKET];
-                let n = enc.encode(&pcm, &mut p).unwrap();
-                p.truncate(n);
-                pkts.push(p);
-            }
             for (i, p) in pkts.iter().enumerate() {
                 if i % 7 == 3 {
-                    // Lost: recover it from the next packet's FEC.
+                    // Lost: recover it from the next packet (FEC if present, else PLC).
                     assert_eq!(dec.decode_fec(&pkts[i + 1], &mut out).unwrap(), fs);
                 } else if i % 11 == 5 {
                     assert_eq!(dec.conceal(&mut out).unwrap(), fs);
@@ -600,12 +674,111 @@ mod tests {
             // PLC for a sub-frame multiple of 2.5 ms.
             let mut short = vec![0.0; 120 * 2];
             assert_eq!(dec.conceal(&mut short).unwrap(), 120);
-            // FEC after a real loss produces non-silent audio when SILK carried LBRR.
-            dec.reset();
-            assert_eq!(dec.decode(&pkts[10], &mut out).unwrap(), fs);
-            assert_eq!(dec.decode_fec(&pkts[12], &mut out).unwrap(), fs);
-            assert!(rms(&out) > 0.01, "recovered frame is silent");
         }
+    }
+
+    #[test]
+    fn fec_recovers_speech_like_frames_better_than_plc() {
+        let cfg = OpusConfig {
+            expected_loss_pct: 20,
+            ..OpusConfig::default()
+        };
+        let fs = 480;
+        let pcm = speech_like(200, fs);
+        let pkts = encode_all(cfg, &pcm);
+        // In steady state most packets carry LBRR for speech-like content.
+        let with_fec = pkts[60..].iter().filter(|p| packet_has_fec(p)).count();
+        assert!(with_fec > 70, "only {with_fec}/140 packets carry FEC");
+        // Reference: every packet decoded normally.
+        let mut reference = Vec::new();
+        let mut dec = OpusDecoder::new(48_000, 2).unwrap();
+        let mut out = vec![0.0; fs * 2];
+        for p in &pkts {
+            dec.decode(p, &mut out).unwrap();
+            reference.push(out.clone());
+        }
+        // Lose frames whose successor carries FEC; compare FEC vs PLC against the reference.
+        let lost: Vec<usize> = (80..190)
+            .filter(|&k| packet_has_fec(&pkts[k + 1]))
+            .step_by(6)
+            .collect();
+        assert!(lost.len() >= 5);
+        let (mut err_fec, mut err_plc) = (0.0, 0.0);
+        for &k in &lost {
+            let mut fec_dec = OpusDecoder::new(48_000, 2).unwrap();
+            let mut plc_dec = OpusDecoder::new(48_000, 2).unwrap();
+            for p in &pkts[..k] {
+                fec_dec.decode(p, &mut out).unwrap();
+                plc_dec.decode(p, &mut out).unwrap();
+            }
+            let mut fec_out = vec![0.0; fs * 2];
+            let mut plc_out = vec![0.0; fs * 2];
+            assert_eq!(fec_dec.decode_fec(&pkts[k + 1], &mut fec_out).unwrap(), fs);
+            assert_eq!(plc_dec.conceal(&mut plc_out).unwrap(), fs);
+            err_fec += rms_diff(&fec_out, &reference[k]);
+            err_plc += rms_diff(&plc_out, &reference[k]);
+        }
+        assert!(
+            err_fec < 0.7 * err_plc,
+            "FEC error {err_fec} is not clearly below PLC error {err_plc}"
+        );
+    }
+
+    #[test]
+    fn stationary_tone_carries_no_fec_after_start_up() {
+        // Documents the libopus behaviour described in the module docs: raising the expected
+        // loss does not make CELT-coded music-like content carry FEC.
+        for loss in [5, 30] {
+            let cfg = OpusConfig {
+                expected_loss_pct: loss,
+                ..OpusConfig::default()
+            };
+            let mut gen = SineGenerator::new(440.0, 0.3, AudioFormat::INTERNAL);
+            let pcm: Vec<Vec<f32>> = (0..200)
+                .map(|_| {
+                    let mut f = vec![0.0; 960];
+                    gen.fill(&mut f);
+                    f
+                })
+                .collect();
+            let pkts = encode_all(cfg, &pcm);
+            assert!(
+                pkts[60..].iter().all(|p| !packet_has_fec(p)),
+                "loss {loss}%: steady-state tone packets unexpectedly carry FEC"
+            );
+        }
+        assert!(!packet_has_fec(&[]));
+        assert!(!packet_has_fec(&[0xFF, 0xFF, 0xFF]));
+    }
+
+    #[test]
+    fn empty_packet_is_concealed_as_dtx() {
+        let cfg = OpusConfig::default();
+        let silence = vec![vec![0.0_f32; 960]; 20];
+        let mut tone = SineGenerator::new(440.0, 0.3, AudioFormat::INTERNAL);
+        let loud: Vec<Vec<f32>> = (0..5)
+            .map(|_| {
+                let mut f = vec![0.0; 960];
+                tone.fill(&mut f);
+                f
+            })
+            .collect();
+        let pkts = encode_all(cfg, &[silence, loud].concat());
+        let mut dec = OpusDecoder::new(48_000, 2).unwrap();
+        let mut out = vec![0.0; 960];
+        for p in &pkts[..20] {
+            dec.decode(p, &mut out).unwrap();
+        }
+        // DTX keep-alives during silence: one frame of (near) silence each.
+        for _ in 0..5 {
+            assert_eq!(dec.decode(&[], &mut out).unwrap(), 480);
+            assert!(rms(&out) < 1e-3, "DTX frame not silent: {}", rms(&out));
+        }
+        // The next real packets decode normally.
+        for p in &pkts[20..] {
+            assert_eq!(dec.decode(p, &mut out).unwrap(), 480);
+        }
+        assert!(rms(&out) > 0.1);
     }
 
     #[test]
@@ -653,9 +826,10 @@ mod tests {
             })
         );
         let mut dec = OpusDecoder::new(48_000, 2).unwrap();
+        // An empty packet is concealment, which needs a 2.5 ms multiple.
         assert!(matches!(
-            dec.decode(&[], &mut [0.0; 960]),
-            Err(AudioError::Opus { .. })
+            dec.decode(&[], &mut [0.0; 101]),
+            Err(AudioError::BufferSize { .. })
         ));
         // A corrupt packet is an Opus error, not a panic.
         let mut garbage_out = [0.0; 960];
