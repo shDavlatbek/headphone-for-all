@@ -85,7 +85,16 @@ pub async fn run(args: SelftestArgs) -> anyhow::Result<()> {
     };
 
     let run = run_session(&args, senders, seed, tmp.path(), &wav).await?;
-    let report = analyse(&args, senders, &wav, &run)?;
+    let timeline = Timeline {
+        t0: run.t0.saturating_duration_since(run.origin).as_secs_f64(),
+        onset: run
+            .onset
+            .map(|o| o.saturating_duration_since(run.origin).as_secs_f64()),
+    };
+    let (seconds, loss, path) = (args.seconds, args.loss, wav.clone());
+    let report =
+        crate::commands::blocking(move || analyse(seconds, loss, senders, &path, timeline))
+            .await??;
     print_report(&args, &wav, &run, &report);
     if report.failures.is_empty() {
         println!("\nResult: PASS");
@@ -391,6 +400,12 @@ struct Report {
     failures: Vec<String>,
 }
 
+/// The amplitude sender 1's onset is detected against: its tone's median amplitude in the
+/// output, or `None` when the tone is missing (below [`PRESENCE`] × `expected`).
+fn onset_reference(measured: Option<f64>, expected: f64) -> Option<f64> {
+    measured.filter(|a| *a >= PRESENCE * expected)
+}
+
 /// Amplitude of each tone: −12 dBFS, lowered with many senders so that the mix never
 /// reaches the hub's limiter (whose gain changes would distort the tones).
 fn tone_amplitude(senders: usize) -> f64 {
@@ -405,34 +420,44 @@ pub fn glitch_budget(loss_pct: f32, seconds: f64, senders: usize) -> usize {
     (BASE_GLITCHES + GLITCHES_PER_LOST_PACKET * lost).floor() as usize
 }
 
+/// Where the analysed events lie in the hub's WAV (seconds from its first sample).
+#[derive(Debug, Clone, Copy)]
+struct Timeline {
+    /// The last sender started streaming.
+    t0: f64,
+    /// Capture time of sender 1's first tone sample.
+    onset: Option<f64>,
+}
+
+/// Analyses the hub's WAV (blocking: file reads and signal processing). Only the left
+/// channel of the needed range is loaded.
 fn analyse(
-    args: &SelftestArgs,
+    seconds: u32,
+    loss: f32,
     senders: usize,
     wav: &Path,
-    run: &Session,
+    timeline: Timeline,
 ) -> anyhow::Result<Report> {
-    let (format, samples) = hfa_audio::wav::read_wav(wav)
+    let from = timeline.t0 + WARM_UP.as_secs_f64();
+    let to = from + f64::from(seconds);
+    // The onset search window: from the capture of the onset, one second long.
+    let search = timeline.onset.map(|c| (c, c + 1.0));
+    let start = search.map_or(from, |(c, _)| c.min(from));
+    let end = search.map_or(to, |(_, e)| e.max(to));
+    let left = analysis::read_left(wav, start, end)
         .with_context(|| format!("cannot read the hub's output {}", wav.display()))?;
-    if format != AudioFormat::INTERNAL {
-        bail!("unexpected WAV format {format:?}");
-    }
-    let left: Vec<f32> = samples.chunks_exact(2).map(|f| f[0]).collect();
-    let t0 = run.t0.saturating_duration_since(run.origin).as_secs_f64();
-    let from = t0 + WARM_UP.as_secs_f64();
-    let to = from + f64::from(args.seconds);
-    let segment = analysis::slice(&left, from, to);
+    let segment = analysis::slice(&left, from - start, to - start);
     let analysed_s = segment.len() as f64 / analysis::RATE;
     let freqs: Vec<f64> = FREQUENCIES.iter().take(senders).copied().collect();
     let glitches = analysis::glitches(segment, &freqs);
     let dropout_ms = analysis::longest_dropout_ms(segment);
     let expected_amplitude = tone_amplitude(senders);
-    let glitch_budget = glitch_budget(args.loss, f64::from(args.seconds), senders);
+    let glitch_budget = glitch_budget(loss, f64::from(seconds), senders);
 
     let mut failures = Vec::new();
-    if analysed_s + 0.05 < f64::from(args.seconds) {
+    if analysed_s + 0.05 < f64::from(seconds) {
         failures.push(format!(
-            "the output holds only {analysed_s:.2} s of the {} s to analyse",
-            args.seconds
+            "the output holds only {analysed_s:.2} s of the {seconds} s to analyse"
         ));
     }
     for (freq, amp) in freqs.iter().zip(&glitches.amplitudes) {
@@ -445,28 +470,28 @@ fn analyse(
     }
     if glitches.events > glitch_budget {
         failures.push(format!(
-            "{} glitches (budget {glitch_budget} for {} % loss)",
-            glitches.events, args.loss
+            "{} glitches (budget {glitch_budget} for {loss} % loss)",
+            glitches.events
         ));
     }
     if glitches.bad_windows > WINDOWS_PER_GLITCH * glitch_budget {
         failures.push(format!(
-            "{} of {} analysis windows are abnormal (at most {} allowed for {} % loss)",
+            "{} of {} analysis windows are abnormal (at most {} allowed for {loss} % loss)",
             glitches.bad_windows,
             glitches.windows,
             WINDOWS_PER_GLITCH * glitch_budget,
-            args.loss
         ));
     }
 
     // Latency: where sender 1's onset appears in the output vs. when it was captured.
     // A block pulled from the ring at time t plays during [t, t + block): sample n of the
     // WAV leaves the output at n / rate + one block.
-    let latency_ms = run.onset.and_then(|onset| {
-        let captured = onset.saturating_duration_since(run.origin).as_secs_f64();
-        let search = analysis::slice(&left, captured, captured + 1.0);
-        let reference = glitches.amplitudes.first().copied()?;
-        analysis::onset(search, FREQUENCIES[0], reference)
+    // The reference is the tone's level in the output; a missing tone has no onset (half of
+    // a zero reference would match the first window of silence).
+    let reference = onset_reference(glitches.amplitudes.first().copied(), expected_amplitude);
+    let latency_ms = search.zip(reference).and_then(|((c, e), reference)| {
+        let window = analysis::slice(&left, c - start, e - start);
+        analysis::onset(window, FREQUENCIES[0], reference)
             .map(|t| (t + f64::from(OUTPUT_BLOCK_MS) / 1000.0) * 1000.0)
     });
     if latency_ms.is_none() {
@@ -607,6 +632,70 @@ mod tests {
             assert!(tone_amplitude(k) * k as f64 <= MAX_MIX_PEAK + 1e-9);
         }
         assert!((tone_amplitude(8) * 8.0 - MAX_MIX_PEAK).abs() < 1e-9);
+    }
+
+    /// Writes a stereo WAV of `seconds` holding `tones` (frequency, amplitude, start s).
+    fn write_mix(path: &Path, seconds: f64, tones: &[(f64, f64, f64)]) {
+        let mut w = hfa_audio::wav::WavWriter::create(path, AudioFormat::INTERNAL).unwrap();
+        let data: Vec<f32> = (0..analysis::index(seconds))
+            .flat_map(|n| {
+                let t = n as f64 / analysis::RATE;
+                let v: f64 = tones
+                    .iter()
+                    .filter(|(_, _, start)| t >= *start)
+                    .map(|(f, a, _)| a * (std::f64::consts::TAU * f * t).sin())
+                    .sum();
+                [v as f32, v as f32]
+            })
+            .collect();
+        w.write(&data).unwrap();
+        w.finalize().unwrap();
+    }
+
+    #[test]
+    fn a_clean_synthetic_mix_passes_with_its_onset_latency() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("mix.wav");
+        let a = tone_amplitude(2);
+        // Sender 1 captured its onset at 0.5 s; it reaches the output 60 ms later.
+        write_mix(&wav, 3.0, &[(440.0, a, 0.56), (1000.0, a, 0.0)]);
+        let timeline = Timeline {
+            t0: 0.0,
+            onset: Some(0.5),
+        };
+        let r = analyse(1, 0.0, 2, &wav, timeline).unwrap();
+        assert!(r.failures.is_empty(), "{:?}", r.failures);
+        let latency = r.latency_ms.expect("latency");
+        let expected = 60.0 + f64::from(OUTPUT_BLOCK_MS);
+        assert!((latency - expected).abs() < 2.0, "{latency}");
+    }
+
+    #[test]
+    fn a_missing_first_tone_reports_no_latency() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("mix.wav");
+        write_mix(&wav, 3.0, &[(1000.0, tone_amplitude(2), 0.0)]);
+        let timeline = Timeline {
+            t0: 0.0,
+            onset: Some(0.5),
+        };
+        let r = analyse(1, 0.0, 2, &wav, timeline).unwrap();
+        assert!(r.latency_ms.is_none(), "{:?}", r.latency_ms);
+        assert!(
+            r.failures
+                .iter()
+                .any(|f| f.contains("440 Hz tone is missing")),
+            "{:?}",
+            r.failures
+        );
+        assert!(
+            r.failures.iter().any(|f| f.contains("onset")),
+            "{:?}",
+            r.failures
+        );
+        assert_eq!(onset_reference(Some(0.0), 0.25), None);
+        assert_eq!(onset_reference(Some(0.2), 0.25), Some(0.2));
+        assert_eq!(onset_reference(None, 0.25), None);
     }
 
     #[test]

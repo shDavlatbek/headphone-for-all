@@ -1136,6 +1136,13 @@ impl HubHandle {
         self.shared.pairing.start(DEFAULT_PAIRING_TTL)
     }
 
+    /// The open pairing window, or `None` when none is open (never opened, cancelled,
+    /// expired, consumed by a successful pairing, or closed after
+    /// [`crate::pairing::MAX_FAILED_ATTEMPTS`] unsuccessful attempts).
+    pub fn current_pairing(&self) -> Option<PairingInfo> {
+        self.shared.pairing.current()
+    }
+
     /// Closes the pairing window.
     pub fn cancel_pairing(&self) {
         self.shared.pairing.cancel();

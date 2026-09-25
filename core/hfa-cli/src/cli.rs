@@ -17,7 +17,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     pub data_dir: Option<PathBuf>,
 
-    /// More logging (-v: debug, -vv: trace). `RUST_LOG` overrides it.
+    /// More logging (-v: info, -vv: debug, -vvv: trace). `RUST_LOG` overrides it.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
@@ -153,8 +153,8 @@ pub enum TrustCommand {
 /// `hfa selftest`.
 #[derive(Debug, Args)]
 pub struct SelftestArgs {
-    /// Test duration in seconds.
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=3600))]
+    /// Seconds of audio to analyse (at most 600: the hub's WAV takes 23 MB per minute).
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=600))]
     pub seconds: u32,
 
     /// Simulated packet loss in percent (0-100).
@@ -366,6 +366,13 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn help_matches_the_log_levels() {
+        // main.rs::default_filter: -v info, -vv debug, -vvv trace.
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("-v: info, -vv: debug, -vvv: trace"), "{help}");
     }
 
     #[test]

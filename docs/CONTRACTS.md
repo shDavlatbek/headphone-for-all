@@ -918,7 +918,7 @@ Modules:
   `CaptureTarget::from_str`; `--bitrate` 6000..=510000; `--frame-ms` 10|20; extra `--label`.
   `--to` parses into `cli::HostPort { host, port }` (`host`, `host:port`, bare IPv6, `[ipv6]:port`; default port 47810).
 - `hub --out` parses with `OutputTarget::from_str`. `discover --timeout <s>` (default 3).
-  `selftest --seconds` 1..=3600 (default 5), `--loss` 0..=100 % (default 0), `--jitter` ms (default 0).
+  `selftest --seconds` 1..=3600 (default 5; 1..=600 since feat/cli, §7.2), `--loss` 0..=100 % (default 0), `--jitter` ms (default 0).
 - Files: `src/main.rs` (runtime + tracing + dispatch), `src/cli.rs` (clap types, tested), `src/commands.rs` (bodies).
 
 ### 7.2 Refinements made by `feat/cli` (the code in `core/hfa-cli` is authoritative)
@@ -928,11 +928,25 @@ Modules:
   `hub.rs`, `send.rs`, `selftest.rs`, `analysis.rs` (WAV analysis), `onset.rs` (selftest tone source),
   `display.rs` (tables, QR code, formatters). `tokio` gains the `signal` feature in `hfa-cli` (Ctrl+C).
 - **Logging:** default filter `warn` (the commands print their own output; logs on stderr would scramble the live
-  table), `-v` info, `-vv` debug, `-vvv` trace; `RUST_LOG` overrides.
+  table), `-v` info, `-vv` debug, `-vvv` trace; `RUST_LOG` overrides. ANSI colours only when stderr is a VT-capable
+  terminal (`display::vt_console`: `TERM` not `dumb`; on Windows `WT_SESSION` or `TERM` set) and `NO_COLOR` is unset
+  or empty.
+- **Data-dir lock:** `hfa hub` and `hfa send` hold a shared advisory lock on `<data_dir>/hfa.lock` (`fs4` 1.1,
+  **new workspace dependency**: std's `File::lock` needs Rust 1.89 > MSRV) for their whole run; `hfa trust remove`
+  takes it exclusively and fails (exit 1) while a hub or sender of that data dir runs, because the engine keeps its
+  own in-memory trust list (the removed device would still be accepted and the next pairing would save it again).
+  Only `hfa` processes take the lock (not the app via `hfa-ffi`).
+- **Ctrl+C:** the first one stops gracefully; a second one while the engine stops exits at once with code 130.
 - **`hfa hub`:** settings from `--data-dir` (`Settings::load_or_default`); `--port`/`--out` override them; output
-  opened with a 20 ms device buffer (as in `hfa-ffi`). `--pair` keeps a pairing window open for the whole session: a
-  new one (new PIN/token) opens after every `PairingCompleted` and when a window expires (not after failed attempts,
-  so the guess budget still closes it). On an ANSI terminal the dashboard (header, PIN/URI/QR, sources table,
+  opened with a 20 ms device buffer (as in `hfa-ffi`). `--pair` opens a pairing window and renews it (new
+  PIN/token) only after a `PairingCompleted` or when it **expired with no failed attempt**. Every `PairingFailed`
+  event (and a lagged event stream) during a window counts as a failed attempt; once the window is closed
+  (`HubHandle::current_pairing()` no longer returns it) after any failed attempt — guess budget used up, or expired —
+  it is **not renewed**, the dashboard shows "Pairing closed after N failed attempt(s) … restart `hfa hub --pair`"
+  instead of the dead PIN, so a guesser gets at most `MAX_FAILED_ATTEMPTS` guesses per `--pair` run (plus those of
+  windows renewed after successful pairings, which only a device knowing the secret can trigger). A window closed
+  early without a failed attempt (a pairing completing, or aborted attempts that revealed nothing) is renewed at its
+  original expiry. The policy lives in `hub::PairingWatch::decide` (unit-tested). On an ANSI terminal the dashboard (header, PIN/URI/QR, sources table,
   last 8 events) is redrawn in place every second; otherwise events are printed as they happen and the table is
   appended every second. QR: `qrcode` 0.14 (**new workspace dependency**, `default-features = false`, text renderer
   only), EC level L, `Dense1x2`, inverted for dark terminals.
@@ -948,7 +962,9 @@ Modules:
   failure.
 - **`hfa discover`** also marks hubs that are in the trust store (when a data dir exists). **`hfa trust remove`** of
   an unknown id fails (exit 1).
-- **`hfa selftest`** extra options: `--senders K` (1..=8, default 2; tones 440, 1000, 2500, 4000, 6000, 1500,
+- **`hfa selftest`** `--seconds` is limited to 1..=600 (the hub's WAV takes 23 MB per minute); the analysis runs in
+  `spawn_blocking` and streams only the left channel of the needed range from the WAV (`analysis::read_left`).
+  Extra options: `--senders K` (1..=8, default 2; tones 440, 1000, 2500, 4000, 6000, 1500,
   3200, 5000 Hz, amplitude `min(0.25, 0.9 / K)` so the mix never reaches the limiter), `--seed N` (impairment seed,
   default random and printed), `--wav PATH` (keep the hub's output; default a temp dir). `--jitter` is limited to
   0..=1000 ms. Timeline: senders start one by one, each paired with a fresh PIN (`HubHandle::start_pairing`); all
@@ -957,16 +973,22 @@ Modules:
   Checks (exit 0 only if all pass): every tone's median amplitude (Hann-windowed Goertzel, 20 ms windows, 10 ms hop)
   ≥ 0.7 × the sent amplitude; glitch events ≤ `2 + 0.2 × expected lost packets` (`loss% × 100 packets/s × seconds ×
   K`) and abnormal windows ≤ 3 × that budget, where a window is abnormal when a tone leaves 0.5..1.5 × its median or
-  the non-tone energy exceeds 2 % (−17 dB) of the tones' energy; the onset of sender 1 must be found. The
+  the non-tone energy exceeds 2 % (−17 dB) of the tones' energy; the onset of sender 1 must be found (it is searched
+  only when the 440 Hz tone is present, against its measured amplitude, so a missing tone reports no latency). The
   end-to-end latency = onset position in the WAV (first 10 ms window reaching half the tone's amplitude) + one WAV
   block − capture time of the onset (relative to the output's `start`, recorded by a wrapping `AudioOutput`).
   Report: proxy counters, per sender `packets_sent`, `StreamCounters` (received, lost, recovered, concealed, late,
   stretched, underruns), the loss the sender saw and the hub's latency estimate.
 - **Tests:** `tests/selftest.rs` (built binary: 3 s clean, 3 s with 5 % loss + 20 ms jitter, and 60 % loss must
   fail), `tests/hub_send.rs` (unix: `hfa hub` + `hfa send` processes, PIN pairing, PIN-less reconnect of the paired
-  device, refusal without PIN, `trust list/remove`, SIGINT → exit 0).
+  device, refusal without PIN, `trust list/remove`, `trust remove` refused while the hub runs, five wrong PINs close
+  pairing for good, SIGINT → exit 0).
 - **Workspace (`core/Cargo.toml`, scaffold-owned, minimal change):** `qrcode = { version = "0.14.1",
-  default-features = false }` in `[workspace.dependencies]`; `hfa-cli` also uses `tempfile` as a normal dependency.
+  default-features = false }` and `fs4 = "1.1.0"` in `[workspace.dependencies]`; `hfa-cli` also uses `tempfile` and
+  `hound` as normal dependencies.
+- **`hfa-core` (feat/core-engine-owned, minimal additive change):** `HubHandle::current_pairing() ->
+  Option<PairingInfo>` (the open window, from `PairingManager::current`), so the CLI sees when the guess budget
+  closed a window.
 
 ## 8. `hfa-ffi` + Flutter app
 

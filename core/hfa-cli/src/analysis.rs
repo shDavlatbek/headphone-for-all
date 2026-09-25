@@ -34,6 +34,42 @@ pub fn slice(x: &[f32], t0: f64, t1: f64) -> &[f32] {
     &x[a..b]
 }
 
+/// Reads the left channel of `[t0, t1)` seconds of a 48 kHz stereo 32-bit float WAV (the
+/// hub's output, [`hfa_audio::AudioFormat::INTERNAL`]) without loading the rest of the file.
+/// The range is clamped to the file.
+///
+/// # Errors
+/// The file cannot be read or has another format.
+pub fn read_left(path: &std::path::Path, t0: f64, t1: f64) -> anyhow::Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let expected = hfa_audio::AudioFormat::INTERNAL;
+    if spec.sample_rate != expected.sample_rate
+        || spec.channels != expected.channels
+        || spec.sample_format != hound::SampleFormat::Float
+        || spec.bits_per_sample != 32
+    {
+        anyhow::bail!(
+            "unexpected WAV format: {} Hz, {} channel(s), {:?} {} bits (want {} Hz stereo f32)",
+            spec.sample_rate,
+            spec.channels,
+            spec.sample_format,
+            spec.bits_per_sample,
+            expected.sample_rate
+        );
+    }
+    let frames = reader.duration() as usize;
+    let a = index(t0).min(frames);
+    let b = index(t1).min(frames).max(a);
+    reader.seek(u32::try_from(a)?)?;
+    let left = reader
+        .samples::<f32>()
+        .take(2 * (b - a))
+        .step_by(2)
+        .collect::<Result<Vec<f32>, _>>()?;
+    Ok(left)
+}
+
 /// Precomputed Hann window of `len` samples and its sum.
 #[derive(Debug, Clone)]
 pub struct Hann {
@@ -188,7 +224,13 @@ pub fn longest_dropout_ms(x: &[f32]) -> f64 {
 /// Time (s, relative to `x`) of the onset of a `freq` tone of steady amplitude `reference`:
 /// the centre of the first 10 ms window (1 ms steps) whose amplitude reaches half of
 /// `reference`. For a step onset that is the onset itself (±1 ms).
+///
+/// `None` if no window reaches it, or if `reference` is not positive (a missing tone has no
+/// onset: half of zero would match the first window of silence).
 pub fn onset(x: &[f32], freq: f64, reference: f64) -> Option<f64> {
+    if reference.is_nan() || reference <= 0.0 {
+        return None;
+    }
     let hann = Hann::new(index(0.010));
     let step = index(0.001);
     (0..)
@@ -272,6 +314,46 @@ mod tests {
         let t = onset(&x, 440.0, 0.25).expect("onset");
         assert!((t - 0.3137).abs() < 0.0015, "{t}");
         assert!(onset(&background, 440.0, 0.25).is_none());
+    }
+
+    #[test]
+    fn a_missing_tone_has_no_onset() {
+        // With a zero reference every window would "reach half of it".
+        let silence = vec![0.0f32; index(0.5)];
+        assert!(onset(&silence, 440.0, 0.0).is_none());
+        assert!(onset(&silence, 440.0, f64::NAN).is_none());
+    }
+
+    #[test]
+    fn reads_only_the_left_channel_of_a_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mix.wav");
+        let fmt = hfa_audio::AudioFormat::INTERNAL;
+        let mut w = hfa_audio::wav::WavWriter::create(&path, fmt).unwrap();
+        // Left = frame index / 1e6, right = -1.
+        let frames = index(1.0);
+        let data: Vec<f32> = (0..frames).flat_map(|n| [n as f32 / 1e6, -1.0]).collect();
+        w.write(&data).unwrap();
+        w.finalize().unwrap();
+
+        let left = read_left(&path, 0.25, 0.5).unwrap();
+        assert_eq!(left.len(), index(0.25));
+        assert_eq!(left[0], index(0.25) as f32 / 1e6);
+        assert!(left.iter().all(|v| *v >= 0.0), "no right-channel samples");
+        // Clamped to the file.
+        assert_eq!(
+            read_left(&path, 0.9, 5.0).unwrap().len(),
+            frames - index(0.9)
+        );
+        assert!(read_left(&path, 2.0, 3.0).unwrap().is_empty());
+
+        let mono = dir.path().join("mono.wav");
+        let mut w =
+            hfa_audio::wav::WavWriter::create(&mono, hfa_audio::AudioFormat::new(48_000, 1))
+                .unwrap();
+        w.write(&[0.0; 480]).unwrap();
+        w.finalize().unwrap();
+        assert!(read_left(&mono, 0.0, 1.0).is_err());
     }
 
     #[test]

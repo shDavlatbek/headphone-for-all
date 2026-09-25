@@ -10,6 +10,7 @@ mod onset;
 mod selftest;
 mod send;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -33,13 +34,24 @@ fn default_filter(verbose: u8) -> &'static str {
     }
 }
 
+/// Colours in log lines only on a VT-capable terminal and without `NO_COLOR`
+/// (<https://no-color.org>), so pipes, files and CI logs get plain text.
+fn log_colours(stderr_is_terminal: bool, no_color: bool) -> bool {
+    !no_color && display::vt_console(stderr_is_terminal)
+}
+
 fn init_tracing(verbose: u8) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_filter(verbose)));
+    let ansi = log_colours(
+        std::io::stderr().is_terminal(),
+        std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
+    );
     // Ignore the error if a subscriber is already installed.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(ansi)
         .try_init();
 }
 
@@ -82,7 +94,13 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::default_filter;
+    use super::{default_filter, log_colours};
+
+    #[test]
+    fn no_colours_off_a_terminal_or_with_no_color() {
+        assert!(!log_colours(false, false), "pipe or file");
+        assert!(!log_colours(true, true), "NO_COLOR");
+    }
 
     #[test]
     fn verbosity_levels() {

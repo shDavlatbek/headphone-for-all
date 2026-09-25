@@ -67,7 +67,9 @@ hfa hub --pair --out device:"USB Audio"   # or a named output (see `hfa devices`
 
 It prints a 6-digit PIN, a `hfa://pair?...` URI and its QR code (for the app), then a live table of
 the connected sources (gain, mute, priority, loss, jitter, buffer, latency, level). Each pairing
-window works for one device; with `--pair` a new one opens after every pairing. Ctrl+C stops the hub.
+window works for one device; with `--pair` a new one opens after every pairing and when a window
+expires unused. After a wrong PIN the window is not renewed (restart `hfa hub --pair` to pair more
+devices), so nobody can keep guessing. Ctrl+C stops the hub (press it again to force-quit).
 
 **2. On every other machine, send its audio** (the PIN is needed only the first time):
 
@@ -85,8 +87,9 @@ fails, or the hub's key does not match.
 
 **Other commands:** `hfa discover` lists hubs on the network, `hfa devices` shows output devices,
 capturable apps and what this OS can capture, `hfa trust list` / `hfa trust remove <id>` manage
-paired devices. `--data-dir <dir>` selects another identity/settings directory, `-v`/`-vv` or
-`RUST_LOG` turn on logging.
+paired devices (stop a running `hfa hub` / `hfa send` of the same data directory before removing a
+device). `--data-dir <dir>` selects another identity/settings directory, `-v`/`-vv`/`-vvv` or
+`RUST_LOG` turn on logging (`NO_COLOR` turns off its colours).
 
 **Selftest** (no audio hardware or network needed): an in-process hub plus tone senders that pair
 with a PIN and stream through a simulated lossy, jittery network; the hub's output is analysed for

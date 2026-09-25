@@ -2,7 +2,7 @@
 //! The larger commands live in `hub.rs`, `send.rs` and `selftest.rs`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -27,6 +27,62 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| anyhow!("background task failed: {e}"))
+}
+
+/// Lock file in the data dir: `hfa hub` and `hfa send` hold a shared lock on it while they
+/// run, `hfa trust remove` takes an exclusive one (see [`DataDirLock`]).
+pub const LOCK_FILE: &str = "hfa.lock";
+
+/// An advisory lock on [`LOCK_FILE`] of a data dir, released on drop (and by the OS when the
+/// process ends, even if it crashes).
+///
+/// A running hub or sender keeps its own copy of the trusted devices in memory: a device
+/// removed from `trusted.json` behind its back would still be accepted, and the next
+/// pairing would write it back. So `hfa hub` / `hfa send` hold a **shared** lock for their
+/// whole run and `hfa trust remove` refuses to change the store unless it gets the
+/// **exclusive** lock.
+#[derive(Debug)]
+pub struct DataDirLock {
+    _file: std::fs::File,
+}
+
+impl DataDirLock {
+    fn open(dir: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(LOCK_FILE))
+    }
+
+    /// Takes the shared lock of a running hub / sender (waits while a `trust remove` holds
+    /// the exclusive lock, which takes milliseconds). Creates `dir` if needed.
+    pub async fn shared(dir: PathBuf) -> anyhow::Result<Self> {
+        let shown = dir.display().to_string();
+        blocking(move || -> std::io::Result<Self> {
+            let file = Self::open(&dir)?;
+            // Fully qualified: std's inherent `File::lock_shared` (Rust 1.89) is above the MSRV.
+            fs4::FileExt::lock_shared(&file)?;
+            Ok(Self { _file: file })
+        })
+        .await?
+        .with_context(|| format!("cannot lock the data dir {shown}"))
+    }
+
+    /// Tries to take the exclusive lock: `Ok(None)` while a hub or sender runs with `dir`.
+    pub fn try_exclusive(dir: &Path) -> anyhow::Result<Option<Self>> {
+        let file = Self::open(dir)
+            .with_context(|| format!("cannot open the lock file in {}", dir.display()))?;
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(fs4::TryLockError::WouldBlock) => Ok(None),
+            Err(fs4::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("cannot lock the data dir {}", dir.display()))
+            }
+        }
+    }
 }
 
 /// Loads the trust store of `dir` (off the async workers).
@@ -176,8 +232,27 @@ pub async fn devices() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `hfa trust list|remove <id>`.
+/// `hfa trust list|remove <id>`. `remove` refuses while a hub or sender runs with the same
+/// data dir (see [`DataDirLock`]).
 pub async fn trust(data_dir: PathBuf, command: TrustCommand) -> anyhow::Result<()> {
+    // Held until the removal is saved, so no hub or sender starts with the old list meanwhile.
+    let _lock = match command {
+        TrustCommand::Remove { .. } if data_dir.exists() => {
+            let dir = data_dir.clone();
+            match blocking(move || DataDirLock::try_exclusive(&dir)).await?? {
+                Some(lock) => Some(lock),
+                None => {
+                    return Err(anyhow!(
+                        "a running `hfa hub` or `hfa send` uses {}; stop it first. It keeps its \
+                         own copy of the trusted devices, so it would still accept the device \
+                         (and its next pairing would save it again)",
+                        data_dir.display()
+                    ))
+                }
+            }
+        }
+        _ => None,
+    };
     let store = load_trust(data_dir.clone()).await?;
     match command {
         TrustCommand::List => {

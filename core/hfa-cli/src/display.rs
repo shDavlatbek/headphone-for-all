@@ -168,6 +168,21 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Whether a stream that `is_terminal` understands ANSI escapes (colours, cursor control): a
+/// terminal whose `TERM` is not `dumb`; on Windows only a VT-capable console (Windows
+/// Terminal sets `WT_SESSION`; MSYS/Cygwin terminals set `TERM`).
+pub fn vt_console(is_terminal: bool) -> bool {
+    if !is_terminal {
+        return false;
+    }
+    let term = std::env::var_os("TERM");
+    if cfg!(windows) {
+        std::env::var_os("WT_SESSION").is_some() || term.is_some_and(|t| t != "dumb")
+    } else {
+        term.is_none_or(|t| t != "dumb")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

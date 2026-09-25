@@ -20,8 +20,9 @@ use hfa_core::{
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::cli::SendArgs;
-use crate::commands::{blocking, hub_addrs};
+use crate::commands::{blocking, hub_addrs, DataDirLock};
 use crate::display::{level, millis, percent};
+use crate::hub::stop_or_force;
 
 /// Interval of the status line.
 const STATUS_INTERVAL: Duration = Duration::from_secs(2);
@@ -42,6 +43,9 @@ struct Target {
 
 /// Runs `hfa send` until Ctrl+C or a fatal error.
 pub async fn run(data_dir: PathBuf, args: SendArgs) -> anyhow::Result<()> {
+    // Held for the whole run: `hfa trust remove` must not edit the trust store behind the
+    // engine's back.
+    let _lock = DataDirLock::shared(data_dir.clone()).await?;
     let dir = data_dir.clone();
     let (settings, trust) = blocking(move || -> hfa_core::Result<_> {
         Ok((Settings::load_or_default(&dir)?, TrustStore::load(&dir)?))
@@ -92,7 +96,7 @@ pub async fn run(data_dir: PathBuf, args: SendArgs) -> anyhow::Result<()> {
         println!("Stopping...");
     }
     let (audio, keepalives) = sender.packets_sent();
-    sender.stop().await;
+    stop_or_force(sender.stop()).await;
     match failed {
         None => {
             println!("Stopped ({audio} audio packets, {keepalives} keep-alives sent).");

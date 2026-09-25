@@ -178,6 +178,16 @@ fn pairing_streaming_and_graceful_stop() {
     let row = hub.expect_line("Test tone");
     assert!(row.contains("active"), "{row}");
 
+    // The running hub keeps its own copy of the trusted devices, so `trust remove` refuses
+    // to change them behind its back.
+    let busy = hfa(hub_dir.path())
+        .args(["trust", "remove", "ab12-cd34-ef56-7890"])
+        .output()
+        .expect("trust remove");
+    assert!(!busy.status.success(), "trust remove while the hub runs");
+    let stderr = String::from_utf8_lossy(&busy.stderr);
+    assert!(stderr.contains("running `hfa hub`"), "{stderr}");
+
     // Paired now: a second sender on the same device needs no PIN.
     let mut second_cmd = hfa(sender_dir.path());
     second_cmd.args([
@@ -240,6 +250,55 @@ fn pairing_streaming_and_graceful_stop() {
         .output()
         .unwrap();
     assert!(!again.status.success(), "removing twice fails");
+}
+
+#[test]
+fn wrong_pins_close_pairing_for_good() {
+    let hub_dir = tempfile::tempdir().unwrap();
+    let sender_dir = tempfile::tempdir().unwrap();
+    let port = free_port().to_string();
+    let mut hub_cmd = hfa(hub_dir.path());
+    hub_cmd.args([
+        "hub",
+        "--out",
+        "null",
+        "--no-mdns",
+        "--pair",
+        "--port",
+        &port,
+    ]);
+    let mut hub = Proc::spawn(hub_cmd);
+    let pin_line = hub.expect_line("PIN: ");
+    let pin = pin_line.rsplit("PIN: ").next().unwrap().trim().to_owned();
+    let wrong = if pin == "000000" { "111111" } else { "000000" };
+    let to = format!("127.0.0.1:{port}");
+    let send = |pin: &str| {
+        hfa(sender_dir.path())
+            .args(["send", "--to", &to, "--pin", pin, "--source", "tone:440"])
+            .output()
+            .expect("run hfa send")
+    };
+    // The core's guess budget: 5 attempts per window.
+    for _ in 0..5 {
+        assert!(!send(wrong).status.success(), "a wrong PIN must fail");
+    }
+    let closed = hub.expect_line("Pairing closed after");
+    assert!(closed.contains("failed attempt"), "{closed}");
+    // Not reopened: the displayed PIN no longer works, and no new PIN is shown even after
+    // a few refreshes.
+    let late = send(&pin);
+    assert!(
+        !late.status.success(),
+        "the old PIN after the budget closed"
+    );
+    hub.expect_line("--- sources ---");
+    hub.expect_line("--- sources ---");
+    let seen = hub.seen.clone();
+    let (code, rest) = hub.interrupt();
+    assert_eq!(code, Some(0));
+    let all: Vec<&String> = seen.iter().chain(&rest).collect();
+    let pins = all.iter().filter(|l| l.contains("PIN: ")).count();
+    assert_eq!(pins, 1, "no second pairing window: {all:#?}");
 }
 
 #[test]

@@ -15,7 +15,7 @@ use hfa_core::{HubConfig, HubEngine, HubEvent, HubHandle, PairingInfo, Settings}
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::cli::HubArgs;
-use crate::commands::blocking;
+use crate::commands::{blocking, DataDirLock};
 use crate::display::{qr_text, sources_table};
 
 /// Device buffer requested from the output (same as the app).
@@ -27,6 +27,9 @@ const RECENT_EVENTS: usize = 8;
 
 /// Runs `hfa hub` until Ctrl+C.
 pub async fn run(data_dir: PathBuf, args: HubArgs) -> anyhow::Result<()> {
+    // Held for the whole run: `hfa trust remove` must not edit the trust store behind the
+    // engine's back.
+    let _lock = DataDirLock::shared(data_dir.clone()).await?;
     let dir = data_dir.clone();
     let mut settings = blocking(move || Settings::load_or_default(&dir))
         .await?
@@ -61,25 +64,39 @@ pub async fn run(data_dir: PathBuf, args: HubArgs) -> anyhow::Result<()> {
         },
     );
     let mut dash = Dashboard::new(header);
-    let mut pairing = if args.pair {
-        Some(open_pairing(&hub, &mut dash))
-    } else {
-        None
-    };
+    let mut pairing = PairingWatch::default();
+    if args.pair {
+        pairing.open(&hub, &mut dash);
+    }
 
     let result = event_loop(&hub, &mut dash, &mut pairing, args.pair).await;
     dash.event("Stopping the hub...".to_owned());
     dash.finish();
-    hub.stop().await;
+    stop_or_force(hub.stop()).await;
     println!("Hub stopped.");
     result
+}
+
+/// Awaits a graceful stop; a second Ctrl+C during it exits the process at once (the first one
+/// replaced the default Ctrl+C handler, so without this a hung stop could only be killed).
+pub async fn stop_or_force(stop: impl std::future::Future<Output = ()>) {
+    tokio::select! {
+        () = stop => {}
+        r = tokio::signal::ctrl_c() => {
+            if r.is_ok() {
+                eprintln!("Interrupted again: exiting without a clean stop.");
+                std::process::exit(130);
+            }
+            // No signal handler: nothing can interrupt the stop, so just wait for it.
+        }
+    }
 }
 
 /// Handles events and refreshes until Ctrl+C.
 async fn event_loop(
     hub: &HubHandle,
     dash: &mut Dashboard,
-    pairing: &mut Option<PairingInfo>,
+    pairing: &mut PairingWatch,
     keep_pairing: bool,
 ) -> anyhow::Result<()> {
     let mut events = hub.events();
@@ -95,34 +112,136 @@ async fn event_loop(
             }
             ev = events.recv() => match ev {
                 Ok(ev) => {
-                    let paired = matches!(ev, HubEvent::PairingCompleted { .. });
                     if let Some(line) = describe_event(&ev) {
                         dash.event(line);
                     }
-                    if paired && keep_pairing {
-                        // A pairing window is single-use: open the next one for the next device.
-                        *pairing = Some(open_pairing(hub, dash));
+                    match ev {
+                        // A pairing window is single-use: open the next one for the next
+                        // device (only a device that knew the secret can trigger this).
+                        HubEvent::PairingCompleted { .. } if keep_pairing => {
+                            pairing.open(hub, dash);
+                        }
+                        HubEvent::PairingFailed { .. } => pairing.failed(),
+                        _ => {}
                     }
                 }
-                Err(RecvError::Lagged(n)) => dash.event(format!("({n} events skipped)")),
+                Err(RecvError::Lagged(n)) => {
+                    // A skipped event may have been a failed attempt: count one.
+                    pairing.failed();
+                    dash.event(format!("({n} events skipped)"));
+                }
                 Err(RecvError::Closed) => anyhow::bail!("the hub stopped unexpectedly"),
             },
             _ = tick.tick() => {
-                if keep_pairing && pairing.as_ref().is_some_and(|p| unix_now() >= p.expires_at_unix) {
-                    dash.event("The pairing window expired; opening a new one.".to_owned());
-                    *pairing = Some(open_pairing(hub, dash));
-                }
+                pairing.check(hub, dash, unix_now());
                 dash.refresh(&sources_table(&hub.sources()));
             }
         }
     }
 }
 
-/// Opens a pairing window and shows it on the dashboard.
-fn open_pairing(hub: &HubHandle, dash: &mut Dashboard) -> PairingInfo {
-    let info = hub.start_pairing();
-    dash.set_pairing(Some(pairing_text(&info)));
-    info
+/// What `hfa hub --pair` does about the window it shows (see [`PairingWatch::decide`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PairingDecision {
+    /// The window is still open.
+    Keep,
+    /// The window expired unused (no failed attempt): open a new one.
+    Reopen,
+    /// Closed before its expiry without a failed attempt: a pairing is completing (its
+    /// `PairingCompleted` event is on the way) or attempts were aborted before a guess could
+    /// be checked. Wait until the original expiry.
+    Wait,
+    /// Closed (expired or guess budget used up) after failed attempts: not reopened, so a
+    /// guesser never gets a fresh budget without the operator's action.
+    Closed { failures: u32 },
+}
+
+/// The pairing window shown by `hfa hub --pair` and the failed attempts seen during it.
+#[derive(Default)]
+struct PairingWatch {
+    /// The window on screen (`None`: none, or closed for good).
+    shown: Option<PairingInfo>,
+    /// `PairingFailed` events since `shown` opened (a lagged event stream counts as one).
+    failures: u32,
+    /// Consecutive checks that found the window closed early (see [`PairingDecision::Wait`]);
+    /// the "closed early" text shows from the second one, so a pairing whose
+    /// `PairingCompleted` event is a moment late does not flash it.
+    waiting: u32,
+}
+
+impl PairingWatch {
+    /// Opens a new window (fresh PIN/token and guess budget) and shows it.
+    fn open(&mut self, hub: &HubHandle, dash: &mut Dashboard) {
+        let info = hub.start_pairing();
+        dash.set_pairing(Some(pairing_text(&info)));
+        self.shown = Some(info);
+        self.failures = 0;
+        self.waiting = 0;
+    }
+
+    /// Counts a failed pairing attempt against the shown window.
+    fn failed(&mut self) {
+        if self.shown.is_some() {
+            self.failures = self.failures.saturating_add(1);
+        }
+    }
+
+    /// Compares the shown window with the hub's (once per second) and acts on it.
+    fn check(&mut self, hub: &HubHandle, dash: &mut Dashboard, now: u64) {
+        let Some(shown) = &self.shown else {
+            return;
+        };
+        match Self::decide(shown, self.failures, hub.current_pairing().as_ref(), now) {
+            PairingDecision::Keep => {}
+            PairingDecision::Reopen => {
+                dash.event("The pairing window expired unused; opening a new one.".to_owned());
+                self.open(hub, dash);
+            }
+            PairingDecision::Wait => {
+                self.waiting = self.waiting.saturating_add(1);
+                if self.waiting == 2 {
+                    let minutes = shown.expires_at_unix.saturating_sub(now).div_ceil(60);
+                    dash.set_pairing(Some(format!(
+                        "Pairing window closed early (a device is completing its pairing, or \
+                         attempts were aborted); a new one opens in {minutes} min.\n"
+                    )));
+                }
+            }
+            PairingDecision::Closed { failures } => {
+                self.shown = None;
+                self.waiting = 0;
+                dash.set_pairing(Some(closed_text(failures)));
+            }
+        }
+    }
+
+    /// The policy: reopen only after a completed pairing (handled on the event) or after a
+    /// window that expired with no failed attempt; after any failed attempt the window stays
+    /// closed, so the core's per-window guess budget bounds guessing for the whole run.
+    fn decide(
+        shown: &PairingInfo,
+        failures: u32,
+        current: Option<&PairingInfo>,
+        now: u64,
+    ) -> PairingDecision {
+        if current.is_some_and(|c| c.token == shown.token) {
+            PairingDecision::Keep
+        } else if failures > 0 {
+            PairingDecision::Closed { failures }
+        } else if now >= shown.expires_at_unix {
+            PairingDecision::Reopen
+        } else {
+            PairingDecision::Wait
+        }
+    }
+}
+
+/// The pairing block once a window closed after failed attempts.
+fn closed_text(failures: u32) -> String {
+    format!(
+        "Pairing closed after {failures} failed attempt(s) (wrong PIN/token); it is not \
+         reopened automatically. Restart `hfa hub --pair` to pair another device.\n"
+    )
 }
 
 /// The pairing block: PIN, URI, QR code and expiry.
@@ -172,17 +291,9 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether stdout understands ANSI cursor control (a terminal; on Windows only a VT-capable
-/// one, e.g. Windows Terminal).
+/// Whether stdout understands ANSI cursor control.
 fn ansi_terminal() -> bool {
-    if !std::io::stdout().is_terminal() {
-        return false;
-    }
-    if cfg!(windows) {
-        std::env::var_os("WT_SESSION").is_some() || std::env::var_os("TERM").is_some()
-    } else {
-        std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
-    }
+    crate::display::vt_console(std::io::stdout().is_terminal())
 }
 
 /// The hub's console output.
@@ -334,6 +445,43 @@ mod tests {
             ..info
         });
         assert!(no_uri.contains("use the PIN"));
+    }
+
+    fn window(token: &str, expires_at_unix: u64) -> PairingInfo {
+        PairingInfo {
+            pin: "123456".into(),
+            token: token.into(),
+            uri: String::new(),
+            expires_at_unix,
+        }
+    }
+
+    #[test]
+    fn pairing_policy_never_renews_a_guessed_window() {
+        let shown = window("a", 1000);
+        let decide = PairingWatch::decide;
+        // Still open.
+        assert_eq!(decide(&shown, 0, Some(&shown), 10), PairingDecision::Keep);
+        assert_eq!(decide(&shown, 3, Some(&shown), 10), PairingDecision::Keep);
+        // Expired unused: renewed.
+        assert_eq!(decide(&shown, 0, None, 1000), PairingDecision::Reopen);
+        // Closed by the guess budget, or expired after failed attempts: closed for good,
+        // also long after the original expiry.
+        assert_eq!(
+            decide(&shown, 5, None, 10),
+            PairingDecision::Closed { failures: 5 }
+        );
+        assert_eq!(
+            decide(&shown, 1, None, 5000),
+            PairingDecision::Closed { failures: 1 }
+        );
+        // Closed early without a failed guess (a pairing completing): wait for its event,
+        // renew only at the original expiry.
+        assert_eq!(decide(&shown, 0, None, 10), PairingDecision::Wait);
+        // Another window replaced it (someone else opened one): not ours to keep.
+        let other = window("b", 2000);
+        assert_eq!(decide(&shown, 0, Some(&other), 10), PairingDecision::Wait);
+        assert!(closed_text(5).contains("5 failed attempt"));
     }
 
     fn sample_source() -> hfa_core::SourceInfo {
