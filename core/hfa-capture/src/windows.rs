@@ -27,8 +27,12 @@
 //! The capture loop waits on `[stop event, audio event]` with a short timeout and drains every
 //! available packet with `GetBuffer`/`ReleaseBuffer`, pushing into the ring without allocating,
 //! locking or logging. The timeout makes the loop robust on systems where loopback streams do not
-//! signal the event. When the device is invalidated (e.g. the default output changes or a
-//! headset is unplugged), the worker re-opens the stream and carries on.
+//! signal the event. When the device is invalidated (e.g. a headset is unplugged or the audio
+//! service restarts), the worker re-opens the stream and carries on. System loopback also
+//! registers an `IMMNotificationClient`: a stream opened on an `IMMDevice` is *not* rerouted by
+//! Windows when the user picks another default output, so `OnDefaultDeviceChanged` signals a third
+//! event and the worker re-opens on the new default endpoint. Unexpected capture errors are
+//! retried a few times before the worker gives up; a later `start` then prepares a fresh worker.
 //!
 //! We always ask WASAPI for **32-bit float, 48 kHz, stereo** with `AUTOCONVERTPCM` (the engine
 //! resamples and down-mixes). If the endpoint refuses that, the system-mix mode falls back to the
@@ -36,30 +40,32 @@
 //! PCM (the format the Microsoft sample uses).
 
 use std::mem::ManuallyDrop;
+use std::ptr::NonNull;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hfa_audio::AudioFormat;
 use windows::core::{implement, IUnknown, Interface, Owned, Ref, GUID, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, E_ACCESSDENIED, E_INVALIDARG,
-    E_NOINTERFACE, E_NOTIMPL, E_POINTER, HANDLE, REGDB_E_CLASSNOTREG, RPC_E_CHANGED_MODE, S_OK,
-    WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
+    E_NOINTERFACE, E_NOTIMPL, E_POINTER, HANDLE, PROPERTYKEY, REGDB_E_CLASSNOTREG,
+    RPC_E_CHANGED_MODE, S_OK, WAIT_EVENT, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, ActivateAudioInterfaceAsync, AudioSessionStateExpired,
+    eConsole, eRender, ActivateAudioInterfaceAsync, AudioSessionStateExpired, EDataFlow, ERole,
     IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
     IAudioSessionControl2, IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED,
-    AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_E_UNSUPPORTED_FORMAT, AUDCLNT_SHAREMODE_SHARED,
-    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
-    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-    DEVICE_STATE_ACTIVE, PROCESS_LOOPBACK_MODE, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_SERVICE_NOT_RUNNING,
+    AUDCLNT_E_UNSUPPORTED_FORMAT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
+    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, DEVICE_STATE, DEVICE_STATE_ACTIVE, PROCESS_LOOPBACK_MODE,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_PCM,
 };
@@ -94,6 +100,14 @@ const BUFFER_DURATION_HNS: i64 = 1_000_000;
 const WAIT_TIMEOUT_MS: u32 = 20;
 /// How long `ActivateAudioInterfaceAsync` may take before we give up.
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Slice in which the activation wait checks the stop event, so `stop` never blocks for long.
+const ACTIVATION_POLL: Duration = Duration::from_millis(50);
+/// Consecutive unexpected capture failures (without a delivered packet in between) after which
+/// the worker gives up.
+const MAX_FAILED_RESTARTS: u32 = 5;
+/// Re-open attempts that land on a different output format before the worker gives up (a device
+/// switch can briefly refuse the preferred float/48 kHz/stereo format).
+const MAX_FORMAT_MISMATCHES: u32 = 10;
 /// Pause between attempts to re-open an invalidated stream.
 const REOPEN_BACKOFF_MS: u32 = 500;
 /// Minimum scratch size (frames) used for format conversion and silence.
@@ -285,12 +299,21 @@ impl CaptureSource for WasapiCapture {
     }
 
     fn start(&mut self, sink: PcmSink) -> crate::Result<()> {
-        if self
-            .worker
-            .as_ref()
-            .is_some_and(|worker| worker.start_tx.is_none())
-        {
-            return Err(CaptureError::AlreadyRunning);
+        if let Some(worker) = self.worker.as_ref() {
+            if worker.start_tx.is_none() {
+                if !worker.thread.is_finished() {
+                    return Err(CaptureError::AlreadyRunning);
+                }
+                // The capture thread gave up (see `run_worker`): reap it and prepare a fresh one
+                // below instead of reporting a dead source as running.
+                tracing::warn!(
+                    mode = %self.mode.describe(),
+                    "WASAPI capture thread had exited; restarting it"
+                );
+                if let Some(dead) = self.worker.take() {
+                    dead.shutdown();
+                }
+            }
         }
         if self.worker.is_none() {
             // Restart after `stop`: prepare a fresh stream. The sender configured itself from
@@ -352,13 +375,26 @@ impl Drop for WasapiCapture {
 // ---------------------------------------------------------------------------------------------
 
 /// Why the capture loop returned.
+#[derive(Debug)]
 enum LoopExit {
     /// The stop event was signalled.
     Stopped,
     /// The endpoint went away (`AUDCLNT_E_DEVICE_INVALIDATED` and friends): re-open.
     Invalidated,
-    /// Any other failure: give up.
+    /// Another endpoint became the default output (system loopback only): re-open on it.
+    DefaultChanged,
+    /// Any other failure: re-open after a pause, a bounded number of times.
     Failed(windows::core::Error),
+}
+
+/// Result of [`reopen`].
+enum Reopened {
+    /// A started stream with the expected output format.
+    Stream(Stream),
+    /// The stop event fired while re-opening.
+    Stopped,
+    /// The endpoint kept delivering another output format.
+    FormatChanged(AudioFormat),
 }
 
 /// Body of the capture thread. Every COM object lives inside [`run_worker`], so it is released
@@ -387,7 +423,23 @@ fn run_worker(
     start_rx: &Receiver<PcmSink>,
     ack_tx: &SyncSender<Result<(), CaptureError>>,
 ) {
-    let mut stream = match Stream::open(mode) {
+    // Register before opening, so a default-device change between open and the first wait is
+    // not missed. Only system loopback is bound to a concrete endpoint.
+    let watch = match mode {
+        Mode::SystemLoopback => match DefaultDeviceWatch::register() {
+            Ok(watch) => Some(watch),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cannot watch default output changes; capture stays on the current device"
+                );
+                None
+            }
+        },
+        Mode::Process { .. } => None,
+    };
+    let reroute = watch.as_ref().map(DefaultDeviceWatch::event);
+    let mut stream = match Stream::open(mode, stop) {
         Ok(stream) => stream,
         Err(e) => {
             let _ = init_tx.send(Err(e));
@@ -404,7 +456,7 @@ fn run_worker(
     };
     if let Err(first) = stream.start() {
         // The endpoint may have changed between open and start: retry once with a fresh stream.
-        let retried = Stream::open(mode).and_then(|fresh| {
+        let retried = Stream::open(mode, stop).and_then(|fresh| {
             if fresh.format.output() == format {
                 fresh.start().map(|()| fresh)
             } else {
@@ -425,46 +477,100 @@ fn run_worker(
 
     let _mmcss = MmcssRegistration::pro_audio();
     let mut scratch = vec![0.0_f32; scratch_len(stream.buffer_frames)];
+    let mut push = |samples: &[f32]| {
+        sink.push(samples);
+    };
+    let mut failures = 0_u32;
     loop {
-        match capture_loop(&stream, &mut sink, stop, &mut scratch) {
-            LoopExit::Stopped => break,
-            LoopExit::Failed(e) => {
-                tracing::error!(error = %e, mode = %mode.describe(), "WASAPI capture failed");
-                break;
-            }
+        let mut delivered = false;
+        let exit = capture_loop(
+            &stream,
+            &mut push,
+            stop,
+            reroute,
+            &mut scratch,
+            &mut delivered,
+        );
+        if delivered {
+            failures = 0;
+        }
+        match exit {
+            LoopExit::Stopped => return,
             LoopExit::Invalidated => {
                 tracing::warn!(mode = %mode.describe(), "audio endpoint invalidated; re-opening");
-                drop(stream);
-                match reopen(mode, format, stop) {
-                    Some(fresh) => {
-                        stream = fresh;
-                        let needed = scratch_len(stream.buffer_frames);
-                        if scratch.len() < needed {
-                            scratch.resize(needed, 0.0);
-                        }
-                        tracing::info!(mode = %mode.describe(), "WASAPI capture resumed");
-                    }
-                    None => return,
+            }
+            LoopExit::DefaultChanged => {
+                tracing::info!(
+                    mode = %mode.describe(),
+                    "default output device changed; re-opening loopback on it"
+                );
+            }
+            LoopExit::Failed(e) => {
+                failures += 1;
+                if failures > MAX_FAILED_RESTARTS {
+                    tracing::error!(
+                        error = %e,
+                        mode = %mode.describe(),
+                        "WASAPI capture keeps failing; giving up (start again to retry)"
+                    );
+                    return;
                 }
+                tracing::warn!(
+                    error = %e,
+                    mode = %mode.describe(),
+                    attempt = failures,
+                    "WASAPI capture failed; re-opening"
+                );
+                if stop.wait(REOPEN_BACKOFF_MS) {
+                    return;
+                }
+            }
+        }
+        drop(stream);
+        match reopen(mode, format, stop) {
+            Reopened::Stream(fresh) => {
+                stream = fresh;
+                let needed = scratch_len(stream.buffer_frames);
+                if scratch.len() < needed {
+                    scratch.resize(needed, 0.0);
+                }
+                tracing::info!(mode = %mode.describe(), "WASAPI capture resumed");
+            }
+            Reopened::Stopped => return,
+            Reopened::FormatChanged(got) => {
+                tracing::error!(
+                    mode = %mode.describe(),
+                    expected = ?format,
+                    got = ?got,
+                    "re-opened endpoint delivers a different format; capture stopped \
+                     (stop and re-open the source to adopt the new format)"
+                );
+                return;
             }
         }
     }
 }
 
-/// Re-opens and starts a stream with the same output format, retrying until it works or the
-/// stop event fires (then `None`).
-fn reopen(mode: Mode, format: AudioFormat, stop: &Event) -> Option<Stream> {
+/// Re-opens and starts a stream with the same output format, retrying every
+/// [`REOPEN_BACKOFF_MS`] until it works, the stop event fires, or the endpoint has delivered a
+/// different format [`MAX_FORMAT_MISMATCHES`] times in a row.
+fn reopen(mode: Mode, format: AudioFormat, stop: &Event) -> Reopened {
+    let mut mismatches = 0_u32;
     loop {
-        match Stream::open(mode).and_then(|s| s.start().map(|()| s)) {
-            Ok(stream) if stream.format.output() == format => return Some(stream),
-            Ok(_) => {
-                tracing::error!("re-opened endpoint delivers a different format; stopping capture");
-                return None;
+        match Stream::open(mode, stop).and_then(|s| s.start().map(|()| s)) {
+            Ok(stream) if stream.format.output() == format => return Reopened::Stream(stream),
+            Ok(stream) => {
+                mismatches += 1;
+                let got = stream.format.output();
+                if mismatches >= MAX_FORMAT_MISMATCHES {
+                    return Reopened::FormatChanged(got);
+                }
+                tracing::debug!(expected = ?format, got = ?got, "re-opened with another format; retrying");
             }
             Err(e) => tracing::debug!(error = %e, "re-opening capture stream failed; retrying"),
         }
         if stop.wait(REOPEN_BACKOFF_MS) {
-            return None;
+            return Reopened::Stopped;
         }
     }
 }
@@ -475,45 +581,68 @@ fn scratch_len(buffer_frames: u32) -> usize {
 }
 
 /// The real-time loop: wait, drain, push. No allocation, locking or logging in here.
-fn capture_loop(
+///
+/// Waits on `[stop, audio]`, plus `reroute` (signalled when the default output changes) when
+/// given. Sets `delivered` once any packet has been pushed.
+fn capture_loop<F: FnMut(&[f32])>(
     stream: &Stream,
-    sink: &mut PcmSink,
+    push: &mut F,
     stop: &Event,
+    reroute: Option<&Event>,
     scratch: &mut [f32],
+    delivered: &mut bool,
 ) -> LoopExit {
-    let handles = [stop.raw(), stream.event.raw()];
+    let all = [
+        stop.raw(),
+        stream.event.raw(),
+        reroute.map_or_else(HANDLE::default, Event::raw),
+    ];
+    let handles = if reroute.is_some() {
+        &all[..]
+    } else {
+        &all[..2]
+    };
+    let reroute_woke = WAIT_EVENT(WAIT_OBJECT_0.0 + 2);
     loop {
-        // SAFETY: both handles are valid event handles owned by `stop` / `stream`, which
-        // outlive this call.
-        let woke = unsafe { WaitForMultipleObjects(&handles, false, WAIT_TIMEOUT_MS) };
+        // SAFETY: every handle in `handles` is a valid event handle owned by `stop`, `stream`
+        // or `reroute`, all of which outlive this call.
+        let woke = unsafe { WaitForMultipleObjects(handles, false, WAIT_TIMEOUT_MS) };
         if woke == WAIT_OBJECT_0 {
             return LoopExit::Stopped;
         }
         if woke == WAIT_FAILED {
             return LoopExit::Failed(windows::core::Error::from_thread());
         }
+        if reroute.is_some() && woke == reroute_woke {
+            return LoopExit::DefaultChanged;
+        }
         // Audio event or timeout: drain whatever is there.
-        if let Err(e) = drain_packets(stream, sink, scratch) {
-            return if is_device_lost(e.code()) {
-                LoopExit::Invalidated
-            } else {
-                LoopExit::Failed(e)
-            };
+        match drain_packets(stream, push, scratch) {
+            Ok(drained) => *delivered |= drained,
+            Err(e) => {
+                return if is_device_lost(e.code()) {
+                    LoopExit::Invalidated
+                } else {
+                    LoopExit::Failed(e)
+                };
+            }
         }
     }
 }
 
-/// Reads every available packet and pushes it into `sink` as stereo `f32`.
-fn drain_packets(
+/// Reads every available packet and pushes it as stereo `f32`. Returns whether any packet was
+/// read.
+fn drain_packets<F: FnMut(&[f32])>(
     stream: &Stream,
-    sink: &mut PcmSink,
+    push: &mut F,
     scratch: &mut [f32],
-) -> windows::core::Result<()> {
+) -> windows::core::Result<bool> {
+    let mut any = false;
     loop {
         // SAFETY: `stream.capture` is a valid, initialised capture client of a started stream.
         let pending = unsafe { stream.capture.GetNextPacketSize()? };
         if pending == 0 {
-            return Ok(());
+            return Ok(any);
         }
         let mut data: *mut u8 = std::ptr::null_mut();
         let mut frames = 0_u32;
@@ -525,17 +654,18 @@ fn drain_packets(
                 .capture
                 .GetBuffer(&mut data, &mut frames, &mut flags, None, None)?
         };
+        any = true;
         let frame_count = frames as usize;
         let silent = flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
         if frame_count > 0 {
             if silent || data.is_null() {
-                push_silence(sink, frame_count * OUT_CHANNELS, scratch);
+                push_silence(push, frame_count * OUT_CHANNELS, scratch);
             } else {
                 let len = frame_count * stream.format.block_align;
                 // SAFETY: after a successful GetBuffer, `data` points at `frames` frames of
                 // `block_align` bytes each, valid until ReleaseBuffer below.
                 let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-                push_converted(sink, &stream.format, bytes, scratch);
+                push_converted(push, &stream.format, bytes, scratch);
             }
         }
         // SAFETY: releases exactly the frames obtained by the GetBuffer call above.
@@ -544,21 +674,27 @@ fn drain_packets(
 }
 
 /// Pushes `samples` zeros (in scratch-sized chunks, without allocating).
-fn push_silence(sink: &mut PcmSink, samples: usize, scratch: &mut [f32]) {
+fn push_silence<F: FnMut(&[f32])>(push: &mut F, samples: usize, scratch: &mut [f32]) {
     let mut left = samples;
     while left > 0 {
         let n = left.min(scratch.len());
-        let Some(chunk) = scratch.get_mut(..n) else {
+        let Some(chunk) = scratch.get_mut(..n).filter(|chunk| !chunk.is_empty()) else {
             return;
         };
         chunk.fill(0.0);
-        sink.push(chunk);
+        push(chunk);
         left -= n;
     }
 }
 
-/// Converts `bytes` (native frames) to stereo `f32` and pushes them.
-fn push_converted(sink: &mut PcmSink, format: &NativeFormat, bytes: &[u8], scratch: &mut [f32]) {
+/// Converts `bytes` (native frames) to stereo `f32` and pushes them (in scratch-sized chunks
+/// unless WASAPI already delivers aligned stereo `f32`).
+fn push_converted<F: FnMut(&[f32])>(
+    push: &mut F,
+    format: &NativeFormat,
+    bytes: &[u8],
+    scratch: &mut [f32],
+) {
     if format.kind == SampleKind::F32
         && format.channels == OUT_CHANNELS
         && bytes.as_ptr().align_offset(std::mem::align_of::<f32>()) == 0
@@ -568,7 +704,7 @@ fn push_converted(sink: &mut PcmSink, format: &NativeFormat, bytes: &[u8], scrat
         // bytes long and every bit pattern is a valid f32.
         let samples =
             unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), bytes.len() / 4) };
-        sink.push(samples);
+        push(samples);
         return;
     }
     let chunk_frames = scratch.len() / OUT_CHANNELS;
@@ -577,8 +713,11 @@ fn push_converted(sink: &mut PcmSink, format: &NativeFormat, bytes: &[u8], scrat
     }
     for chunk in bytes.chunks(chunk_frames * format.block_align) {
         let frames = convert_to_stereo_f32(format, chunk, scratch);
-        if let Some(out) = scratch.get(..frames * OUT_CHANNELS) {
-            sink.push(out);
+        if let Some(out) = scratch
+            .get(..frames * OUT_CHANNELS)
+            .filter(|out| !out.is_empty())
+        {
+            push(out);
         }
     }
 }
@@ -594,8 +733,9 @@ struct Stream {
 }
 
 impl Stream {
-    /// Activates and initialises a stream for `mode`.
-    fn open(mode: Mode) -> Result<Self, CaptureError> {
+    /// Activates and initialises a stream for `mode`. A pending process-loopback activation is
+    /// abandoned as soon as `stop` is signalled.
+    fn open(mode: Mode, stop: &Event) -> Result<Self, CaptureError> {
         match mode {
             Mode::SystemLoopback => Self::open_system_loopback(),
             Mode::Process { pid, include_tree } => {
@@ -604,7 +744,7 @@ impl Stream {
                 } else {
                     PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
                 };
-                Self::open_process_loopback(pid, loopback_mode)
+                Self::open_process_loopback(pid, loopback_mode, stop)
             }
         }
     }
@@ -630,12 +770,16 @@ impl Stream {
         unsafe { Self::initialize(client, mix.as_ptr(), 0) }
     }
 
-    fn open_process_loopback(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> Result<Self, CaptureError> {
+    fn open_process_loopback(
+        pid: u32,
+        mode: PROCESS_LOOPBACK_MODE,
+        stop: &Event,
+    ) -> Result<Self, CaptureError> {
         let float = float_format(TARGET_RATE, OUT_CHANNELS as u16);
         let pcm16 = pcm16_format(TARGET_RATE, OUT_CHANNELS as u16);
         let mut last = None;
         for format in [&float, &pcm16] {
-            let client = activate_process_loopback(pid, mode)?;
+            let client = activate_process_loopback(pid, mode, stop)?;
             // GetMixFormat is not supported on the process-loopback device: always pass an
             // explicit format and let AUTOCONVERTPCM convert.
             // SAFETY: `format` is a complete WAVEFORMATEX (cbSize 0) on this stack frame.
@@ -765,6 +909,114 @@ impl Drop for MixFormat {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Default output change notifications
+// ---------------------------------------------------------------------------------------------
+
+/// `IMMNotificationClient` that signals `changed` when the default console render endpoint
+/// changes. A loopback stream activated on a concrete `IMMDevice` is not rerouted by Windows (only
+/// streams activated on the default-device interface are), and the old endpoint usually stays
+/// valid, so without this the capture would silently stay on the previous device.
+#[implement(IMMNotificationClient)]
+struct DefaultDeviceListener {
+    changed: Arc<Event>,
+}
+
+impl IMMNotificationClient_Impl for DefaultDeviceListener_Impl {
+    fn OnDeviceStateChanged(
+        &self,
+        _device_id: &PCWSTR,
+        _new_state: DEVICE_STATE,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _device_id: &PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, _device_id: &PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnDefaultDeviceChanged(
+        &self,
+        flow: EDataFlow,
+        role: ERole,
+        _default_device_id: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        // We open `GetDefaultAudioEndpoint(eRender, eConsole)`; the callback also fires once
+        // per other role and for capture devices. SetEvent does not block.
+        if is_our_default_change(flow, role) {
+            self.changed.set();
+        }
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(
+        &self,
+        _device_id: &PCWSTR,
+        _key: &PROPERTYKEY,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+/// `true` for the default-device change that affects system loopback.
+fn is_our_default_change(flow: EDataFlow, role: ERole) -> bool {
+    flow == eRender && role == eConsole
+}
+
+/// Registration of a [`DefaultDeviceListener`], unregistered on drop (before the enumerator is
+/// released). Lives on the capture thread (MTA).
+struct DefaultDeviceWatch {
+    enumerator: IMMDeviceEnumerator,
+    listener: IMMNotificationClient,
+    /// Auto-reset event signalled by the listener.
+    changed: Arc<Event>,
+}
+
+impl DefaultDeviceWatch {
+    fn register() -> Result<Self, CaptureError> {
+        let changed = Arc::new(Event::new(false)?);
+        let enumerator = device_enumerator()?;
+        let listener: IMMNotificationClient = DefaultDeviceListener {
+            changed: Arc::clone(&changed),
+        }
+        .into();
+        // SAFETY: valid enumerator and listener on this MTA thread; the registration is undone
+        // in Drop while both are still alive.
+        unsafe { enumerator.RegisterEndpointNotificationCallback(&listener) }.map_err(|e| {
+            map_error(
+                "IMMDeviceEnumerator::RegisterEndpointNotificationCallback",
+                &e,
+            )
+        })?;
+        Ok(Self {
+            enumerator,
+            listener,
+            changed,
+        })
+    }
+
+    fn event(&self) -> &Event {
+        &self.changed
+    }
+}
+
+impl Drop for DefaultDeviceWatch {
+    fn drop(&mut self) {
+        // SAFETY: unregisters the listener registered in `register` on the same enumerator; not
+        // called from inside a notification callback.
+        if let Err(e) = unsafe {
+            self.enumerator
+                .UnregisterEndpointNotificationCallback(&self.listener)
+        } {
+            tracing::debug!(error = %e, "UnregisterEndpointNotificationCallback failed");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Process loopback activation
 // ---------------------------------------------------------------------------------------------
 
@@ -781,6 +1033,10 @@ unsafe impl Send for ActivatedClient {}
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct ActivationHandler {
     done: SyncSender<Result<ActivatedClient, HRESULT>>,
+    /// The activation parameters the pending operation points at. The OS holds a reference to
+    /// this handler until `ActivateCompleted` has run, so owning them here keeps them alive for
+    /// the whole operation even if the waiter gave up (timeout or stop).
+    _params: ActivationParams,
 }
 
 impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
@@ -816,23 +1072,64 @@ fn activation_outcome(
         .map_err(|e| e.code())
 }
 
-/// Activates an `IAudioClient` on the process-loopback virtual device and waits for it.
-fn activate_process_loopback(
-    pid: u32,
-    mode: PROCESS_LOOPBACK_MODE,
-) -> Result<IAudioClient, CaptureError> {
-    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
-        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
-            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-                TargetProcessId: pid,
-                ProcessLoopbackMode: mode,
+/// The process-loopback `AUDIOCLIENT_ACTIVATION_PARAMS` and the `VT_BLOB` `PROPVARIANT` that
+/// points at them.
+struct ActivationParamsData {
+    params: AUDIOCLIENT_ACTIVATION_PARAMS,
+    prop: PROPVARIANT,
+}
+
+/// Owner of a heap-allocated [`ActivationParamsData`] at a fixed address (the `PROPVARIANT`
+/// points into the same allocation, so it must never move). Freed on drop.
+struct ActivationParams(NonNull<ActivationParamsData>);
+
+impl ActivationParams {
+    fn new(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> Self {
+        let data = Box::new(ActivationParamsData {
+            params: AUDIOCLIENT_ACTIVATION_PARAMS {
+                ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+                Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                    ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                        TargetProcessId: pid,
+                        ProcessLoopbackMode: mode,
+                    },
+                },
             },
-        },
-    };
-    // A VT_BLOB PROPVARIANT pointing at `params`. It is never passed to PropVariantClear (the
-    // windows-crate PROPVARIANT has no Drop), so the stack blob is not freed by COM.
-    let prop = PROPVARIANT {
+            prop: PROPVARIANT::default(),
+        });
+        let ptr = NonNull::from(Box::leak(data));
+        let raw = ptr.as_ptr();
+        // SAFETY: `raw` comes from a leaked Box, so it is valid, aligned and uniquely owned by
+        // us; we only take field addresses and overwrite the (Drop-free) default PROPVARIANT.
+        unsafe {
+            let blob_data = std::ptr::addr_of_mut!((*raw).params).cast::<u8>();
+            (*raw).prop = blob_propvariant(
+                blob_data,
+                std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+            );
+        }
+        Self(ptr)
+    }
+
+    /// The `VT_BLOB` PROPVARIANT, valid while `self` lives.
+    fn prop(&self) -> *const PROPVARIANT {
+        // SAFETY: the allocation is live until `self` drops; only a field address is taken.
+        unsafe { std::ptr::addr_of!((*self.0.as_ptr()).prop) }
+    }
+}
+
+impl Drop for ActivationParams {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `Box::leak` in `new` and is reclaimed exactly once. The
+        // PROPVARIANT's blob points into this allocation, so it is not PropVariantClear'ed
+        // (the windows-crate PROPVARIANT has no Drop).
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
+/// A `VT_BLOB` PROPVARIANT pointing at `len` bytes at `data` (not owned by the PROPVARIANT).
+fn blob_propvariant(data: *mut u8, len: u32) -> PROPVARIANT {
+    PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
             Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
                 vt: VT_BLOB,
@@ -841,42 +1138,78 @@ fn activate_process_loopback(
                 wReserved3: 0,
                 Anonymous: PROPVARIANT_0_0_0 {
                     blob: BLOB {
-                        cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-                        pBlobData: std::ptr::addr_of_mut!(params).cast::<u8>(),
+                        cbSize: len,
+                        pBlobData: data,
                     },
                 },
             }),
         },
-    };
+    }
+}
+
+/// The error returned when `stop` interrupts a pending activation.
+fn activation_cancelled() -> CaptureError {
+    CaptureError::Backend("process loopback activation cancelled by stop".to_owned())
+}
+
+/// Activates an `IAudioClient` on the process-loopback virtual device and waits for it (up to
+/// [`ACTIVATION_TIMEOUT`], returning early when `stop` is signalled).
+fn activate_process_loopback(
+    pid: u32,
+    mode: PROCESS_LOOPBACK_MODE,
+    stop: &Event,
+) -> Result<IAudioClient, CaptureError> {
+    if stop.wait(0) {
+        return Err(activation_cancelled());
+    }
+    let params = ActivationParams::new(pid, mode);
+    let prop = params.prop();
     let (done_tx, done_rx) = mpsc::sync_channel(1);
-    let handler: IActivateAudioInterfaceCompletionHandler =
-        ActivationHandler { done: done_tx }.into();
+    // The handler owns `params`: the heap allocation `prop` points at does not move and lives
+    // as long as the handler, i.e. until the OS has delivered the completion.
+    let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler {
+        done: done_tx,
+        _params: params,
+    }
+    .into();
     // SAFETY: the device path is a static wide string, the IID matches IAudioClient, `prop`
-    // (and the `params` it points at) outlive the call and the wait below, and `handler` is an
-    // agile COM object kept alive by the API until it has been called.
+    // points into the allocation owned by `handler` (kept alive by our reference until after
+    // the wait, and by the API's reference until the callback has run, whatever happens to
+    // the wait), and `handler` is an agile COM object.
     let operation = unsafe {
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            Some(std::ptr::from_ref(&prop)),
+            Some(prop),
             &handler,
         )
     }
     .map_err(|e| process_loopback_error(e.code()))?;
-    let outcome = done_rx.recv_timeout(ACTIVATION_TIMEOUT);
-    // Keep the operation, the PROPVARIANT and its blob alive until the callback has run.
+    let deadline = Instant::now() + ACTIVATION_TIMEOUT;
+    let outcome = loop {
+        match done_rx.recv_timeout(ACTIVATION_POLL) {
+            Ok(result) => break result.map_err(process_loopback_error),
+            Err(RecvTimeoutError::Disconnected) => {
+                break Err(CaptureError::Backend(
+                    "process loopback activation handler was released without completing"
+                        .to_owned(),
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if stop.wait(0) {
+                    break Err(activation_cancelled());
+                }
+                if Instant::now() >= deadline {
+                    break Err(CaptureError::Backend(
+                        "process loopback activation timed out".to_owned(),
+                    ));
+                }
+            }
+        }
+    };
     drop(operation);
-    drop(prop);
-    match outcome {
-        Ok(Ok(ActivatedClient(client))) => Ok(client),
-        Ok(Err(hr)) => Err(process_loopback_error(hr)),
-        Err(RecvTimeoutError::Timeout) => Err(CaptureError::Backend(
-            "process loopback activation timed out".to_owned(),
-        )),
-        Err(RecvTimeoutError::Disconnected) => Err(CaptureError::Backend(
-            "process loopback activation handler was released without completing".to_owned(),
-        )),
-    }
+    drop(handler);
+    outcome.map(|ActivatedClient(client)| client)
 }
 
 /// Maps a process-loopback activation failure to a clear error.
@@ -1383,6 +1716,7 @@ impl Drop for MmcssRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Media::Audio::{eCapture, eCommunications, eMultimedia};
 
     fn fmt(kind: SampleKind, channels: usize) -> NativeFormat {
         let bytes = match kind {
@@ -1549,6 +1883,191 @@ mod tests {
         assert!(big[6..].iter().all(|s| *s == 1.0));
         let mut small = [1.0_f32; 4];
         assert_eq!(convert_to_stereo_f32(&format, &src, &mut small), 2);
+    }
+
+    /// Collects every push: the chunk lengths and the concatenated samples.
+    #[derive(Default)]
+    struct Collected {
+        chunks: Vec<usize>,
+        samples: Vec<f32>,
+    }
+
+    impl Collected {
+        fn sink(&mut self) -> impl FnMut(&[f32]) + '_ {
+            |chunk: &[f32]| {
+                self.chunks.push(chunk.len());
+                self.samples.extend_from_slice(chunk);
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_len_has_a_floor_and_is_stereo() {
+        assert_eq!(scratch_len(0), MIN_SCRATCH_FRAMES * 2);
+        assert_eq!(scratch_len(480), MIN_SCRATCH_FRAMES * 2);
+        assert_eq!(scratch_len(10_000), 20_000);
+    }
+
+    #[test]
+    fn silence_is_split_into_scratch_sized_chunks() {
+        let mut scratch = vec![7.0_f32; scratch_len(0)];
+        let mut got = Collected::default();
+        push_silence(&mut got.sink(), 10_000 * OUT_CHANNELS, &mut scratch);
+        assert_eq!(got.chunks, vec![9_600, 9_600, 800]);
+        assert_eq!(got.samples.len(), 20_000);
+        assert!(got.samples.iter().all(|s| *s == 0.0));
+
+        // Zero samples push nothing; an empty scratch must not spin forever.
+        let mut got = Collected::default();
+        push_silence(&mut got.sink(), 0, &mut scratch);
+        push_silence(&mut got.sink(), 100, &mut []);
+        assert!(got.chunks.is_empty());
+    }
+
+    #[test]
+    fn converted_packets_keep_order_across_scratch_chunks() {
+        let format = fmt(SampleKind::I16, 2);
+        let frames = 10_000_usize;
+        // Left = +n, right = -n (small values, exactly representable after scaling).
+        let values: Vec<i16> = (0..frames)
+            .flat_map(|n| {
+                let v = (n % 16_000) as i16;
+                [v, -v]
+            })
+            .collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut scratch = vec![0.0_f32; scratch_len(0)];
+        let mut got = Collected::default();
+        push_converted(&mut got.sink(), &format, &bytes, &mut scratch);
+        assert_eq!(got.chunks, vec![9_600, 9_600, 800]);
+        let expected: Vec<f32> = values.iter().map(|v| f32::from(*v) / 32_768.0).collect();
+        assert_eq!(got.samples, expected);
+    }
+
+    #[test]
+    fn converted_mono_is_duplicated_across_chunks() {
+        let format = fmt(SampleKind::F32, 1);
+        let frames = 5_000_usize;
+        let values: Vec<f32> = (0..frames).map(|n| n as f32 / 8_192.0).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut scratch = vec![0.0_f32; scratch_len(0)];
+        let mut got = Collected::default();
+        push_converted(&mut got.sink(), &format, &bytes, &mut scratch);
+        assert_eq!(got.chunks, vec![9_600, 400]);
+        let expected: Vec<f32> = values.iter().flat_map(|v| [*v, *v]).collect();
+        assert_eq!(got.samples, expected);
+    }
+
+    #[test]
+    fn aligned_stereo_f32_takes_the_fast_path() {
+        let format = fmt(SampleKind::F32, 2);
+        // 10_000 frames, more than the scratch holds: the fast path pushes it in one go.
+        let values: Vec<f32> = (0..20_000).map(|n| n as f32 / 32_768.0).collect();
+        let mut scratch = vec![0.0_f32; scratch_len(0)];
+        // SAFETY: plain reinterpretation of an f32 buffer as its bytes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) };
+        let mut got = Collected::default();
+        push_converted(&mut got.sink(), &format, bytes, &mut scratch);
+        assert_eq!(got.chunks, vec![20_000]);
+        assert_eq!(got.samples, values);
+
+        // The same data at an odd address goes through the converting path, chunked.
+        let mut shifted = vec![0_u8; bytes.len() + 1];
+        shifted[1..].copy_from_slice(bytes);
+        let unaligned = &shifted[1..];
+        assert_ne!(unaligned.as_ptr().align_offset(4), 0);
+        let mut got = Collected::default();
+        push_converted(&mut got.sink(), &format, unaligned, &mut scratch);
+        assert_eq!(got.chunks, vec![9_600, 9_600, 800]);
+        assert_eq!(got.samples, values);
+    }
+
+    #[test]
+    fn default_device_listener_signals_only_console_render_changes() {
+        let changed = Arc::new(Event::new(false).expect("event"));
+        let listener: IMMNotificationClient = DefaultDeviceListener {
+            changed: Arc::clone(&changed),
+        }
+        .into();
+        let fire = |flow, role| {
+            // SAFETY: calling our own COM object through its interface; a null device id is
+            // allowed (no default device) and never read.
+            unsafe { listener.OnDefaultDeviceChanged(flow, role, PCWSTR::null()) }
+                .expect("callback");
+        };
+        fire(eCapture, eConsole);
+        fire(eRender, eMultimedia);
+        fire(eRender, eCommunications);
+        assert!(!changed.wait(0));
+        fire(eRender, eConsole);
+        assert!(changed.wait(0));
+        // Auto-reset: consumed by the wait above.
+        assert!(!changed.wait(0));
+        assert!(is_our_default_change(eRender, eConsole));
+        assert!(!is_our_default_change(eCapture, eConsole));
+    }
+
+    #[test]
+    fn activation_params_are_a_self_contained_blob() {
+        let params = ActivationParams::new(1234, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE);
+        let prop = params.prop();
+        // SAFETY: `prop` points at the live PROPVARIANT built by `new`, whose `vt` is VT_BLOB.
+        let (vt, blob) = unsafe {
+            let inner = &(*prop).Anonymous.Anonymous;
+            (inner.vt, inner.Anonymous.blob)
+        };
+        assert_eq!(vt, VT_BLOB);
+        assert_eq!(
+            blob.cbSize as usize,
+            std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>()
+        );
+        // SAFETY: the blob points at the AUDIOCLIENT_ACTIVATION_PARAMS in the same allocation.
+        let decoded = unsafe { &*blob.pBlobData.cast::<AUDIOCLIENT_ACTIVATION_PARAMS>() };
+        assert_eq!(
+            decoded.ActivationType,
+            AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+        );
+        // SAFETY: ProcessLoopbackParams is the active union member for this activation type.
+        let loopback = unsafe { decoded.Anonymous.ProcessLoopbackParams };
+        assert_eq!(loopback.TargetProcessId, 1234);
+        assert_eq!(
+            loopback.ProcessLoopbackMode,
+            PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+        );
+    }
+
+    #[test]
+    fn activation_handler_reports_a_missing_operation_and_owns_the_params() {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler {
+            done: done_tx,
+            _params: ActivationParams::new(1, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE),
+        }
+        .into();
+        // SAFETY: calling our own COM object; a null operation is handled (E_POINTER).
+        unsafe { handler.ActivateCompleted(None) }.expect("callback");
+        assert!(matches!(done_rx.try_recv(), Ok(Err(hr)) if hr == E_POINTER));
+        // Releasing the last reference drops the sender (and frees the params).
+        drop(handler);
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn activation_returns_immediately_once_stopped() {
+        let stop = Event::new(true).expect("event");
+        stop.set();
+        let started = Instant::now();
+        let result = activate_process_loopback(
+            std::process::id(),
+            PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            &stop,
+        );
+        assert!(matches!(result, Err(CaptureError::Backend(m)) if m.contains("cancelled")));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

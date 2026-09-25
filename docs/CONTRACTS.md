@@ -326,8 +326,15 @@ Modules:
   pointers never cross threads except the activated client handed from the (MTA) activation callback.
 - **Capture loop.** Waits on `[stop, audio]` events with a 20 ms timeout (some Windows builds never signal the
   event for loopback streams) and drains all packets; no allocation, locking or logging inside. On
-  `AUDCLNT_E_DEVICE_INVALIDATED` / `AUDCLNT_E_SERVICE_NOT_RUNNING` it re-opens the stream (default device change,
-  unplug) every 500 ms until it works or `stop` is called. The thread registers with MMCSS ("Pro Audio").
+  `AUDCLNT_E_DEVICE_INVALIDATED` / `AUDCLNT_E_SERVICE_NOT_RUNNING` (unplug, audio service restart) it re-opens the
+  stream every 500 ms until it works or `stop` is called. System loopback also registers an `IMMNotificationClient`
+  (Windows does not reroute a stream opened on a concrete `IMMDevice`): `OnDefaultDeviceChanged(eRender, eConsole)`
+  signals a third event in the wait set and the stream is re-opened on the new default output. Other capture
+  errors are re-opened after 500 ms, up to 5 times in a row without a delivered packet; a re-open that keeps
+  landing on a different output format (10 tries) ends the worker. A `start` after the worker ended prepares a
+  fresh one instead of returning `AlreadyRunning`. A pending process-loopback activation (max 10 s) watches the
+  stop event, so `stop` never blocks on it; its activation parameters are owned by the completion handler, so
+  they outlive an abandoned wait. The thread registers with MMCSS ("Pro Audio").
 - **Errors.** Process-loopback activation failures map to `Unsupported` (message names Windows 10 build 20348,
   works from 19041), `E_ACCESSDENIED` to `PermissionDenied`; no default output device → `NotFound`;
   `open_process(0)` → `InvalidArgument`; a pid that does not exist → `NotFound`.
