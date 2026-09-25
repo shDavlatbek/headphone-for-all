@@ -131,14 +131,16 @@ impl fmt::Debug for HubConfig {
 /// Receive statistics of one stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamStats {
-    /// Packet loss (after FEC) over the last second, in percent.
+    /// Frames missing from the output over the last second (lost and not recovered by
+    /// redundancy/FEC, or dropped by a jitter-buffer overflow), in percent.
     pub loss_pct: f32,
     /// Interarrival jitter in ms.
     pub jitter_ms: f32,
     /// Jitter-buffer fill in ms.
     pub buffer_ms: f32,
-    /// Estimated end-to-end latency in ms (jitter target + frame + output ring fill target +
-    /// the output's own latency).
+    /// Estimated end-to-end latency in ms (audio queued in the jitter buffer — its target
+    /// before playout starts — + frame + output ring fill target + the output's own
+    /// latency).
     pub latency_ms: f32,
     /// Post-gain level in dBFS.
     pub level_db: f32,
@@ -221,7 +223,7 @@ pub struct StreamCounters {
     pub resets: u64,
     /// Frames decoded from their own packet.
     pub played: u64,
-    /// Frames the jitter buffer reported lost (never arrived, too late, dropped by overflow).
+    /// Frames lost in the network (never arrived in time; the jitter buffer's `lost`).
     pub lost: u64,
     /// Packets that arrived after their frame was played.
     pub late: u64,
@@ -237,6 +239,14 @@ pub struct StreamCounters {
     pub stretched: u64,
     /// Ticks in which a playing stream ran dry (outside DTX).
     pub underruns: u64,
+    /// Buffered frames dropped because the jitter buffer was full (the mixer did not keep
+    /// up; not network loss).
+    #[serde(default)]
+    pub overflowed: u64,
+    /// Frames discarded because far more audio was buffered than the target (cuts the
+    /// latency a network burst left behind).
+    #[serde(default)]
+    pub skipped: u64,
 }
 
 /// Entry point of the hub engine.
@@ -445,6 +455,7 @@ struct Snapshot {
     lost: u64,
     played: u64,
     recovered: u64,
+    overflowed: u64,
 }
 
 /// Commands to a connection task.
@@ -610,12 +621,13 @@ impl Shared {
         {
             let mut st = self.state.lock();
             for e in st.sources.iter_mut() {
-                let (jb, buffered, target, mix, level, last_packet) = {
+                let (jb, buffered, target, primed, mix, level, last_packet) = {
                     let s = e.shared.state.lock();
                     (
                         s.jb.stats(),
                         s.jb.buffered_ms(),
                         s.jb.target_ms(),
+                        s.jb.is_primed(),
                         s.mix,
                         s.level_db,
                         s.last_packet,
@@ -625,18 +637,24 @@ impl Shared {
                     lost: jb.lost,
                     played: mix.played,
                     recovered: mix.recovered_redundancy + mix.recovered_fec,
+                    overflowed: jb.overflowed,
                 };
                 let lost = cur.lost.saturating_sub(e.last.lost);
                 let played = cur.played.saturating_sub(e.last.played);
                 let recovered = cur.recovered.saturating_sub(e.last.recovered).min(lost);
+                let overflowed = cur.overflowed.saturating_sub(e.last.overflowed);
                 let total = lost + played;
                 if total >= MIN_FRAMES_FOR_LOSS {
                     // Too few frames (start-up, DTX) would give a noisy estimate that the
                     // sender might overreact to: keep the previous values and let the
                     // interval grow until it holds enough frames.
                     e.last = cur;
+                    // Network loss only: frames the hub itself dropped (overflow) must not
+                    // make the sender cut its bitrate.
                     e.loss_pct = 100.0 * lost as f32 / total as f32;
-                    e.residual_loss_pct = 100.0 * (lost - recovered) as f32 / total as f32;
+                    // What the listener misses: unrecovered losses and overflow drops.
+                    e.residual_loss_pct = 100.0 * (lost - recovered + overflowed) as f32
+                        / (total + overflowed) as f32;
                 } else if total == 0 {
                     // Nothing played (DTX or idle): no loss either.
                     e.last = cur;
@@ -645,7 +663,10 @@ impl Shared {
                 }
                 let idle_for = now.saturating_duration_since(last_packet);
                 let active = idle_for < IDLE_AFTER;
-                let latency_ms = target as f32 + e.frame_ms as f32 + output_latency;
+                // The audio actually queued while playing (a burst can leave more than the
+                // target for a while), the target before playout starts.
+                let queued = if primed { buffered } else { target };
+                let latency_ms = queued as f32 + e.frame_ms as f32 + output_latency;
                 e.info.active = active;
                 e.info.stats = StreamStats {
                     loss_pct: e.residual_loss_pct,
@@ -1067,6 +1088,8 @@ impl HubHandle {
             concealed: s.mix.concealed,
             stretched: jb.stretched,
             underruns: s.mix.underruns,
+            overflowed: jb.overflowed,
+            skipped: jb.skipped,
         })
     }
 

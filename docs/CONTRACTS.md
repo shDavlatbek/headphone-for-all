@@ -899,6 +899,24 @@ Modules:
   WAV analysis with a 50 ms-block Goertzel detector — a single long Goertzel sum is cancelled by the tiny frequency
   shifts of drift correction).
 
+### 6.4 Refinements made by `fix/core-engine` (the code and module docs in `core/hfa-audio` and `core/hfa-core` are authoritative; they override §4.2 and §6.3 where they differ)
+
+- **Jitter buffer shrinking (`hfa-audio` `jitter`).** The symmetric counterpart of `Pop::Stretch`: while primed,
+  when `buffered_ms − target_ms` stays above `max(SHRINK_THRESHOLD_FRAMES (3) · frame_ms,
+  SHRINK_THRESHOLD_TARGET_FRACTION (0.5) · target_ms)` for `SHRINK_HOLD_MS = 500` ms of pops in a row, `pop()`
+  silently discards the oldest slot before taking the next one (at most once every `SHRINK_MIN_INTERVAL = 10`
+  pops). An excess above `MAX_EXCESS_MS = 200` is cut at once: the oldest slots are discarded until the buffer is
+  within one frame of the target, and leading gaps after the cut are discarded too. The `Pop` enum is unchanged
+  (the caller simply receives the next frame). A network stall followed by a burst no longer leaves the stream
+  ~0.5 s late for minutes (the drift controller alone drains ≤ 2 ms/s).
+- **`JitterStats` split (`#[serde(default)]` fields):** `lost` is now **network** loss only (`Missing`, gaps skipped
+  at priming, sequence numbers jumped over); slots dropped by an overflow are counted in **`overflowed`**, slots
+  discarded by shrinking in **`skipped`**. `Stats.loss_pct` (what the sender adapts to) therefore no longer counts
+  local overflow drops; `StreamStats.loss_pct` (what the listener misses) = `(lost − recovered + overflowed) /
+  (lost + played + overflowed)`. `StreamCounters` gains `overflowed` and `skipped` (`#[serde(default)]`).
+- **`StreamStats.latency_ms` / `Stats.latency_ms`** use the audio actually queued in the jitter buffer while it is
+  primed (its target before playout starts) + frame + output ring fill target + the output's latency.
+
 ## 7. `hfa-cli` (`hfa` binary, clap)
 
 - `hfa hub [--port N] [--out default|device:<name>|wav:<path>|null] [--no-mdns] [--pair]`: prints the PIN and URI and shows a live sources table.

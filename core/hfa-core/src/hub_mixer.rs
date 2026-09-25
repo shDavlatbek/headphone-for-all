@@ -753,22 +753,23 @@ mod tests {
         let (shared, mut mix) = stream(10);
         let pkts = packets(30, true);
         let t0 = Instant::now();
+        // Packets arrive in real time (one per tick, two ticks ahead of playout).
         for (seq, p) in pkts.iter().enumerate() {
-            if seq == 10 {
-                continue; // lost
+            if seq != 10 {
+                // (10 is lost.)
+                let seq = seq as u32;
+                shared.state.lock().on_datagram(
+                    &header(0, seq),
+                    p.clone(),
+                    u64::from(seq) * 10_000,
+                    t0,
+                );
             }
-            let seq = seq as u32;
-            shared.state.lock().on_datagram(
-                &header(0, seq),
-                p.clone(),
-                u64::from(seq) * 10_000,
-                t0,
-            );
-        }
-        for _ in 0..25 {
-            mix.fill();
-            if mix.has_input {
-                mix.fifo.drain(..MIX_SAMPLES);
+            if seq >= 2 {
+                mix.fill();
+                if mix.has_input {
+                    mix.fifo.drain(..MIX_SAMPLES);
+                }
             }
         }
         let c = mix.counters;
@@ -1138,9 +1139,12 @@ mod tests {
             worker.streams.push(mix);
             shared.push((s, frame_ms));
         }
-        // 2 s of packets for both streams (a 10 ms and a 20 ms one), pushed up front.
+        // 2 s of packets for both streams (a 10 ms and a 20 ms one), encoded up front and
+        // delivered in real-time order (40 ms ahead) as the ticks run: pushing moves the
+        // payload in and stays within the buffer's preallocated capacity.
         let t0 = Instant::now();
-        for (s, frame_ms) in &shared {
+        let mut queues = Vec::new();
+        for (_, frame_ms) in &shared {
             let mut enc = OpusEncoder::new(OpusConfig {
                 frame_ms: *frame_ms,
                 ..OpusConfig::default()
@@ -1148,6 +1152,7 @@ mod tests {
             .expect("encoder");
             let mut tone = SineGenerator::new(440.0, 0.25, AudioFormat::INTERNAL);
             let mut pcm = vec![0.0; AudioFormat::INTERNAL.samples_for_ms(*frame_ms)];
+            let mut queue = std::collections::VecDeque::new();
             for seq in 0..(2000 / frame_ms) {
                 tone.fill(&mut pcm);
                 let mut buf = vec![0u8; 1275];
@@ -1160,18 +1165,35 @@ mod tests {
                     seq,
                     timestamp: seq * frame_ms * 48,
                 };
-                s.state
-                    .lock()
-                    .on_datagram(&h, payload, u64::from(seq * frame_ms) * 1000, t0);
+                queue.push_back((h, payload));
             }
+            queues.push(queue);
         }
-        for _ in 0..30 {
+        let mut deliver = |tick: u32| {
+            for ((s, frame_ms), queue) in shared.iter().zip(queues.iter_mut()) {
+                while queue
+                    .front()
+                    .is_some_and(|(h, _)| h.seq * frame_ms <= (tick + 4) * MIX_FRAME_MS)
+                {
+                    let (h, payload) = queue.pop_front().expect("queued");
+                    s.state.lock().on_datagram(
+                        &h,
+                        payload,
+                        u64::from(h.seq * frame_ms) * 1000,
+                        t0,
+                    );
+                }
+            }
+        };
+        for tick in 0..30 {
+            deliver(tick);
             worker.tick();
             let (mix, output) = (&worker.mix, &mut worker.output);
             output.write(mix);
         }
         let allocations = crate::test_alloc::count_allocs(|| {
-            for _ in 0..100 {
+            for tick in 30..130 {
+                deliver(tick);
                 worker.tick();
                 let (mix, output) = (&worker.mix, &mut worker.output);
                 output.write(mix);
