@@ -147,7 +147,6 @@ ANDROID_PLATFORM=android-29 CC_aarch64_linux_android=$TC/aarch64-linux-android29
 |---|---|---|
 | `hfa-capture` `live_*` (Linux) | a PipeWire + WirePlumber session with a default sink named `hfa-test-sink` | see below |
 | `hfa-capture` macOS tap test | a Mac with the System Audio Recording permission for the terminal | `cargo test --manifest-path core/Cargo.toml -p hfa-capture -- --ignored` |
-| `hfa-ffi` `api_lifecycle` | the real `hfa-core` engines | `cargo test --manifest-path core/Cargo.toml -p hfa-ffi --test api_lifecycle -- --ignored` |
 
 The PipeWire live tests in a headless machine or container (CI does exactly this):
 

@@ -56,6 +56,10 @@ tempfile = { workspace = true }
 name = "api_lifecycle"
 required-features = ["flutter"]
 
+[[test]]
+name = "api_e2e"
+required-features = ["flutter"]
+
 [lints.rust]
 # `flutter_rust_bridge_codegen` expands the crate with `--cfg frb_expand`.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

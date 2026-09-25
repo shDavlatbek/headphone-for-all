@@ -1,11 +1,8 @@
 //! End-to-end check of the flutter_rust_bridge API against the real engines: init, settings,
 //! trust store sharing, hub start / pairing / stop, and a sender that cannot reach its hub.
 //!
-//! Ignored until the `hfa-core` engines are implemented (they are `todo!()` stubs on the
-//! integration branch while feat/ffi is built). Run with
-//! `cargo test -p hfa-ffi --test api_lifecycle -- --ignored` once feat/core-net and
-//! feat/core-engine are merged. Everything runs in one test because the API uses one global
-//! engine manager per process.
+//! Everything runs in one test because the API uses one global engine manager per process.
+//! `api_e2e.rs` covers a sender that pairs with and streams to a hub.
 
 use hfa_core::{TrustStore, TrustedPeer};
 use hfa_ffi::api::app::{forget_peer, get_settings, init_app, trusted_peers, update_settings};
@@ -17,7 +14,6 @@ use hfa_ffi::api::sender::{
 };
 
 #[test]
-#[ignore = "needs the hfa-core engines (feat/core-net + feat/core-engine)"]
 fn api_lifecycle_with_real_engines() {
     let dir = tempfile::tempdir().expect("tempdir");
     // A null output: the test machine may have no audio device. Port 0: any free port.

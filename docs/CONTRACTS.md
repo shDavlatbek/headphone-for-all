@@ -1137,8 +1137,9 @@ Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `
   **`flutter`** compiles `api`, `manager`, `convert` and `frb_generated`. flutter_rust_bridge builds C shims on Apple
   targets (`dart-sys`, `oslog`, they need Xcode), so `cargo check --target aarch64-apple-ios --no-default-features`
   on Linux checks the C ABI and all engine code without the frb API (same idea as `bundled-opus`, §11). Every app
-  build uses the defaults. `tests/api_lifecycle.rs` (`required-features = ["flutter"]`) exercises the API against
-  the real engines and is `#[ignore]`d until `hfa-core` is implemented (run it with `-- --ignored`).
+  build uses the defaults. `tests/api_lifecycle.rs` and `tests/api_e2e.rs` (`required-features = ["flutter"]`)
+  exercise the API against the real engines (not ignored since the integration): `api_e2e` runs a hub in a child
+  process (the test binary started again) and pairs a Tone sender with it by PIN over loopback.
 - `EngineManager`: `OnceLock` global created on first use; owns a 2-worker multi-thread tokio runtime
   (`hfa-ffi` threads), a `lifecycle` mutex that serializes blocking operations (init, start, stop) and a `state`
   mutex held only briefly, so getters never wait for a hub or capture that is starting. Engine futures are driven with
@@ -1281,7 +1282,7 @@ TC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
 ANDROID_PLATFORM=android-29 CC_aarch64_linux_android=$TC/aarch64-linux-android29-clang \
   AR_aarch64_linux_android=$TC/llvm-ar CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android29-clang \
   cargo clippy --manifest-path core/Cargo.toml -p hfa-ffi --all-targets --target aarch64-linux-android -- -D warnings
-cargo test --manifest-path core/Cargo.toml -p hfa-ffi --test api_lifecycle -- --ignored   # once hfa-core is implemented
+cargo test --manifest-path core/Cargo.toml -p hfa-ffi   # includes api_lifecycle and api_e2e (real engines)
 ```
 
 Bindings and Flutter (from `app/`):
