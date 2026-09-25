@@ -46,3 +46,8 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // JVM unit tests of the pure capture logic (src/test).
+    testImplementation("junit:junit:4.13.2")
+}

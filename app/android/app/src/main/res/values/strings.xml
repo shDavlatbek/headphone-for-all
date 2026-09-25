@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Headphone for All</string>
+
+    <!-- Notification channels -->
+    <string name="channel_capture_name">Audio streaming</string>
+    <string name="channel_capture_description">Shown while this device streams its audio to a hub.</string>
+    <string name="channel_hub_name">Hub</string>
+    <string name="channel_hub_description">Shown while this device mixes and plays the audio of other devices.</string>
+
+    <!-- Capture service -->
+    <string name="capture_notification_title">Streaming device audio</string>
+    <string name="capture_notification_text">Audio played on this device is sent to your headphone hub.</string>
+    <string name="action_stop">Stop</string>
+    <string name="capture_stopped_by_user">Stopped from the notification</string>
+    <string name="capture_stopped_by_system">Audio capture was ended by the system</string>
+    <string name="capture_error_foreground">The capture service could not start: %1$s</string>
+    <string name="capture_error_projection">Screen capture permission is not usable: %1$s</string>
+    <string name="capture_error_record">Audio capture failed: %1$s</string>
+
+    <!-- Hub service -->
+    <string name="hub_notification_title">Hub is running</string>
+    <string name="hub_notification_text">Mixing the audio of your devices into this headphone.</string>
+</resources>

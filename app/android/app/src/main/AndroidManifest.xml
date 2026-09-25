@@ -1,6 +1,30 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- LAN streaming, discovery (mDNS) and pairing. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- AudioPlaybackCapture records through AudioRecord, which needs RECORD_AUDIO. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- CaptureService (mediaProjection) and HubService (mediaPlayback). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- HubService keeps the CPU (and Wi-Fi) awake while the hub runs. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Scanning the pairing QR code. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- None of the hardware is required: without a camera the pairing PIN is typed, and
+         playback capture does not use the microphone. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi" android:required="false" />
+
     <application
-        android:label="Headphone for All"
+        android:label="@string/app_name"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
@@ -25,6 +49,19 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+
+        <!-- Captures the audio other apps play (MediaProjection + AudioPlaybackCapture). -->
+        <service
+            android:name=".CaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- Keeps the hub alive in the background; Rust plays the mix. -->
+        <service
+            android:name=".HubService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data
