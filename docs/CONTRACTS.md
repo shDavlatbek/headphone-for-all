@@ -16,7 +16,7 @@ locations and semantics must stay**. When you change a contract, update this fil
 ## 1. Repository layout
 
 ```
-core/                      Rust workspace (edition 2021, rust-version 1.85, resolver 2)
+core/                      Rust workspace (edition 2021, rust-version 1.87, resolver 2)
   Cargo.toml               [workspace] + [workspace.dependencies] (all shared dep versions live here)
   hfa-proto/               wire format, control messages, crypto, pairing (pure: no tokio, no audio I/O)
   hfa-audio/               DSP + Opus codec: jitter buffer, drift, resampler, mixer, meters (no networking)
@@ -104,6 +104,37 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
 - `identity.rs`: `fingerprint(pubkey: &[u8;32]) -> String`. It is the first 8 bytes of SHA-256, hex, grouped as `ab12-cd34-ef56-7890`.
   This is the `device_id`.
 
+### 3.1 Refinements made by `feat/scaffold` (the code in `core/hfa-proto` is authoritative)
+
+- `error.rs` holds `ProtoError` (`Clone + PartialEq + Eq`, string payloads); `lib.rs` has `pub type Result<T>`.
+  Variants: `Truncated{needed,got}`, `BadMagic`, `UnsupportedVersion(u8)`, `StreamMismatch{expected,got}`, `Crypto`,
+  `InvalidKey`, `FrameTooLarge{len,max}`, `Decode`, `InvalidMessage`, `Noise`, `Pairing`, `InvalidUri`.
+- `MediaHeader::has_flag(flag) -> bool` (implemented).
+- `MediaKey`: `generate() -> MediaKey`, `from_bytes([u8;32])`, **new** `from_slice(&[u8]) -> Result<MediaKey>` (for
+  `StreamStart.media_key`), `as_bytes() -> &[u8;32]`. Zeroized on drop; `Debug` is redacted.
+- `MediaSealer::new(&MediaKey, stream_id)`, `MediaOpener::new(&MediaKey, stream_id)`, both with `stream_id()`.
+  `seal`/`open` reject a header whose `stream_id` differs (`StreamMismatch`). `seal` clears `out` first.
+- `control.rs`: prost enums `Role { Unspecified = 0, Hub = 1, Sender = 2 }` and
+  `PairMethod { Unspecified = 0, Pin = 1, Token = 2 }` (proto3: 0 = unset → protocol error).
+  **Final wire tags** — `ControlMessage.body` oneof: Hello=1, PairStart=2, PairSpake=3, PairConfirm=4, PairResult=5,
+  StreamStart=10, StreamAccepted=11, StreamRejected=12, StreamStop=13, SetVolume=20, SetMute=21, SetPriority=22,
+  Ping=30, Pong=31, Stats=32, Bye=40. Field tags inside each message follow the order listed in §3
+  (1, 2, 3, … ; see the `.proto` equivalent in the `control.rs` module docs). Types: ids/ports/rates/bitrate `uint32`,
+  `nonce`/`t_us` `uint64`, gains/percentages/ms `float`, keys/MACs/SPAKE messages `bytes`.
+- The oneof enum is `control::control_message::Body` (re-exported as `control::Body`); `ControlMessage::new(Body)` and
+  `From<Body> for ControlMessage` exist.
+- `FrameDecoder` implements **`Iterator<Item = Result<ControlMessage>>`** instead of an inherent `next()` (clippy
+  `should_implement_trait`); plus `new()`, `push(&[u8])`, `buffered()`. An empty `body` decodes as `InvalidMessage`.
+- `noise.rs`: `StaticKeypair::generate() -> Result<StaticKeypair>`; `NoiseHandshake::{initiator, responder}(&StaticKeypair)
+  -> Result<NoiseHandshake>`; `write_message(&[u8]) -> Result<Vec<u8>>`; `read_message(&[u8]) -> Result<Vec<u8>>`;
+  `into_transport(self) -> Result<NoiseTransport>` (snow can fail on all of these). `StaticKeypair` is zeroized on drop,
+  `Debug` redacts the private key.
+- `pairing.rs`: the role type is **`PairingRole { Hub, Sender }`**; `PairingRole::label()` is part of the wire contract:
+  `b"hfa-v0 pair-confirm hub"` / `b"hfa-v0 pair-confirm sender"`. `PairingKey::verify(role, &[u8]) -> Result<()>`
+  (constant time, `Pairing` error on mismatch). A wrong password is detected by `verify`, not by `finish`.
+- `uri.rs`: `PairingUri` implements `Display` (hence `to_string()`) and `FromStr<Err = ProtoError>`; `URI_SCHEME = "hfa"`.
+- The crate is `#![forbid(unsafe_code)]`.
+
 ## 4. `hfa-audio` (pure DSP + codec)
 
 - `format.rs`: `AudioFormat { sample_rate: u32, channels: u16 }`, `AudioFormat::INTERNAL` (48 000 Hz, 2 channels),
@@ -140,6 +171,34 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
 - `meter.rs`: `Level { peak_db, rms_db }` and `LevelMeter`.
 - `tone.rs`: `SineGenerator::new(freq, amplitude, format)` with `fill(&mut [f32])`.
 - `wav.rs`: thin helpers over `hound` (`WavWriter`, `read_wav`).
+
+### 4.1 Refinements made by `feat/scaffold` (the code in `core/hfa-audio` is authoritative)
+
+- `AudioError` (`error.rs`): `Opus{code, message}`, `InvalidConfig`, `BufferSize{expected, got}`, `Resample`, `Wav`.
+- `AudioFormat::new(rate, ch)` (const), `frames_for_ms(&self, ms: u32) -> usize`, `samples_for_ms(&self, ms: u32)`,
+  `Default` = `INTERNAL` (implemented).
+- `convert`: `i16_to_f32(&[i16], &mut [f32])`, `f32_to_i16(&[f32], &mut [i16])` (convert `min(len)` samples);
+  `to_stereo(input: &[f32], in_channels: u16, out: &mut Vec<f32>)` clears `out`, then writes `frames * 2` samples.
+- `opus`: `MAX_OPUS_PACKET = 1275`. `OpusConfig { sample_rate: u32, channels: u16, bitrate: u32, frame_ms: u32, fec: bool,
+  expected_loss_pct: u8, low_delay: bool }`, `Default` = 48 kHz / 2 ch / 128 kbit/s / 10 ms / FEC on / 5 % / `APPLICATION_AUDIO`.
+  `OpusEncoder::new(cfg) -> Result<Self>`, `config()`, `encode(..) -> Result<usize>`, `set_bitrate(u32) -> Result<()>`,
+  `set_expected_loss(u8) -> Result<()>`, **new** `set_fec(bool) -> Result<()>` (the sender adapts FEC),
+  `frame_samples()` = samples **per channel**. `OpusDecoder::new(rate, ch) -> Result<Self>`, `decode/decode_fec/conceal
+  -> Result<usize /*frames*/>`, **new** `reset()`. Encoder and decoder must be `Send` (compile-time asserted in `lib.rs`).
+- `jitter`: `JitterConfig` field types `u32` ms + `capacity: usize`, `Default` = 10 / 20 / 150 / 40 ms / 64 packets.
+  `buffered_ms()` and `target_ms()` return `f64` (they feed the drift controller); `config()`.
+  `Pop::Missing.next` is a *copy* of packet `seq + 1`, which stays buffered.
+- `drift`: `DriftConfig { kp: f64, ki: f64, max_ppm: f64 }` (`Default`: 1e-5, 1e-6, 2000). Sign convention: buffer above
+  target → ratio < 1. Extra `ratio()` and `reset()`.
+- `resample`: `StreamResampler::new(channels: u16, in_rate: u32, out_rate: u32, chunk_frames: usize) -> Result<Self>`,
+  `set_ratio_relative(f64) -> Result<()>`, `process(&[f32], &mut Vec<f32>) -> Result<()>`, `reset()`, getters.
+- `mixer`: **`MixerConfig` gains `sample_rate: u32`** (attack/release need it). Times are `f32` ms. Gains are linear and
+  clamped to 0.0..=4.0. `mix` must not allocate. Extra `master_level() -> Level`, `config()`, `frame_frames()`.
+- `meter`: `SILENCE_DB = -120.0`, `Level::SILENT` (= `Default`), `amplitude_to_db`, `db_to_amplitude`,
+  `LevelMeter::{new, process(&[f32]) -> Level, level(), reset()}`.
+- `tone`: `SineGenerator::new(freq: f32, amplitude: f32, format)`, `fill(&mut self, &mut [f32])`.
+- `wav`: `WavWriter::{create(&Path, AudioFormat) -> Result<Self>, write(&[f32]) -> Result<()>, finalize(self) -> Result<()>}`,
+  `read_wav(&Path) -> Result<(AudioFormat, Vec<f32>)>` (32-bit float files written; int/float read).
 
 ## 5. `hfa-capture` (OS audio I/O)
 
@@ -184,6 +243,47 @@ Modules:
 - `macos.rs`: Core Audio process tap (`AudioHardwareCreateProcessTap`, `CATapDescription`, private aggregate
   device, `muteBehavior = mutedWhenTapped`).
 
+### 5.1 Refinements made by `feat/scaffold` (the code in `core/hfa-capture` is authoritative)
+
+- `CaptureError` (`error.rs`): `Unsupported`, `PermissionDenied`, `NotFound`, `Format`, `AlreadyRunning`,
+  `InvalidArgument`, `Backend`, `Io`, `Audio(#[from] AudioError)`; `From<io::Error>`. `lib.rs` has `pub type Result<T>`.
+- `CaptureTarget` / `OutputTarget` implement `FromStr` + `Display` (implemented and tested) with the CLI string forms
+  `system | system-excl | pid:<n> | tone:<hz> | wav:<path> | external:<id>` and `default | device:<name> | wav:<path> | null`.
+  Both derive serde (`OutputTarget` is stored in `Settings`); `OutputTarget::default()` is `Default`.
+- `open_capture` / `open_output` dispatch is implemented in `lib.rs` (wiring). WAV and null outputs use
+  `AudioFormat::INTERNAL`; device outputs use the device's default config. `list_output_devices()` delegates to
+  `output_cpal::list_devices()`.
+- Ring semantics: `PcmSink::overruns()` / `PcmSource::underruns()` count **samples** dropped / zero-filled.
+  Extra `PcmSink::{free, capacity}`, `PcmSource::capacity`.
+- Concrete types: `tone::ToneSource::new(freq_hz, format)`, `wav_source::WavFileSource::open(&Path) -> Result`,
+  `external::ExternalSource::open(id) -> Result`, `output_cpal::CpalOutput::open(Option<&str>, buffer_ms) -> Result`,
+  `output_file::WavFileOutput::create(&Path, AudioFormat, buffer_ms) -> Result`, `output_file::NullOutput::new(format, buffer_ms)`.
+- **External feed API (refined):**
+  ```rust
+  pub fn register_external(id: u32, format: AudioFormat) -> ExternalFeed;   // registers or replaces feed `id`
+  pub fn unregister_external(id: u32);
+  #[derive(Clone)] pub struct ExternalFeed;                                  // Send + Sync (compile-time asserted)
+  impl ExternalFeed { pub fn id(&self) -> u32; pub fn format(&self) -> AudioFormat;
+                      pub fn push(&self, interleaved: &[f32]) -> usize; }    // any thread; 0 if no source is started
+  ```
+  The format is fixed at registration (so `ExternalSource::format()` is known before `start`). `push` takes a short
+  `parking_lot` lock around the SPSC producer (native capture threads are not real-time callbacks).
+- **Platform-module interface.** `lib.rs` compiles exactly one of `linux.rs` (`target_os = "linux"`), `windows.rs`,
+  `macos.rs`, or `unsupported.rs` (every other target, including Android and iOS) as `mod platform`. Each exposes exactly:
+  ```rust
+  pub(crate) fn capabilities() -> Capabilities;
+  pub(crate) fn open_system(exclude_self: bool) -> Result<Box<dyn CaptureSource>, CaptureError>;
+  pub(crate) fn open_process(pid: u32) -> Result<Box<dyn CaptureSource>, CaptureError>;
+  pub(crate) fn list_apps() -> Result<Vec<CaptureApp>, CaptureError>;
+  ```
+  The OS stubs return `Err(Unsupported)`; `unsupported.rs` is final (`list_apps` → `Ok(vec![])`). Linux should return
+  `Ok(vec![])` from `list_apps` once implemented. All OS dependencies are already declared in `hfa-capture/Cargo.toml`
+  under `[target.'cfg(target_os = "…")'.dependencies]` (see §10), so OS work packages only edit their `src/<os>.rs`.
+- macOS note: `objc2-core-audio` 0.3.2 (default features) already binds everything the tap backend needs:
+  `AudioHardwareCreateProcessTap`/`AudioHardwareDestroyProcessTap`, `CATapDescription` (`initStereoGlobalTapButExcludeProcesses`,
+  `initStereoMixdownOfProcesses`, `setPrivate`, `setMuteBehavior`, `UUID`), `CATapMuteBehavior`,
+  `AudioHardwareCreateAggregateDevice` and `kAudioAggregateDeviceTapListKey`.
+
 ## 6. `hfa-core` (networking + engines; tokio)
 
 - `config.rs`: `Settings { device_name, port, bitrate, frame_ms, fec, jitter_min_ms, jitter_max_ms, output: OutputTarget, data_dir }`
@@ -225,6 +325,48 @@ Modules:
   - It sends `Stats` to each sender every second. A stream is idle after 2 s without packets and removed after 30 s.
 - `lib.rs` re-exports the engines and a `platform_name()` helper.
 
+### 6.1 Refinements made by `feat/scaffold` (the code in `core/hfa-core` is authoritative)
+
+- `CoreError` (`error.rs`, `Clone + PartialEq + Eq`): `Io`, `Json`, `Config`, `Proto(#[from])`, `Audio(#[from])`,
+  `Capture(#[from])`, `Discovery`, `PairingRequired`, `PairingFailed`, `KeyMismatch`, `Protocol`, `Rejected`,
+  `HubNotFound`, `Timeout`, `Closed`, `UnknownStream(u32)`; `From<io::Error>`, `From<serde_json::Error>`.
+- `lib.rs`: `APP_VERSION`, `platform_name()` (implemented), re-exports; compile-time `Send + Sync` assertions for
+  `HubHandle`, `SenderHandle`, `PairingManager`, `TrustStore` and `Send` for `SenderConfig`, `HubConfig`, `ControlChannel`.
+- `config`: `SETTINGS_FILE = "settings.json"`; `Settings` is `#[serde(default)]`, `data_dir` is `#[serde(skip)]`.
+  `Default` (implemented): port 47810, 128 kbit/s, 10 ms, FEC on, jitter 20..=150 ms, `OutputTarget::Default`,
+  `default_device_name()`, `default_data_dir()` (`directories::ProjectDirs("io.github", "shdavlatbek", "headphone-for-all")`).
+- `identity`: `IDENTITY_FILE`, `TRUST_FILE`. `Identity::load_or_create(data_dir, name) -> Result<Identity>`,
+  `public_key()`. **`TrustStore` is a cheap-to-clone shared handle** (`Arc<Mutex<..>>`) whose methods take `&self`
+  (so `accept(&TrustStore)` can add a newly paired peer): `load(data_dir) -> Result`, `is_trusted(&[u8;32]) -> bool`
+  (by public key), `get(device_id) -> Option<TrustedPeer>`, `add(TrustedPeer) -> Result<()>`,
+  `remove(device_id) -> Result<bool>`, `peers() -> Vec<TrustedPeer>`. `TrustedPeer.paired_at` is unix seconds.
+- `pairing`: `PairingManager::new(hub_id: [u8;32], name: String, port: u16)`, `start(ttl) -> PairingInfo`, `cancel()`,
+  `current()`, **`secret_for(PairMethod) -> Option<String>`** (the hub runs SPAKE2 with it), `verify_password(&str) -> bool`,
+  `record_failure()` (window invalidated after `MAX_FAILED_ATTEMPTS = 5`), `record_success()` (one-time: closes the
+  window). `DEFAULT_PAIRING_TTL = 300 s`. `method_for_secret(&str) -> PairMethod`: exactly 6 ASCII digits = PIN, else token
+  (so `pairing_secret: Option<String>` stays untyped).
+- `control`: `connect`/`accept`/`send`/`recv` are `async`. After the handshake, every Noise transport message is also
+  `u16` BE length-prefixed and carries one `encode_frame` payload. `PeerInfo { device_id, name, platform, app_version,
+  public_key, addr: SocketAddr, newly_paired }`. `HANDSHAKE_TIMEOUT = 20 s`. A sender pins a trusted hub's key
+  (`KeyMismatch`).
+- `discovery`: `TXT_VERSION/TXT_ID/TXT_NAME/TXT_PLATFORM`; `Advertiser::start(..) -> Result<Advertiser>`, `stop(self)`;
+  `browse() -> Result<Browser>`; `Browser::recv().await -> Option<DiscoveryEvent>` and `try_recv()` (not `next`, to avoid
+  clashing with `Iterator`/`Stream`). `DiscoveryEvent::Lost(device_id)`.
+- `media`: `MediaSender::new(Arc<UdpSocket>, dest, &MediaKey, stream_id)` with non-blocking `send(flags, timestamp, payload)
+  -> Result<bool /*sent*/>` (usable from the encoder thread) and `next_seq()`; `MediaDemux::{new, add_stream, remove_stream,
+  open}` for the hub's single UDP socket.
+- `sender`: `HubAddress { Direct { host, port }, Discover { name_or_id } }`. `SenderState` is a separate enum
+  (`Connecting | Pairing | Streaming | Reconnecting | Stopped | Failed(String)`) used in `SenderStatus.state`.
+  `SenderEvent { StateChanged(SenderState), Connected{device_id,name}, Paired{device_id,name}, HubControl{gain,muted,priority},
+  Status(SenderStatus), Error(String) }`. **`SenderEngine::start(cfg).await`** (async; runs on the caller's tokio runtime,
+  returns before the connection is up); `SenderHandle::stop(self).await`. `SenderConfig` has a manual `Debug` (redacts the secret).
+- `hub`: `STATS_INTERVAL = 1 s`, `IDLE_AFTER = 2 s`, `REMOVE_AFTER = 30 s`. **`HubEngine::start(cfg).await`**;
+  `settings.port = 0` binds any free port (see `local_port()`). `set_gain/set_muted/set_priority -> Result<()>`
+  (`UnknownStream`), `set_master_gain(f32)`, `start_pairing() -> PairingInfo`, `cancel_pairing()`, `events()`, `local_port()`,
+  **new** `device_id()`, `stop(self).await`. `HubEvent::{SourceAdded(SourceInfo), SourceRemoved{stream_id},
+  SourceUpdated(SourceInfo), PairingCompleted{device_id,name}, PairingFailed{reason}, Error(String)}`.
+  `StreamStats`/`SenderStatus` `Default` use `SILENCE_DB` for levels.
+
 ## 7. `hfa-cli` (`hfa` binary, clap)
 
 - `hfa hub [--port N] [--out default|device:<name>|wav:<path>|null] [--no-mdns] [--pair]`: prints the PIN and URI and shows a live sources table.
@@ -232,6 +374,17 @@ Modules:
 - `hfa discover`, `hfa devices` (outputs + capture apps + capabilities), `hfa trust list|remove <id>`.
 - `hfa selftest [--seconds N] [--loss PCT] [--jitter MS]`: an in-process hub (WAV/Null output) plus a tone sender over
   localhost. It reports the measured latency, loss and glitches, and exits non-zero on failure. Used in CI.
+
+### 7.1 Refinements made by `feat/scaffold`
+
+- Global options: `--data-dir <DIR>` and `-v/--verbose` (count; `RUST_LOG` overrides).
+- `send`: `--to` / `--hub` are mutually exclusive and **optional when `--uri` is given** (the URI carries host and port);
+  `--pin` / `--uri` are mutually exclusive; `--pin` must be 6 digits; `--source` defaults to `system` and parses with
+  `CaptureTarget::from_str`; `--bitrate` 6000..=510000; `--frame-ms` 10|20; extra `--label`.
+  `--to` parses into `cli::HostPort { host, port }` (`host`, `host:port`, bare IPv6, `[ipv6]:port`; default port 47810).
+- `hub --out` parses with `OutputTarget::from_str`. `discover --timeout <s>` (default 3).
+  `selftest --seconds` 1..=3600 (default 5), `--loss` 0..=100 % (default 0), `--jitter` ms (default 0).
+- Files: `src/main.rs` (runtime + tracing + dispatch), `src/cli.rs` (clap types, tested), `src/commands.rs` (bodies).
 
 ## 8. `hfa-ffi` + Flutter app
 
@@ -246,6 +399,16 @@ Modules:
     `io.github.shdavlatbek.hfa.broadcast`.
   - The frb config `app/flutter_rust_bridge.yaml` points `rust_root` at `../core/hfa-ffi`. Dart output goes to `app/lib/src/rust/`.
   - Riverpod for state. `qr_flutter` shows the QR code, and `mobile_scanner` scans it on mobile.
+
+### 8.1 Refinements made by `feat/scaffold`
+
+- C ABI (`c_api.rs`, `#[no_mangle] unsafe extern "C"`, never panics across the boundary):
+  `hfa_ext_sender_start(config_json: *const c_char) -> *mut HfaExtSender` (null on failure),
+  `hfa_ext_push_pcm(handle, samples: *const f32, frames: u32, channels: u32, rate: u32) -> i32`,
+  `hfa_ext_sender_stop(handle) -> i32`. Codes: `HFA_OK = 0`, `HFA_ERR_INVALID_ARGUMENT = -1`, `HFA_ERR_CONFIG = -2`,
+  `HFA_ERR_ENGINE = -3`, `HFA_ERR_NOT_IMPLEMENTED = -100`. `HfaExtSender` is opaque; the JSON schema is defined by `feat/ffi`.
+- `src/api/mod.rs` is a placeholder; `feat/ffi` adds `flutter_rust_bridge` to `hfa-ffi/Cargo.toml` itself.
+- `src/android.rs` is compiled only for `target_os = "android"`; `jni` (0.22) is already an Android-only dependency.
 
 ## 9. Work packages and file ownership
 
@@ -264,3 +427,36 @@ Modules:
 | `feat/apple` | `app/ios/**`, `app/macos/**` |
 | `feat/desktop` | `app/windows/**`, `app/linux/**`, packaging |
 | `feat/ci` | `.github/**`, `docs/BUILDING.md` |
+
+## 10. Dependency choices (all versions live in `core/Cargo.toml` `[workspace.dependencies]`)
+
+Latest stable releases as of 2026-09. Members use `dep = { workspace = true }`.
+
+| Area | Crate (version) | Why / notes |
+|---|---|---|
+| Errors / logs | `thiserror` 2, `anyhow` 1 (cli only), `tracing` 0.1, `tracing-subscriber` 0.3 (`env-filter`, `fmt`) | |
+| Serialization | `serde` 1 (`derive`), `serde_json` 1, `prost` 0.14 (hand-written derives, no `protoc`) | |
+| Utilities | `parking_lot` 0.12, `once_cell` 1 (prefer `std::sync::OnceLock/LazyLock`), `directories` 6, `clap` 4 (`derive`), `rand` 0.10, `libc` 0.2 | |
+| Crypto | `snow` 0.10, `spake2` 0.4 (Ed25519 group), `chacha20poly1305` 0.11, `sha2` 0.11, `hmac` 0.13, `hkdf` 0.13, `subtle` 2.6, `zeroize` 1.9 (`derive`), `base64` 0.23, `percent-encoding` 2.3 | `snow` is used **without default features** (`default-resolver`, `use-curve25519`, `use-chacha20poly1305`, `use-blake2`, `use-getrandom`): its `std` feature force-enables `ring`, which needs a C/asm toolchain per target. `spake2` 0.4 still uses `curve25519-dalek` 4 / `sha2` 0.10 internally — fine, the types never cross crate boundaries. |
+| Audio | `rtrb` 0.4, `rubato` 5 (MSRV 1.87 → workspace `rust-version = "1.87"`), `hound` 3.5, `cpal` 0.18 | `rubato` 5 uses the `audioadapter` buffer API. |
+| Opus | `opusic-sys` 0.7 | Pre-generated bindings (no bindgen); its `bundled` feature builds libopus 1.6.1 from source with CMake as a **static** library. Verified: Linux build+test, `x86_64-pc-windows-gnu` (mingw) link of `hfa.exe`, `aarch64-linux-android` link of `libhfa_ffi.so` (uses `ANDROID_NDK_HOME`'s CMake toolchain). Chosen over `audiopus_sys` (last release 2021). The safe wrapper is our own `hfa_audio::opus`. |
+| Networking | `tokio` 1 (`rt-multi-thread`, `net`, `sync`, `time`, `macros`, `io-util`; tests add `test-util`), `mdns-sd` 0.21, `if-addrs` 0.15 (LAN address for the pairing URI) | |
+| Windows | `windows` 0.62 + `windows-core` 0.62 | Features: `std`, `Win32_Foundation`, `Win32_Security`, `Win32_Devices_FunctionDiscovery`, `Win32_Devices_Properties`, `Win32_Media_Audio`, `Win32_Media_Audio_Endpoints`, `Win32_Media_KernelStreaming`, `Win32_Media_Multimedia`, `Win32_System_Com`, `Win32_System_Com_StructuredStorage`, `Win32_System_Variant`, `Win32_System_Threading`, `Win32_System_ProcessStatus`, `Win32_System_Diagnostics_ToolHelp`, `Win32_System_SystemServices`, `Win32_UI_Shell_PropertiesSystem`. Verified to resolve `ActivateAudioInterfaceAsync`, `AUDIOCLIENT_ACTIVATION_PARAMS`, `AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS`, `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`, `IAudioSessionManager2/IAudioSessionControl2`, `PROPVARIANT`, `CreateEventW`, `QueryFullProcessImageNameW`, ToolHelp snapshots and `#[implement(IActivateAudioInterfaceCompletionHandler)]`. Same major as cpal's. `windows-core` must stay on 0.62 (not the newest 0.100) to match `windows`. |
+| Linux | `pipewire` 0.10 (+ `libc`) | Same major as cpal's optional PipeWire backend; SPA types via `pipewire::spa`. Needs `libpipewire-0.3-dev`, `libspa-0.2-dev`, `clang`. |
+| macOS | `objc2` 0.6, `objc2-foundation` 0.3, `objc2-core-audio` 0.3, `objc2-core-audio-types` 0.3, `objc2-core-foundation` 0.3, `block2` 0.6 (+ `libc`) | One mutually compatible family (the same one cpal 0.18 uses). Default features (all framework bindings). |
+| Android | `jni` 0.22 (hfa-ffi, Android only) | Same major as cpal's Android backend. |
+| Dev | `proptest` 1.11, `tempfile` 3 | |
+
+## 11. Cargo features and cross-target checks
+
+- `bundled-opus` (default on every crate that links libopus: `hfa-audio`, `hfa-capture`, `hfa-core`, `hfa-ffi`, `hfa-cli`)
+  forwards to `opusic-sys/bundled`. The workspace declares `hfa-audio`, `hfa-capture` and `hfa-core` with
+  `default-features = false`, and each member re-enables them through its own `bundled-opus`, so normal builds always
+  bundle libopus while `--no-default-features` links the system libopus instead and **skips the C build**.
+- Apple targets cannot build libopus on the Linux dev container (no macOS SDK), so check Apple code with:
+  `cargo check --workspace --all-targets --target aarch64-apple-darwin --no-default-features` (also `x86_64-apple-darwin`,
+  `aarch64-apple-ios`). Real Apple builds (with bundled libopus) run in CI on macOS.
+- Android: `cargo clippy --workspace --all-targets --target aarch64-linux-android` works with
+  `ANDROID_NDK_HOME=/opt/android-sdk/ndk/<ver>`, `ANDROID_PLATFORM=android-24`,
+  `CC_aarch64_linux_android`/`CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` = `<ndk>/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang`
+  and `AR_aarch64_linux_android` = `…/llvm-ar` (or simply `cargo ndk`).
