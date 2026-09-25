@@ -1606,6 +1606,10 @@ no manifest of its own; its use is declared in the app's manifest. If App Store 
 in an ITMS-91053 warning, add the same file to `app/rust_builder/{ios,macos}` as a `resource_bundles` entry of the
 podspec. A new Apple-side dependency that calls another required-reason API must be added to all three files.
 
+**`build_rust_ext.sh`.** Appends `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` to `PATH` (Xcode GUI builds),
+fails early without `cargo` or `cmake`, and runs `cargo rustc --locked`. cargokit's `build_pod.sh` (app/rust_builder)
+is unchanged; app/ios/README.md says how to build from the Xcode GUI.
+
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 
 **Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).

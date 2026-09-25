@@ -303,7 +303,8 @@ git status                             # commit everything it changed
   the C ABI** (`cargo rustc --crate-type staticlib --no-default-features --features bundled-opus`) into
   `$BUILT_PRODUCTS_DIR/libhfa_ext.a`, in its own cargo target directory. So `flutter build ios` needs the
   Rust targets `aarch64-apple-ios` (device) and `aarch64-apple-ios-sim` / `x86_64-apple-ios` (simulator);
-  the script adds missing ones with rustup and sources `~/.cargo/env` (Xcode build phases do not see
+  the script adds missing ones with rustup, sources `~/.cargo/env`, appends `~/.cargo/bin`, `/opt/homebrew/bin`,
+  `/usr/local/bin`, needs `cmake` and builds with `--locked` (Xcode build phases do not see
   your shell's `PATH`).
 - A Rust static library does not carry its framework dependencies: both targets link `AVFAudio`,
   `AudioToolbox`, `CoreAudio`, `CoreFoundation`, `Foundation`, `-lobjc` (and the extension `-liconv`,

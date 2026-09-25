@@ -78,7 +78,16 @@ background after `hfa_ext_sender_start` returned (see Known limitations).
 `aarch64-apple-ios-sim` / `x86_64-apple-ios` (simulator, `lipo`'d when both), in its own target
 directory (`$PROJECT_TEMP_DIR/hfa_ext_cargo`), and copies the archive to
 `$BUILT_PRODUCTS_DIR/libhfa_ext.a`. Debug → cargo dev profile, Release/Profile → `--release`
-(override: `HFA_EXT_RUST_PROFILE`). It sources `~/.cargo/env` and installs missing rustup targets.
+(override: `HFA_EXT_RUST_PROFILE`). It sources `~/.cargo/env`, appends `~/.cargo/bin`, `/opt/homebrew/bin` and
+`/usr/local/bin` to `PATH` (a build started from the Xcode GUI has a minimal `PATH`), fails early with a clear
+error when `cargo` or `cmake` (bundled libopus) is missing, builds with `--locked` (like CI: an Xcode build never
+rewrites `core/Cargo.lock`) and installs missing rustup targets.
+
+Xcode GUI builds: the app's own Rust pod (cargokit's `build_pod.sh`, in `app/rust_builder/`) also builds the
+bundled libopus with CMake but does not extend `PATH`. If a GUI build fails there with "cmake not found", build
+once from a terminal (`flutter build ios`; later GUI builds reuse the compiled libopus) or make Homebrew's
+directory visible to GUI apps (`sudo launchctl config user path "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"`,
+then restart the Mac).
 
 The extension links `-lhfa_ext` (`LIBRARY_SEARCH_PATHS = $(BUILT_PRODUCTS_DIR)`) plus what the
 static library needs (`rustc --print native-static-libs` for this configuration): `AVFAudio`,

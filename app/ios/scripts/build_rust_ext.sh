@@ -23,6 +23,10 @@
 #   HFA_EXT_CARGO_TARGET_DIR=<dir>       cargo target directory
 #                                        (default: $PROJECT_TEMP_DIR/hfa_ext_cargo)
 #
+# PATH: sources ~/.cargo/env, drops Xcode's developer directories and appends ~/.cargo/bin,
+# /opt/homebrew/bin and /usr/local/bin (an Xcode GUI build has a minimal PATH); needs cargo and
+# cmake (bundled libopus).
+#
 # Manual use outside Xcode (on a Mac), e.g. to check that the library builds:
 #   PLATFORM_NAME=iphoneos ARCHS=arm64 CONFIGURATION=Release BUILT_PRODUCTS_DIR=/tmp/out \
 #     PROJECT_DIR="$PWD/app/ios" PROJECT_TEMP_DIR=/tmp/hfa-ext sh app/ios/scripts/build_rust_ext.sh
@@ -50,9 +54,19 @@ fi
 # host build scripts use the regular /usr/bin toolchain shims.
 PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v 'Contents/Developer/' | tr '\n' ':')
 PATH=${PATH%:}
+# A build started from the Xcode GUI does not see the shell's PATH either: add rustup's and
+# Homebrew's directories (Apple Silicon, Intel), where cargo and cmake usually live.
+for dir in "$HOME/.cargo/bin" /opt/homebrew/bin /usr/local/bin; do
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) if [ -d "$dir" ]; then PATH="$PATH:$dir"; fi ;;
+  esac
+done
 export PATH
 
 command -v cargo >/dev/null 2>&1 || fail "cargo not found: install Rust with rustup (https://rustup.rs)"
+# The bundled libopus (opusic-sys) is built with CMake.
+command -v cmake >/dev/null 2>&1 || fail "cmake not found: install it (brew install cmake)"
 
 MANIFEST="$PROJECT_DIR/../../core/Cargo.toml"
 [ -f "$MANIFEST" ] || fail "Rust workspace not found at $MANIFEST"
@@ -98,10 +112,12 @@ for triple in $TRIPLES; do
     fi
   fi
   echo "note: building hfa-ffi ($PROFILE) for $triple"
-  # Only the staticlib crate type: the cdylib / rlib of hfa-ffi are not needed here.
+  # Only the staticlib crate type: the cdylib / rlib of hfa-ffi are not needed here. --locked:
+  # like CI, never rewrite core/Cargo.lock from an Xcode build.
   # shellcheck disable=SC2086 # PROFILE_FLAG is empty or a single word.
   cargo rustc \
     --manifest-path "$MANIFEST" \
+    --locked \
     -p hfa-ffi \
     --lib \
     --crate-type staticlib \
