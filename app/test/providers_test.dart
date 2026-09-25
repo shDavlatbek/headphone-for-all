@@ -30,6 +30,9 @@ const streamingStatus = SenderStatusDto(
   lossPct: 0,
   rttMs: 3,
   levelDb: -20,
+  hubGain: 1,
+  hubMuted: false,
+  hubPriority: false,
 );
 
 const trustedHub = HubInfoDto(
@@ -690,6 +693,9 @@ void main() {
           lossPct: 0,
           rttMs: 0,
           levelDb: -120,
+          hubGain: 1,
+          hubMuted: false,
+          hubPriority: false,
         ),
       );
       await settle();

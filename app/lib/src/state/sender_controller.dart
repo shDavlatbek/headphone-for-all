@@ -127,6 +127,11 @@ class SenderController extends Notifier<SenderState> {
   /// [start] ran in this controller.
   bool _startedHere = false;
 
+  /// Android: a capture found without a live sender at startup was stopped
+  /// (by the first status or by the native capture status, whichever came
+  /// first).
+  bool _strayCaptureStopped = false;
+
   /// This sender holds a reference on the multicast lock (it finds its hub
   /// by id over mDNS, also on every reconnect).
   bool _holdsMulticast = false;
@@ -186,7 +191,7 @@ class SenderController extends Notifier<SenderState> {
       if (live) {
         _nativeCapture = true;
       } else {
-        await _quietly(_native.stopSystemCapture);
+        await _stopStrayCapture();
       }
     } else if (live) {
       // The first status may have adopted this sender's capture already.
@@ -255,8 +260,15 @@ class SenderController extends Notifier<SenderState> {
     if (live) {
       _nativeCapture = true;
     } else {
-      unawaited(_quietly(_native.stopSystemCapture));
+      unawaited(_stopStrayCapture());
     }
+  }
+
+  /// Stops a capture left behind by an earlier UI, once.
+  Future<void> _stopStrayCapture() async {
+    if (_strayCaptureStopped) return;
+    _strayCaptureStopped = true;
+    await _quietly(_native.stopSystemCapture);
   }
 
   void _onNativeEvent(NativeEvent event) {

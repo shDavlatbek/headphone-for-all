@@ -80,6 +80,9 @@ void main() {
         lossPct: 0,
         rttMs: 3,
         levelDb: -20,
+        hubGain: 1,
+        hubMuted: false,
+        hubPriority: false,
       ),
     );
     expect(traySendingTo(live), 'Desk PC');
