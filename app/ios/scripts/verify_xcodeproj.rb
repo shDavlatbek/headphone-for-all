@@ -72,6 +72,14 @@ if runner && ext
     check.call(!sources.call(ext).include?(f), "HfaBroadcast must not compile #{f}")
   end
 
+  # App Store Connect rejects binaries whose required-reason API use is not declared.
+  { runner => 'Runner', ext => 'HfaBroadcast' }.each do |target, dir|
+    manifest = target.resources_build_phase.files_references.find { |f| f.path == 'PrivacyInfo.xcprivacy' }
+    check.call(manifest && File.exist?(File.join(IOS_DIR, dir, 'PrivacyInfo.xcprivacy')) &&
+               manifest.real_path.to_s == File.join(IOS_DIR, dir, 'PrivacyInfo.xcprivacy'),
+               "#{target.name} does not copy #{dir}/PrivacyInfo.xcprivacy")
+  end
+
   first = ext.build_phases.first
   check.call(first.is_a?(Xcodeproj::Project::Object::PBXShellScriptBuildPhase) &&
              first.shell_script.include?('build_rust_ext.sh'),
@@ -84,7 +92,7 @@ if runner && ext
   ext.build_configurations.each do |config|
     s = config.build_settings
     expect = {
-      'PRODUCT_BUNDLE_IDENTIFIER' => 'io.github.shdavlatbek.hfa.broadcast',
+      'PRODUCT_BUNDLE_IDENTIFIER' => '$(HFA_BROADCAST_BUNDLE_ID)',
       'IPHONEOS_DEPLOYMENT_TARGET' => '15.0',
       'SWIFT_OBJC_BRIDGING_HEADER' => 'HfaBroadcast/HfaBroadcast-Bridging-Header.h',
       'CODE_SIGN_ENTITLEMENTS' => 'HfaBroadcast/HfaBroadcast.entitlements',
@@ -104,6 +112,11 @@ if runner && ext
   runner.build_configurations.each do |config|
     check.call(config.build_settings['CODE_SIGN_ENTITLEMENTS'] == 'Runner/Runner.entitlements',
                "Runner [#{config.name}] lacks Runner/Runner.entitlements")
+    check.call(config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] == '$(HFA_BUNDLE_ID)',
+               "Runner [#{config.name}] PRODUCT_BUNDLE_IDENTIFIER is not $(HFA_BUNDLE_ID)")
+    base = config.base_configuration_reference&.path.to_s
+    check.call(%w[Debug.xcconfig Release.xcconfig Flutter/Debug.xcconfig Flutter/Release.xcconfig].include?(base),
+               "Runner [#{config.name}] is not based on Flutter/Debug.xcconfig or Flutter/Release.xcconfig")
     # The app must never link the extension's copy of the Rust library (duplicate symbols with
     # the cargokit pod's libhfa_ffi.a).
     check.call(!Array(config.build_settings['OTHER_LDFLAGS']).include?('-lhfa_ext'),
@@ -116,6 +129,51 @@ if runner && ext
     next if ref.path.start_with?('GeneratedPluginRegistrant')
 
     check.call(File.exist?(ref.real_path), "missing file #{ref.real_path}")
+  end
+end
+
+# Identity (ios/Identity.xcconfig): one place for the bundle ids and the App Group.
+identity = File.join(IOS_DIR, 'Identity.xcconfig')
+if File.exist?(identity)
+  text = File.read(identity)
+  %w[HFA_BUNDLE_ID HFA_BROADCAST_BUNDLE_ID HFA_APP_GROUP].each do |name|
+    check.call(text.match?(/^#{name}\s*=/), "Identity.xcconfig does not define #{name}")
+  end
+  check.call(text.include?('#include? "Identity.local.xcconfig"'),
+             'Identity.xcconfig does not include the optional Identity.local.xcconfig')
+else
+  errors << 'missing Identity.xcconfig'
+end
+{
+  'Flutter/Debug.xcconfig' => '#include "../Identity.xcconfig"',
+  'Flutter/Release.xcconfig' => '#include "../Identity.xcconfig"',
+  'HfaBroadcast/HfaBroadcast.xcconfig' => '#include "../Identity.xcconfig"'
+}.each do |path, line|
+  file = File.join(IOS_DIR, path)
+  check.call(File.exist?(file) && File.read(file).include?(line), "#{path} does not #{line}")
+end
+%w[Runner/Runner.entitlements HfaBroadcast/HfaBroadcast.entitlements].each do |path|
+  file = File.join(IOS_DIR, path)
+  check.call(File.exist?(file) && File.read(file).include?('<string>$(HFA_APP_GROUP)</string>'),
+             "#{path} does not use the App Group $(HFA_APP_GROUP)")
+end
+%w[Runner/Info.plist HfaBroadcast/Info.plist].each do |path|
+  file = File.join(IOS_DIR, path)
+  text = File.exist?(file) ? File.read(file) : ''
+  { 'HfaAppGroup' => '$(HFA_APP_GROUP)', 'HfaBroadcastExtension' => '$(HFA_BROADCAST_BUNDLE_ID)' }.each do |key, value|
+    check.call(text.match?(%r{<key>#{key}</key>\s*<string>#{Regexp.escape(value)}</string>}),
+               "#{path} lacks #{key} = #{value}")
+  end
+end
+
+# App icon: the committed PNGs are packaging/icon/generate.py's output (packaging/icon/out/ios).
+icon_src = File.expand_path('../../packaging/icon/out/ios/AppIcon.appiconset', IOS_DIR)
+icon_dst = File.join(IOS_DIR, 'Runner', 'Assets.xcassets', 'AppIcon.appiconset')
+if Dir.exist?(icon_src)
+  Dir.glob(File.join(icon_src, '*.png')).each do |png|
+    target = File.join(icon_dst, File.basename(png))
+    check.call(File.exist?(target) && File.binread(target) == File.binread(png),
+               "#{File.basename(png)} differs from packaging/icon/out/ios (copy the generated icons)")
   end
 end
 

@@ -9,11 +9,15 @@ import Foundation
 
 /// Identifiers and helpers shared by the app and the broadcast extension.
 enum HfaShared {
-  /// App Group shared by the app and the extension (both entitlements files list it).
-  static let appGroupId = "group.io.github.shdavlatbek.hfa"
+  /// App Group shared by the app and the extension: the `HfaAppGroup` key of both Info.plists,
+  /// set from the `HFA_APP_GROUP` build setting (`app/ios/Identity.xcconfig`), which both
+  /// entitlements files use too.
+  static let appGroupId = infoString("HfaAppGroup") ?? "group.io.github.shdavlatbek.hfa"
 
-  /// Bundle id of the broadcast upload extension (`RPSystemBroadcastPickerView.preferredExtension`).
-  static let broadcastExtensionBundleId = "io.github.shdavlatbek.hfa.broadcast"
+  /// Bundle id of the broadcast upload extension (`RPSystemBroadcastPickerView.preferredExtension`):
+  /// the `HfaBroadcastExtension` key of both Info.plists (`HFA_BROADCAST_BUNDLE_ID`).
+  static let broadcastExtensionBundleId =
+    infoString("HfaBroadcastExtension") ?? "io.github.shdavlatbek.hfa.broadcast"
 
   /// Directory inside the container that holds the Rust data (settings, identity, trusted hubs).
   static let dataDirName = "hfa"
@@ -24,11 +28,21 @@ enum HfaShared {
   /// Last broadcast state written by the extension (read by the app to explain a failure).
   static let broadcastStatusFileName = "broadcast_status.json"
 
-  /// Darwin notification posted by the extension once the Rust sender runs.
-  static let broadcastStartedNotification = "io.github.shdavlatbek.hfa.broadcast.started"
+  /// Darwin notification posted by the extension once the Rust sender runs
+  /// (`<extension bundle id>.started`: builds with other ids never hear each other).
+  static let broadcastStartedNotification = "\(broadcastExtensionBundleId).started"
 
   /// Darwin notification posted by the extension when the broadcast ends (normally or not).
-  static let broadcastFinishedNotification = "io.github.shdavlatbek.hfa.broadcast.finished"
+  static let broadcastFinishedNotification = "\(broadcastExtensionBundleId).finished"
+
+  /// A non-empty string value of the current bundle's Info.plist, or `nil` (missing, or a build
+  /// setting that was not expanded).
+  static func infoString(_ key: String) -> String? {
+    guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+      !value.isEmpty, !value.contains("$(")
+    else { return nil }
+    return value
+  }
 
   /// The App Group container, or `nil` when the App Group entitlement is missing (for example
   /// an unsigned build).
@@ -67,7 +81,8 @@ enum HfaShared {
 /// decodes the file and replaces `data_dir` with the directory it computes itself
 /// (`forSender(fileData:dataDir:)`) before passing the JSON to Rust.
 struct BroadcastConfig: Codable, Equatable {
-  /// Hub host name or address; empty = find `hubDeviceId` over mDNS.
+  /// Hub host name or address. Required: the app refuses an empty one (`writeBroadcastConfig`),
+  /// since mDNS discovery needs the restricted multicast entitlement on iOS.
   var hubHost: String
   /// Hub UDP/TCP port; 0 = the port in the shared settings.
   var hubPort: Int
@@ -124,12 +139,16 @@ struct BroadcastConfig: Codable, Equatable {
 
 /// `broadcast_status.json`: written by the extension before it posts a Darwin notification.
 struct BroadcastStatus: Codable, Equatable {
-  /// `"started"` or `"finished"`.
+  /// `"started"` or `"finished"`. Readers treat any other value like `"started"` (a running
+  /// broadcast), so the extension may report finer states later.
   var state: String
   /// Why the broadcast finished (an error description), or `nil`.
   var message: String?
   /// Seconds since 1970 when the status was written.
   var timestamp: Double
+
+  /// Whether the extension was running when it wrote this status (anything but `finished`).
+  var isActive: Bool { state != "finished" }
 
   /// Reads the status file; `nil` when it is missing or unreadable.
   static func read() -> BroadcastStatus? {

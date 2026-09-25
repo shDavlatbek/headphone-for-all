@@ -13,6 +13,7 @@ Registered in `Runner/MainFlutterWindow.swift`, implemented in `Runner/HfaPlatfo
 | `getDataDir` | `~/Library/Application Support/io.github.shdavlatbek.hfa/hfa` (created; inside the sandbox container `~/Library/Containers/io.github.shdavlatbek.hfa/Data/...`). Same place as the Dart fallback (`path_provider` + `/hfa`). |
 | `captureSupport` | `{supported: true, reason: "processTap"}` on macOS 14.2+, else `{supported: false, reason: "<needs macOS 14.2...>"}` |
 | `startSystemCapture` | `false` (not used: Rust captures directly) |
+| `startHubService` / `stopHubService` | begin / end `ProcessInfo.beginActivity([.userInitiated, .latencyCritical])`: no App Nap (the window is usually hidden to the tray while the hub runs) and no idle system sleep |
 | other §8.3 methods | no-op (`nil`) |
 
 The event channel is not registered (Dart listens to it only on Android and iOS).
@@ -55,6 +56,14 @@ entitlements above. **If manual testing on a Mac shows taps failing only because
 (silence or `AudioHardwareCreateProcessTap`/aggregate-device errors that disappear unsandboxed),
 set `com.apple.security.app-sandbox` to `false` in both entitlements files (this is a
 Developer ID / notarized DMG build, not a Mac App Store one) and document the macOS version here.
+
+## Privacy manifest
+
+`Runner/PrivacyInfo.xcprivacy` (copied into `Contents/Resources` by the Resources phase; added by
+`scripts/configure_xcodeproj.rb`): no tracking, no collected data, required-reason APIs FileTimestamp `C617.1`
+(Rust `std::fs` metadata calls `stat`/`fstat`) and SystemBootTime `35F9.1` (cpal's Core Audio backend calls
+`mach_absolute_time`). Needed only for a Mac App Store upload; harmless for the Developer ID DMG. Same content as
+the iOS manifests.
 
 ## Deployment target
 

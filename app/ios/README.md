@@ -20,17 +20,29 @@ broadcast upload extension streams what the phone plays).
 | `scripts/add_broadcast_extension.rb` | adds everything above to `Runner.xcodeproj` (idempotent; the result is committed) |
 | `scripts/verify_xcodeproj.rb` | prints targets / build phases and checks the project invariants |
 | `RunnerTests/RunnerTests.swift` | XCTest: config/status JSON formats and the PCM converter |
+| `Runner/PrivacyInfo.xcprivacy`, `HfaBroadcast/PrivacyInfo.xcprivacy` | privacy manifests (Resources of both targets): no tracking, no collected data; required-reason APIs FileTimestamp `C617.1` (Rust `std::fs` metadata → `stat`/`fstat`) and SystemBootTime `35F9.1` (cpal's Core Audio backend → `mach_absolute_time`). Re-check with `nm -u` of the built binaries when dependencies change |
+| `Identity.xcconfig` | `HFA_BUNDLE_ID` (app), `HFA_BROADCAST_BUNDLE_ID` (extension), `HFA_APP_GROUP`; override them in a git-ignored `Identity.local.xcconfig` |
 
 ## Platform channel (iOS)
 
 | Method | Behaviour |
 |---|---|
-| `getDataDir` | `<App Group group.io.github.shdavlatbek.hfa>/hfa` (created); fallback Application Support `/hfa` when the App Group is missing (unsigned build: the extension then cannot share the pairing) |
+| `getDataDir` | `<App Group>/hfa` (created). Without the App Group (a build not signed with the App Groups capability) `FlutterError("NO_APP_GROUP")`, which the app shows as a start-up error: a private directory would hide the pairings from the extension. Only Simulator builds fall back to Application Support `/hfa` |
 | `startHubService` / `stopHubService` | `AVAudioSession` category `.playback` with `.mixWithOthers`, `setActive(true)` / `setActive(false, .notifyOthersOnDeactivation)`; errors → `FlutterError("AUDIO_SESSION")` |
-| `writeBroadcastConfig` | `{hubHost, hubPort, hubDeviceId?, hubKey?, label}` → `<container>/broadcast_config.json` with the C ABI keys plus `data_dir` (`FlutterError("NO_APP_GROUP")` without the App Group) |
+| `writeBroadcastConfig` | `{hubHost, hubPort, hubDeviceId?, hubKey?, label}` → `<container>/broadcast_config.json` with the C ABI keys plus `data_dir`. `hubHost` is required (`BAD_ARGS`: the extension cannot look for hubs, see Known limitations); `FlutterError("NO_APP_GROUP")` without the App Group |
 | `captureSupport` | `{supported: true, reason: "broadcast"}` |
 | `startSystemCapture` | `false` (the user starts the broadcast with the picker) |
 | `stopSystemCapture`, `acquireMulticastLock`, `releaseMulticastLock` | no-op |
+| `getBroadcastStatus` | `{broadcasting, state?, message?, timestamp?}`: whether a broadcast runs now, plus the extension's last `broadcast_status.json` |
+
+**Broadcast state re-sync.** Besides forwarding the Darwin notifications (below), the channel compares
+`broadcast_status.json` with the screen capture state (`UIWindowScene.screen.isCaptured`, and
+`sceneCaptureState` on iOS 17+) whenever Dart starts listening, the app becomes active or the capture state
+changes. A status other than `finished` while the screen is captured is a running broadcast: a new listener
+gets `broadcastStarted` (the app was relaunched while the extension kept broadcasting). A status other than
+`finished` while nothing is captured for 8 s means ReplayKit ended the extension without `broadcastFinished`
+(memory limit, crash): the app writes a `finished` status and sends `broadcastFinished` with "The broadcast
+stopped unexpectedly ...". Only changes relative to what Dart was last told are sent.
 
 Events: `{type: "broadcastStarted"}` and `{type: "broadcastFinished", message?}`, driven by the Darwin
 notifications `io.github.shdavlatbek.hfa.broadcast.started` / `.finished` that the extension posts.
@@ -43,7 +55,7 @@ this device (`hfa_ext_sender_state` reported `failed`, e.g. pairing required). A
 
 ## Broadcast extension `HfaBroadcast`
 
-- Bundle id `io.github.shdavlatbek.hfa.broadcast`, iOS 15, principal class `SampleHandler`,
+- Bundle id `$(HFA_BROADCAST_BUNDLE_ID)` (`io.github.shdavlatbek.hfa.broadcast` by default), iOS 15, principal class `SampleHandler`,
   `RPBroadcastProcessMode = RPBroadcastProcessModeSampleBuffer`, App Group entitlement.
 - `broadcastStarted` reads `broadcast_config.json` (the C ABI keys), replaces its `data_dir` with
   `<container>/hfa` resolved in the extension's own process (a stored absolute container path can be
@@ -71,7 +83,16 @@ this device (`hfa_ext_sender_state` reported `failed`, e.g. pairing required). A
 `aarch64-apple-ios-sim` / `x86_64-apple-ios` (simulator, `lipo`'d when both), in its own target
 directory (`$PROJECT_TEMP_DIR/hfa_ext_cargo`), and copies the archive to
 `$BUILT_PRODUCTS_DIR/libhfa_ext.a`. Debug → cargo dev profile, Release/Profile → `--release`
-(override: `HFA_EXT_RUST_PROFILE`). It sources `~/.cargo/env` and installs missing rustup targets.
+(override: `HFA_EXT_RUST_PROFILE`). It sources `~/.cargo/env`, appends `~/.cargo/bin`, `/opt/homebrew/bin` and
+`/usr/local/bin` to `PATH` (a build started from the Xcode GUI has a minimal `PATH`), fails early with a clear
+error when `cargo` or `cmake` (bundled libopus) is missing, builds with `--locked` (like CI: an Xcode build never
+rewrites `core/Cargo.lock`) and installs missing rustup targets.
+
+Xcode GUI builds: the app's own Rust pod (cargokit's `build_pod.sh`, in `app/rust_builder/`) also builds the
+bundled libopus with CMake but does not extend `PATH`. If a GUI build fails there with "cmake not found", build
+once from a terminal (`flutter build ios`; later GUI builds reuse the compiled libopus) or make Homebrew's
+directory visible to GUI apps (`sudo launchctl config user path "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"`,
+then restart the Mac).
 
 The extension links `-lhfa_ext` (`LIBRARY_SEARCH_PATHS = $(BUILT_PRODUCTS_DIR)`) plus what the
 static library needs (`rustc --print native-static-libs` for this configuration): `AVFAudio`,
@@ -102,6 +123,28 @@ It adds the `HfaBroadcast` target (Debug/Release/Profile, base configuration
 depend on it, compiles the new Runner sources, sets `CODE_SIGN_ENTITLEMENTS` for Runner and
 compiles `PcmInterleaver.swift` into RunnerTests as well.
 
+### Identity (bundle ids, App Group, team)
+
+`ios/Identity.xcconfig` is the only place that names them; Runner's `Flutter/Debug.xcconfig` /
+`Release.xcconfig` and `HfaBroadcast/HfaBroadcast.xcconfig` include it:
+
+| Setting | Default | Used by |
+|---|---|---|
+| `HFA_BUNDLE_ID` | `io.github.shdavlatbek.hfa` | Runner `PRODUCT_BUNDLE_IDENTIFIER` |
+| `HFA_BROADCAST_BUNDLE_ID` | `$(HFA_BUNDLE_ID).broadcast` | HfaBroadcast `PRODUCT_BUNDLE_IDENTIFIER`; the `HfaBroadcastExtension` Info.plist key (the picker's `preferredExtension`, the Darwin notification names `<id>.started` / `.finished`) |
+| `HFA_APP_GROUP` | `group.$(HFA_BUNDLE_ID)` | both `.entitlements` files; the `HfaAppGroup` Info.plist key (`HfaShared.appGroupId`) |
+
+To build with another team, create `ios/Identity.local.xcconfig` (git-ignored, included at the end of
+`Identity.xcconfig`):
+
+```
+HFA_BUNDLE_ID = com.example.hfa
+DEVELOPMENT_TEAM = ABCDE12345
+```
+
+Xcode expands the settings in the Info.plists and the entitlements; `verify_xcodeproj.rb` checks that nothing
+names the ids directly.
+
 ## What is verified where
 
 On Linux (this repository's dev container):
@@ -125,10 +168,11 @@ Only on a real iPhone (ReplayKit broadcasts do not run in the Simulator): everyt
 
 ## Manual test (iPhone + a hub on the same Wi-Fi)
 
-1. Signing: give the App ID `io.github.shdavlatbek.hfa` **and** `io.github.shdavlatbek.hfa.broadcast`
-   the App Groups capability with `group.io.github.shdavlatbek.hfa`; select your team for both
-   targets in Xcode (Runner and HfaBroadcast). Without the App Group the extension reports
-   "cannot reach its shared storage".
+1. Signing: App IDs and App Groups belong to one team, so unless you are the owner of
+   `io.github.shdavlatbek.hfa`, create `ios/Identity.local.xcconfig` with `HFA_BUNDLE_ID = <your prefix>`
+   (and `DEVELOPMENT_TEAM = <your team id>`); see Identity (below). Give the App IDs `$(HFA_BUNDLE_ID)` **and**
+   `$(HFA_BUNDLE_ID).broadcast` the App Groups capability with `group.$(HFA_BUNDLE_ID)` (Xcode's automatic
+   signing does this). Without the App Group the app stops at start-up with `NO_APP_GROUP`.
 2. `flutter run --release` on the iPhone. Allow local network access when asked.
 3. Start a hub on another device (the app, or the `hfa` CLI), pair the iPhone (QR or PIN) and choose
    that hub as the target: the app writes `broadcast_config.json`.

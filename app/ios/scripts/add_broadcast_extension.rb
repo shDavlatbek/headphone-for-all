@@ -16,12 +16,15 @@
 #
 # What it does:
 # - Runner: adds HfaPlatformChannel.swift, BroadcastPickerFactory.swift, Shared/HfaShared.swift
-#   to the Sources phase and CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements (App Group).
+#   to the Sources phase, CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements (App Group) and
+#   PRODUCT_BUNDLE_IDENTIFIER = $(HFA_BUNDLE_ID) (ios/Identity.xcconfig).
 # - RunnerTests: also compiles HfaBroadcast/PcmInterleaver.swift (unit tests of the converter).
-# - HfaBroadcast (com.apple.product-type.app-extension, bundle io.github.shdavlatbek.hfa.broadcast):
+# - HfaBroadcast (com.apple.product-type.app-extension, bundle $(HFA_BROADCAST_BUNDLE_ID), i.e.
+#   io.github.shdavlatbek.hfa.broadcast unless Identity.local.xcconfig overrides HFA_BUNDLE_ID):
 #   sources SampleHandler.swift, PcmInterleaver.swift, Shared/HfaShared.swift; first build phase
 #   "Build Rust sender (hfa-ffi)" runs scripts/build_rust_ext.sh (-> $BUILT_PRODUCTS_DIR/libhfa_ext.a);
 #   links libhfa_ext.a plus the system frameworks/libraries the Rust static library needs.
+# - Runner and HfaBroadcast copy their PrivacyInfo.xcprivacy (required-reason API declarations).
 # - Runner embeds HfaBroadcast.appex with an "Embed Foundation Extensions" copy-files phase
 #   (dstSubfolderSpec 13 = PlugIns) placed before Flutter's "Thin Binary" script (avoids Xcode's
 #   "Cycle inside Runner" error) and depends on the extension target.
@@ -32,12 +35,18 @@ IOS_DIR = File.expand_path('..', __dir__)
 PROJECT_PATH = File.join(IOS_DIR, 'Runner.xcodeproj')
 
 EXT_NAME = 'HfaBroadcast'
-EXT_BUNDLE_ID = 'io.github.shdavlatbek.hfa.broadcast'
+# Bundle ids come from ios/Identity.xcconfig (included by the targets' base configurations).
+RUNNER_BUNDLE_ID = '$(HFA_BUNDLE_ID)'
+EXT_BUNDLE_ID = '$(HFA_BROADCAST_BUNDLE_ID)'
 DEPLOYMENT_TARGET = '15.0'
 RUST_PHASE_NAME = 'Build Rust sender (hfa-ffi)'
 EMBED_PHASE_NAME = 'Embed Foundation Extensions'
 PLUGINS_DST_SUBFOLDER_SPEC = '13'
 
+# Privacy manifest of Runner and HfaBroadcast: the Rust core calls stat/fstat (std::fs metadata,
+# FileTimestamp C617.1: files in the app / App Group container) and cpal's Core Audio backend
+# mach_absolute_time (SystemBootTime 35F9.1: elapsed time inside the app).
+PRIVACY_MANIFEST = 'PrivacyInfo.xcprivacy'
 RUNNER_SOURCES = %w[HfaPlatformChannel.swift BroadcastPickerFactory.swift].freeze
 EXT_SOURCES = %w[SampleHandler.swift PcmInterleaver.swift].freeze
 EXT_OTHER_FILES = %w[
@@ -120,6 +129,17 @@ def ensure_file(group, name)
   group.new_reference(name)
 end
 
+# Adds the privacy manifest `group/PrivacyInfo.xcprivacy` to the target's Resources phase (App Store
+# Connect requires the required-reason APIs the binary uses to be declared, see PRIVACY_MANIFEST).
+def ensure_privacy_manifest(target, group)
+  ref = ensure_file(group, PRIVACY_MANIFEST)
+  ref.last_known_file_type = 'text.xml'
+  return if target.resources_build_phase.files_references.include?(ref)
+
+  log("#{target.name}: resource #{PRIVACY_MANIFEST}")
+  target.resources_build_phase.add_file_reference(ref, true)
+end
+
 # Adds `ref` to the target's Sources phase unless it is there already.
 def ensure_source(target, ref)
   return if target.source_build_phase.files_references.include?(ref)
@@ -156,9 +176,11 @@ shared_swift = ensure_file(shared_group, 'HfaShared.swift')
 runner_group = main.children.find { |c| c.display_name == 'Runner' } or abort('Runner group not found')
 RUNNER_SOURCES.each { |name| ensure_source(runner, ensure_file(runner_group, name)) }
 ensure_source(runner, shared_swift)
+ensure_privacy_manifest(runner, runner_group)
 ensure_file(runner_group, 'Runner.entitlements')
 runner.build_configurations.each do |config|
-  set_settings(config, 'CODE_SIGN_ENTITLEMENTS' => 'Runner/Runner.entitlements')
+  set_settings(config, 'CODE_SIGN_ENTITLEMENTS' => 'Runner/Runner.entitlements',
+                       'PRODUCT_BUNDLE_IDENTIFIER' => RUNNER_BUNDLE_ID)
 end
 
 # --- Extension target ------------------------------------------------------------------------
@@ -180,6 +202,7 @@ ext.product_name = EXT_NAME
 ext_group = ensure_group(main, EXT_NAME, EXT_NAME)
 EXT_SOURCES.each { |name| ensure_source(ext, ensure_file(ext_group, name)) }
 ensure_source(ext, shared_swift)
+ensure_privacy_manifest(ext, ext_group)
 # The PCM converter is unit-tested in RunnerTests (an app extension cannot host tests).
 runner_tests = project.targets.find { |t| t.name == 'RunnerTests' }
 ensure_source(runner_tests, ensure_file(ext_group, 'PcmInterleaver.swift')) if runner_tests

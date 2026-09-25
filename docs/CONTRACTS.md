@@ -1800,6 +1800,79 @@ the Swift side logs failures with `os.Logger`. (3) `mdns-sd` on iOS needs the re
 `com.apple.developer.networking.multicast` entitlement, so iOS should pass an explicit `hubHost` (and a
 native `NWBrowser` discovery remains to be done, ARCHITECTURE.md).
 
+### 8.9.1 Refinements made by `fix/apple` (the code in `app/ios` and `app/macos` is authoritative; overrides §8.3 and §8.9 where they differ)
+
+**iOS `getDataDir` is strict.** `<App Group container>/hfa` as before, but without the App Group (a device build
+not signed with the App Groups capability) the answer is `FlutterError("NO_APP_GROUP", <what to sign and how>)`
+instead of a private Application Support directory, so the Dart bootstrap's strict iOS rule (§8.7) shows the
+start-up error. Only Simulator builds (`targetEnvironment(simulator)`) keep the Application Support `/hfa` fallback.
+`DATA_DIR` stays the I/O error. The policy is `HfaPlatformChannel.resolveDataDir(shared:privateFallback:)`
+(RunnerTests `DataDirTests`).
+
+**`writeBroadcastConfig` requires `hubHost`** (`BAD_ARGS` "The hub's address is unknown ... Add the hub by address
+or scan its QR code."): the extension cannot discover a hub by id (mDNS needs the restricted multicast
+entitlement), so a host-less configuration could only fail after the broadcast started. `hubDeviceId` stays
+optional. `writeBroadcastConfig`'s `NO_APP_GROUP` uses the same message as `getDataDir`.
+
+**Broadcast state re-sync (iOS).** `broadcastStarted` / `broadcastFinished` no longer come only from the Darwin
+notifications. `HfaPlatformChannel` also evaluates `broadcast_status.json` against the screen capture state
+(`BroadcastSync.evaluate`: no status or `finished` → idle with its message; any other state → running while the
+screen is captured, else "vanished") when Dart starts listening, when the app becomes active and on
+`UIScreen.capturedDidChangeNotification`, and sends an event only when the result differs from what Dart was last
+told (a new listener counts as told "not broadcasting"). So a relaunched app learns about a broadcast that is still
+running, and a broadcast whose extension ReplayKit killed without `broadcastFinished` (memory limit, crash) ends
+after 8 s "vanished" with `broadcastFinished` and the message "The broadcast stopped unexpectedly ...", which the
+app also writes as a `finished` status. `broadcast_status.json` readers treat any `state` other than `finished`
+as running. New method **`getBroadcastStatus`** → `{broadcasting: bool, state?, message?, timestamp?}` (iOS only;
+other platforms do not implement it).
+
+**iOS identity in one place.** `app/ios/Identity.xcconfig` defines `HFA_BUNDLE_ID` (default
+`io.github.shdavlatbek.hfa`), `HFA_BROADCAST_BUNDLE_ID = $(HFA_BUNDLE_ID).broadcast` and
+`HFA_APP_GROUP = group.$(HFA_BUNDLE_ID)`, optionally overridden by a git-ignored `Identity.local.xcconfig` (also the
+place for `DEVELOPMENT_TEAM`). Runner (`Flutter/Debug.xcconfig`, `Release.xcconfig`) and HfaBroadcast
+(`HfaBroadcast.xcconfig`) include it; `PRODUCT_BUNDLE_IDENTIFIER` is `$(HFA_BUNDLE_ID)` /
+`$(HFA_BROADCAST_BUNDLE_ID)`, both `.entitlements` list `$(HFA_APP_GROUP)`, and both Info.plists carry
+`HfaAppGroup = $(HFA_APP_GROUP)` and `HfaBroadcastExtension = $(HFA_BROADCAST_BUNDLE_ID)`, which
+`HfaShared.appGroupId` / `broadcastExtensionBundleId` read (falling back to the defaults). The Darwin notification
+names are derived: `<broadcastExtensionBundleId>.started` / `.finished` (unchanged for the default ids).
+`verify_xcodeproj.rb` checks all of it. This supersedes the literal ids of §8.2 and §8.9 for iOS.
+
+**Privacy manifests.** `app/ios/Runner/PrivacyInfo.xcprivacy`, `app/ios/HfaBroadcast/PrivacyInfo.xcprivacy` and
+`app/macos/Runner/PrivacyInfo.xcprivacy` are in their targets' Resources phases (added by
+`add_broadcast_extension.rb` / `configure_xcodeproj.rb`, checked by `verify_xcodeproj.rb` / `--check`):
+`NSPrivacyTracking = false`, no tracking domains, no collected data types, and the required-reason APIs
+`NSPrivacyAccessedAPICategoryFileTimestamp` (`C617.1`: Rust `std::fs` metadata → `stat`/`fstat` on files in the app
+or App Group container) and `NSPrivacyAccessedAPICategorySystemBootTime` (`35F9.1`: cpal's Core Audio backend calls
+`mach_absolute_time`). The Rust pod (`rust_lib_headphone_for_all`, a framework inside the app under `use_frameworks!`) has
+no manifest of its own; its use is declared in the app's manifest. If App Store Connect ever names that framework
+in an ITMS-91053 warning, add the same file to `app/rust_builder/{ios,macos}` as a `resource_bundles` entry of the
+podspec. A new Apple-side dependency that calls another required-reason API must be added to all three files.
+
+**`build_rust_ext.sh`.** Appends `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` to `PATH` (Xcode GUI builds),
+fails early without `cargo` or `cmake`, and runs `cargo rustc --locked`. cargokit's `build_pod.sh` (app/rust_builder)
+is unchanged; app/ios/README.md says how to build from the Xcode GUI.
+
+**macOS hub activity.** `startHubService` / `stopHubService` (which the Dart hub controller calls on every
+platform) now begin / end a `ProcessInfo` activity (`.userInitiated` + `.latencyCritical`, idempotent) instead of
+doing nothing, so App Nap cannot throttle a hub whose window is hidden to the tray, and idle sleep is held off while
+it runs. A sender has no such native call yet: if a Mac test shows App Nap throttling a process-tap sender with the
+window hidden (Activity Monitor's "App Nap" column), add `beginStreaming` / `endStreaming` around `senderStart` /
+`senderStop` in Dart backed by the same kind of activity.
+
+**App icons.** The iOS and macOS `AppIcon.appiconset` PNGs are now `packaging/icon/generate.py`'s output
+(`packaging/icon/out/{ios,macos}`, byte for byte; `Contents.json` was already equivalent and keeps Xcode's
+formatting). `verify_xcodeproj.rb` and `configure_xcodeproj.rb` fail when a committed PNG differs from the
+generator output, so regenerate and copy both together.
+
+**Not done in `fix/apple` (and why).** Native Bonjour for iOS (browse with `NWBrowser`, advertise an iOS hub with
+`NWListener`/`NetService`) needs `fix/core-sec`'s `discovery::set_platform_backend` hook and a registration path
+through `hfa-ffi`, neither of which exists on this branch; until then iOS dials hubs at their remembered address
+(`fix/flutter`), and both `writeBroadcastConfig` and the C ABI (`fix/ffi-cli`) refuse an empty host. The
+extension's live connection state (`hfa_ext_sender_state`, ending the broadcast on `failed`) is `fix/ffi-cli`'s;
+forwarding `connecting`/`reconnecting` to the app (a `broadcast_status.json` state other than `started`, which the
+re-sync above already treats as running) can build on it after the merge. The running engines' trust-store
+snapshot is `fix/core-sec`'s shared store.
+
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 
 **Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).
