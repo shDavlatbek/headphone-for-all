@@ -137,9 +137,10 @@ class SenderStatusCard extends ConsumerWidget {
                     ],
                   ),
                 ),
-                action,
               ],
             ),
+            const SizedBox(height: 12),
+            Align(alignment: Alignment.centerRight, child: action),
             if (sender.isLive) ...[
               const SizedBox(height: 12),
               LevelMeter(levelDb: status.levelDb),

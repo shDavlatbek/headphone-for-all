@@ -7,7 +7,7 @@
 library;
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
-    show AnyhowException;
+    show AnyhowException, PanicException;
 
 import '../rust/api/app.dart';
 import '../rust/api/hub.dart';
@@ -143,6 +143,9 @@ const idleSenderStatus = SenderStatusDto(
 String describeError(Object error) {
   return switch (error) {
     AnyhowException(:final message) => _firstLine(message),
+    // frb appends the Rust backtrace to the panic message.
+    PanicException(:final message) =>
+      'Internal error: ${_firstLine(message.split('Backtrace [').first)}',
     HfaApiException(:final message) => message,
     StateError(:final message) => message,
     ArgumentError(:final message) => '$message',

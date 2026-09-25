@@ -1,3 +1,5 @@
+import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
+    show AnyhowException, PanicException;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/models/hub_target.dart';
@@ -199,5 +201,13 @@ void main() {
   test('describeError extracts the core message', () {
     expect(describeError(const HfaApiException('boom')), 'boom');
     expect(describeError(StateError('bad')), 'bad');
+    expect(
+      describeError(AnyhowException('the hub is not running\n\nStack:\n0: x')),
+      'the hub is not running',
+    );
+    expect(
+      describeError(PanicException('todo: engineBacktrace [{ fn: "x" }]')),
+      'Internal error: todo: engine',
+    );
   });
 }

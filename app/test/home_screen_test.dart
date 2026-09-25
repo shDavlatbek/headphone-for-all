@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/bootstrap.dart';
+import 'package:headphone_for_all/src/state/navigation.dart';
 
 import 'helpers.dart';
 
@@ -71,6 +72,45 @@ void main() {
     expect(find.text('Hub is on'), findsOneWidget);
     await unmount(tester);
   });
+
+  for (final (platform, size) in const [
+    ('android', Size(360, 740)),
+    ('ios', Size(360, 740)),
+    ('linux', Size(360, 740)),
+    ('windows', Size(1280, 800)),
+  ]) {
+    testWidgets('every $platform screen lays out at ${size.width.toInt()} px', (
+      tester,
+    ) async {
+      final fake = FakeHfaApi(
+        platform: platform,
+        discoverableHubs: const [
+          HubInfoDto(
+            deviceId: 'h1',
+            name: 'A hub with a rather long name for a small phone',
+            addrs: ['fe80::1234:5678:9abc:def0'],
+            port: 47810,
+            platform: 'windows',
+            trusted: false,
+          ),
+        ],
+        trusted: const [
+          TrustedPeerDto(deviceId: 'p1', name: 'Tablet', pairedAtUnix: 0),
+        ],
+      )..addSource(FakeHfaApi.source(streamId: 1, label: 'A long app label'));
+      final container = await pumpApp(tester, fake, size: size);
+      for (final section in AppSection.values) {
+        container.read(sectionProvider.notifier).select(section);
+        await tester.pumpAndSettle();
+        if (section == AppSection.hub) {
+          await tester.tap(find.byKey(const Key('hub-toggle')));
+          await tester.pumpAndSettle();
+          expect(find.byKey(const Key('source-1')), findsOneWidget);
+        }
+      }
+      await unmount(tester);
+    });
+  }
 
   testWidgets('the init error screen shows the reason and retries', (
     tester,
