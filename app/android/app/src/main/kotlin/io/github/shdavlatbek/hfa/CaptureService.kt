@@ -319,6 +319,17 @@ class CaptureService : Service() {
         )
     }
 
+    /**
+     * Why the projection ended by itself. Since Android 15 QPR1 locking the screen (also by the
+     * screen-off timeout) ends every MediaProjection, so on API 35+ the message names it.
+     */
+    private fun projectionStoppedMessage(): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            R.string.capture_stopped_by_system_or_lock
+        } else {
+            R.string.capture_stopped_by_system
+        }
+
     @Suppress("DEPRECATION") // getParcelableExtra(String) is the only variant before API 33.
     private fun consentData(intent: Intent): Intent? =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -333,11 +344,7 @@ class CaptureService : Service() {
             val capture = active
             if (capture == null || capture.session != session) return
             endActive {
-                CaptureCoordinator.onServiceStopped(
-                    this@CaptureService,
-                    it,
-                    getString(R.string.capture_stopped_by_system),
-                )
+                CaptureCoordinator.onServiceStopped(this@CaptureService, it, getString(projectionStoppedMessage()))
             }
         }
     }
