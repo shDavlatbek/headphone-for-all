@@ -37,6 +37,8 @@ target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 # SetCurrentProcessExplicitAppUserModelID (main.cpp).
 target_link_libraries(${BINARY_NAME} PRIVATE "shell32.lib")
+# ConvertStringSecurityDescriptorToSecurityDescriptorW (single_instance.cpp).
+target_link_libraries(${BINARY_NAME} PRIVATE "advapi32.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

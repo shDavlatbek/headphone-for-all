@@ -36,7 +36,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
       HasArgument(command_line_arguments, kAutostartArgument);
 
   const UINT activate_message = RegisterActivateMessage(kActivateMessageName);
-  SingleInstanceGuard single_instance(kSingleInstanceMutexName);
+  // Debug builds skip the guard (kEnforceSingleInstance).
+  SingleInstanceGuard single_instance(
+      kEnforceSingleInstance ? kSingleInstanceMutexName : nullptr);
   if (!single_instance.IsFirstInstance()) {
     // A sign-in launch never pops up an instance that is already running.
     if (!autostart &&
