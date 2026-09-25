@@ -1634,6 +1634,11 @@ the version comes from `app/pubspec.yaml` without the `+build` part.
 
 These supersede the matching statements of §8.5 and the "Open" list of §8.9.
 
+**Event subscriptions (`manager.rs`).** `sender_events` computes the current status and joins the subscription set
+under the set's lock (`SinkSet::add_with_initial`), and `sender_start` fills the sender slot before the forwarder can
+relay anything (`broadcast_then`), so a status change can no longer fall between the initial status and the
+subscription (e.g. a final `failed` that would leave the stream at `pairing`). Lock order: sinks → state → meta.
+
 **C ABI (`c_api.rs`, `hfa_ext.h`).**
 - **Trust, not just a key.** `hfa_ext_sender_start` requires the resolved hub key (`hub_key`, or the key of the
   trusted `hub_device_id`) to be **in the trust store**; a key that is merely known (a scanned URI whose pairing

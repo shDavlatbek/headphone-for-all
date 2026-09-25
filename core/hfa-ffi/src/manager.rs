@@ -88,9 +88,28 @@ impl<T: Clone> SinkSet<T> {
         self.sinks.lock().push(sink);
     }
 
+    /// Delivers `initial()` to `sink` and adds it, both under the set's lock, so that a
+    /// concurrent [`SinkSet::broadcast`] either happened before `initial()` was computed (and
+    /// is reflected in it) or is delivered after it: no change falls in between. A sink that
+    /// refuses the initial value is not kept. `initial` must not use this set.
+    fn add_with_initial(&self, sink: Box<dyn EventSink<T>>, initial: impl FnOnce() -> T) {
+        let mut sinks = self.sinks.lock();
+        if sink.deliver(initial()) {
+            sinks.push(sink);
+        }
+    }
+
     /// Delivers `value` to every subscription, dropping the closed ones.
     fn broadcast(&self, value: &T) {
         self.sinks.lock().retain(|s| s.deliver(value.clone()));
+    }
+
+    /// [`SinkSet::broadcast`], then runs `then` before any other broadcast or new
+    /// subscription can happen. `then` must not use this set.
+    fn broadcast_then<R>(&self, value: &T, then: impl FnOnce() -> R) -> R {
+        let mut sinks = self.sinks.lock();
+        sinks.retain(|s| s.deliver(value.clone()));
+        then()
     }
 
     /// Number of live subscriptions.
@@ -511,19 +530,22 @@ impl EngineManager {
                 // A capture fallback warning (macOS) is shown as the last non-fatal error.
                 let meta = Arc::new(Mutex::new(SenderMeta::new(handle.status(), warning)));
                 let initial = meta_dto(&meta.lock());
-                self.sender_sinks.broadcast(&initial);
-                let forwarder = self.runtime.spawn(forward_sender_events(
-                    events,
-                    Arc::clone(&meta),
-                    Arc::clone(&self.sender_sinks),
-                ));
-                tracing::info!(source = %capture_target, "sender started");
-                self.state.lock().sender = Some(SenderSlot {
-                    handle,
-                    forwarder,
-                    meta,
-                    feed_id,
+                // The slot is filled before the forwarder can relay anything, so a
+                // subscription made meanwhile (`sender_events`) sees this sender.
+                self.sender_sinks.broadcast_then(&initial, || {
+                    let forwarder = self.runtime.spawn(forward_sender_events(
+                        events,
+                        Arc::clone(&meta),
+                        Arc::clone(&self.sender_sinks),
+                    ));
+                    self.state.lock().sender = Some(SenderSlot {
+                        handle,
+                        forwarder,
+                        meta,
+                        feed_id,
+                    });
                 });
+                tracing::info!(source = %capture_target, "sender started");
                 Ok(())
             }
             Err(e) => {
@@ -613,9 +635,10 @@ impl EngineManager {
 
     /// See `api::sender::sender_events`.
     pub(crate) fn sender_events(&self, sink: Box<dyn EventSink<SenderStatusDto>>) {
-        if sink.deliver(self.sender_status()) {
-            self.sender_sinks.add(sink);
-        }
+        // Lock order: sinks, then state, then a sender's meta. The forwarder releases the
+        // meta lock before it broadcasts, and nobody broadcasts while holding state or meta.
+        self.sender_sinks
+            .add_with_initial(sink, || self.sender_status());
     }
 }
 
@@ -848,6 +871,26 @@ mod tests {
         // A sink that is already closed is not kept.
         m.sender_events(Box::new(Recorder::<SenderStatusDto>::new(0)));
         assert_eq!(m.sender_sinks.len(), 1);
+    }
+
+    /// A broadcast racing a new subscription is delivered after the initial value.
+    #[test]
+    fn no_change_falls_between_the_snapshot_and_the_subscription() {
+        let set = Arc::new(SinkSet::new());
+        let rec = Recorder::new(10);
+        let mut racer = None;
+        set.add_with_initial(Box::new(rec.clone()), || {
+            let set = Arc::clone(&set);
+            // Blocks on the set's lock until the subscription is in place.
+            racer = Some(std::thread::spawn(move || set.broadcast(&2)));
+            std::thread::sleep(Duration::from_millis(50));
+            1
+        });
+        racer.expect("spawned").join().expect("racer");
+        assert_eq!(*rec.got.lock(), vec![1, 2]);
+        // A closed sink is not kept.
+        set.add_with_initial(Box::new(Recorder::<i32>::new(0)), || 3);
+        assert_eq!(set.len(), 1);
     }
 
     #[test]
