@@ -493,6 +493,95 @@ void main() {
       expect(state.error, 'Capture stopped: revoked');
     });
 
+    group('Android: a new UI while the process lives on', () {
+      /// Starts device-audio streaming in a first UI, then drops that UI
+      /// (the activity was destroyed; the engine and the service live on).
+      Future<void> streamThenCloseUi(
+        FakeHfaApi fake,
+        RecordingNativeChannel native,
+      ) async {
+        final first = containerFor(fake, native: native);
+        first.listen(senderControllerProvider, (_, _) {});
+        final sender = first.read(senderControllerProvider.notifier);
+        sender.selectTarget(HubTarget.discovered(trustedHub));
+        await sender.start();
+        await settle();
+        expect(first.read(senderControllerProvider).isLive, isTrue);
+        first.dispose();
+        native.calls.clear();
+        fake.calls.clear();
+      }
+
+      test('adopts the running capture', () async {
+        final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+        final native = RecordingNativeChannel();
+        await streamThenCloseUi(fake, native);
+        native.captureStatusAnswer = const NativeCaptureStatus(running: true);
+
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        await settle();
+        await settle();
+        expect(c.read(senderControllerProvider).isLive, isTrue);
+        // Adopted: a capture end reaches this UI and stops the sender.
+        native.emit(
+          const NativeEvent(NativeEventType.captureStopped, message: 'gone'),
+        );
+        await settle();
+        await settle();
+        expect(fake.calls, contains('senderStop'));
+        expect(c.read(senderControllerProvider).error, 'Capture stopped: gone');
+      });
+
+      test('Stop ends a capture this UI did not start', () async {
+        final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+        final native = RecordingNativeChannel();
+        await streamThenCloseUi(fake, native);
+        // captureStatus says nothing useful (for example not answered yet).
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        await settle();
+        await c.read(senderControllerProvider.notifier).stop();
+        expect(native.calls, ['stopSystemCapture']);
+        expect(fake.calls.last, 'senderStop');
+      });
+
+      test('stops a sender whose capture ended unheard', () async {
+        final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+        final native = RecordingNativeChannel();
+        await streamThenCloseUi(fake, native);
+        native.captureStatusAnswer = const NativeCaptureStatus(
+          running: false,
+          endedWhileAway: 'screen locked',
+        );
+
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        await settle();
+        await settle();
+        await settle();
+        expect(fake.calls, contains('senderStop'));
+        final state = c.read(senderControllerProvider);
+        expect(state.isLive, isFalse);
+        expect(state.error, contains('while the app was closed'));
+        expect(state.error, contains('screen locked'));
+      });
+
+      test('stops a capture whose sender ended', () async {
+        final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+        final native = RecordingNativeChannel();
+        await streamThenCloseUi(fake, native);
+        await fake.senderStop();
+        native.captureStatusAnswer = const NativeCaptureStatus(running: true);
+
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        await settle();
+        await settle();
+        expect(native.calls, ['stopSystemCapture']);
+      });
+    });
+
     test(
       'iOS: pairs through the app, then writes the broadcast config',
       () async {

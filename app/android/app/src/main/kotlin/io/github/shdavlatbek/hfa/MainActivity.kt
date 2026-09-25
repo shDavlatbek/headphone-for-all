@@ -101,6 +101,15 @@ class MainActivity : FlutterFragmentActivity(), CaptureCoordinator.Host {
                 result.success(null)
             }
             "captureSupport" -> result.success(CaptureSupport.forSdk(Build.VERSION.SDK_INT))
+            "captureStatus" -> {
+                val ended = PlatformEvents.takeUnheardCaptureEnd()
+                result.success(
+                    mapOf(
+                        "running" to CaptureCoordinator.isRunning(),
+                        "endedWhileAway" to ended?.let { it.message ?: "" },
+                    ),
+                )
+            }
             else -> result.notImplemented()
         }
     }

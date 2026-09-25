@@ -121,11 +121,53 @@ class SenderController extends Notifier<SenderState> {
       _statusSub?.cancel();
       _nativeSub?.cancel();
     });
-    final sources = availableSources(ref.read(appInfoProvider));
+    final info = ref.read(appInfoProvider);
+    final sources = availableSources(info);
+    if (info.isAndroid) unawaited(_syncNativeCapture());
     return SenderState(
       status: idleSenderStatus,
       source: sources.isEmpty ? null : SourceChoice(sources.first),
     );
+  }
+
+  /// Android: the capture service and the Rust sender live as long as the
+  /// process, this controller only as long as the Flutter UI. A new UI (the
+  /// activity was recreated) takes over a running capture, stops a capture
+  /// whose sender ended, and stops a sender whose capture ended unheard.
+  Future<void> _syncNativeCapture() async {
+    NativeCaptureStatus? native;
+    try {
+      native = await _native.captureStatus();
+    } catch (e) {
+      debugPrint('capture status: ${describeError(e)}');
+    }
+    if (native == null || !ref.mounted || state.busy || _nativeCapture) {
+      return;
+    }
+    if (!native.running && native.endedWhileAway == null) return;
+    SenderStatusDto? now;
+    try {
+      now = await _api.senderStatus();
+    } catch (e) {
+      debugPrint('sender status: ${describeError(e)}');
+    }
+    if (now == null || !ref.mounted || state.busy || _nativeCapture) return;
+    final live = liveSenderStates.contains(now.state);
+    if (native.running) {
+      if (live) {
+        _nativeCapture = true;
+      } else {
+        await _quietly(_native.stopSystemCapture);
+      }
+    } else if (live) {
+      final why = native.endedWhileAway!;
+      state = state.copyWith(
+        error:
+            'Capture stopped while the app was closed'
+            '${why.isEmpty ? '' : ': $why'}',
+      );
+      await _quietly(_api.senderStop);
+    }
   }
 
   void _onStatus(SenderStatusDto status) {
@@ -386,7 +428,11 @@ class SenderController extends Notifier<SenderState> {
     if (state.busy) return;
     state = state.copyWith(busy: true);
     try {
-      if (_nativeCapture) {
+      // Also when this controller did not start the capture (a capture
+      // started by an earlier UI): stopping an idle capture is a no-op.
+      if (_nativeCapture ||
+          (ref.read(appInfoProvider).isAndroid &&
+              state.source?.kind == SourceKind.deviceAudio)) {
         _nativeCapture = false;
         await _quietly(_native.stopSystemCapture);
       }

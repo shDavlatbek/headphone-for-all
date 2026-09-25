@@ -41,7 +41,8 @@ import io.github.shdavlatbek.hfa.capture.SampleEncoding
  *
  * Every end — Dart's stop, the notification's Stop action, `MediaProjection.Callback.onStop`
  * (the user or the system ended the projection, for example on screen lock), a recording or
- * engine failure, `onDestroy` — goes through [teardown], which is idempotent. All state is
+ * engine failure, no sender reading the feed any more, `onDestroy` — goes through [teardown],
+ * which is idempotent. All state is
  * touched on the main thread only; the capture thread reports through [mainHandler].
  */
 class CaptureService : Service() {
@@ -279,6 +280,15 @@ class CaptureService : Service() {
         if (active !== capture) return
         val message = when (exit) {
             LoopExit.Stopped -> return
+            LoopExit.NoSender -> {
+                // The sender was stopped (for example by a Flutter UI that did not know about
+                // this capture): end the capture as if stopped, not as a failure.
+                Log.i(TAG, "capture session ${capture.session}: no sender reads the audio; stopping")
+                teardown()
+                CaptureCoordinator.onServiceStopped(this, capture.session, getString(R.string.capture_stopped_no_sender))
+                finish()
+                return
+            }
             is LoopExit.ReadFailed -> getString(R.string.capture_error_record, "AudioRecord.read = ${exit.code}")
             is LoopExit.PushFailed -> exit.reason
         }

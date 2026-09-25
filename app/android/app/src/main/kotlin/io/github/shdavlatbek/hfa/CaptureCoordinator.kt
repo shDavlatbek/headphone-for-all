@@ -8,6 +8,7 @@ import android.os.Looper
 import android.util.Log
 import io.flutter.plugin.common.MethodChannel
 import io.github.shdavlatbek.hfa.capture.CaptureEffect
+import io.github.shdavlatbek.hfa.capture.CapturePhase
 import io.github.shdavlatbek.hfa.capture.CaptureRequest
 import io.github.shdavlatbek.hfa.capture.CaptureStateMachine
 
@@ -64,11 +65,19 @@ object CaptureCoordinator {
             return
         }
         pendingResult = result
+        PlatformEvents.clearUnheardCaptureEnd()
         execute(context, effects)
     }
 
     /** `stopSystemCapture`. */
     fun stop(context: Context) = execute(context, machine.stop())
+
+    /**
+     * `captureStatus`: whether a capture service records right now. A Flutter UI created while
+     * the service kept running (the activity was destroyed, the process lived on) asks this to
+     * take over the capture it did not start.
+     */
+    fun isRunning(): Boolean = machine.phase == CapturePhase.RUNNING
 
     /** The permission dialog ended; [granted]: RECORD_AUDIO is granted. */
     fun onPermissions(context: Context, granted: Boolean) = execute(context, machine.onPermissions(granted))

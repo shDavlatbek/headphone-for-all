@@ -6,13 +6,15 @@ import android.util.Log
 import io.flutter.plugin.common.EventChannel
 import io.github.shdavlatbek.hfa.capture.OwnedSlot
 import io.github.shdavlatbek.hfa.capture.PlatformEvent
+import io.github.shdavlatbek.hfa.capture.UnheardCaptureEnd
 
 /**
  * The Dart listener of `EventChannel('hfa/platform/events')`.
  *
  * Process-wide, because the capture service reports while the activity (and its Flutter
- * engine) may be gone: events emitted while Dart does not listen are dropped, which is fine
- * since a new UI asks for the state again. Each engine registers its own [handlerFor]; the
+ * engine) may be gone: events emitted while Dart does not listen are dropped. The last capture
+ * end nobody heard is remembered ([UnheardCaptureEnd]) and handed to the next UI through
+ * `captureStatus` ([takeUnheardCaptureEnd]). Each engine registers its own [handlerFor]; the
  * sink belongs to the engine that listened last, so a late cancel or cleanup of an older
  * engine cannot silence a newer one.
  */
@@ -23,6 +25,9 @@ object PlatformEvents {
 
     /** The sink of the listening engine, keyed by its messenger. Only touched on the main thread. */
     private val sink = OwnedSlot<EventChannel.EventSink>()
+
+    /** The last capture end no listener received. Only touched on the main thread. */
+    private val unheard = UnheardCaptureEnd()
 
     /** The stream handler for the engine identified by [owner] (its `BinaryMessenger`). */
     fun handlerFor(owner: Any): EventChannel.StreamHandler =
@@ -45,8 +50,15 @@ object PlatformEvents {
             } else {
                 current.success(event.toMap())
             }
+            unheard.onEmitted(event, heard = current != null)
         }
     }
+
+    /** The last capture end no listener received, if any, and forgets it (main thread). */
+    fun takeUnheardCaptureEnd(): PlatformEvent? = unheard.take()
+
+    /** A new capture starts: forgets an older unheard end (main thread). */
+    fun clearUnheardCaptureEnd() = unheard.clear()
 
     /** Forgets the sink of the engine [owner] that is being destroyed, if it still holds it (main thread). */
     fun detach(owner: Any) {
