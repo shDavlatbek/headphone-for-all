@@ -240,7 +240,7 @@ pub enum CaptureTarget { SystemMix, SystemMixExcludingSelf, Process { pid: u32 }
 pub struct CaptureApp { pub pid: u32, pub name: String }
 pub struct Capabilities { pub system_mix: bool, pub per_app: bool, pub mutes_local_output: bool, pub notes: String }
 pub fn capabilities() -> Capabilities;
-pub fn list_capture_apps() -> Result<Vec<CaptureApp>, CaptureError>;       // Windows/macOS; else Ok(vec![])
+pub fn list_capture_apps() -> Result<Vec<CaptureApp>, CaptureError>;       // Windows/macOS/Linux; else Ok(vec![])
 pub fn open_capture(target: &CaptureTarget) -> Result<Box<dyn CaptureSource>, CaptureError>;
 pub enum OutputTarget { Default, Device(String), WavFile(PathBuf), Null }
 pub fn open_output(target: &OutputTarget, buffer_ms: u32) -> Result<Box<dyn AudioOutput>, CaptureError>;
@@ -254,7 +254,8 @@ Modules:
   `ExternalFeed::push(&[f32], format)`. It is used by the Android and iOS native capture.
 - `output_cpal.rs`
 - `output_file.rs`: WAV and Null outputs, real-time paced.
-- `linux.rs`: PipeWire monitor of the default sink (`stream.capture.sink=true`).
+- `linux.rs`: PipeWire monitor of the default sink (`stream.capture.sink=true`); `system-excl` and per-process capture
+  link application playback streams into the capture stream (see §5.2).
 - `windows.rs`: WASAPI loopback via cpal, plus process loopback via the `windows` crate
   (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, include/exclude tree), plus session enumeration.
 - `macos.rs`: Core Audio process tap (`AudioHardwareCreateProcessTap`, `CATapDescription`, private aggregate
@@ -298,13 +299,38 @@ Modules:
   pub(crate) fn open_process(pid: u32) -> Result<Box<dyn CaptureSource>, CaptureError>;
   pub(crate) fn list_apps() -> Result<Vec<CaptureApp>, CaptureError>;
   ```
-  The OS stubs return `Err(Unsupported)`; `unsupported.rs` is final (`list_apps` → `Ok(vec![])`). Linux should return
-  `Ok(vec![])` from `list_apps` once implemented. All OS dependencies are already declared in `hfa-capture/Cargo.toml`
+  The OS stubs return `Err(Unsupported)`; `unsupported.rs` is final (`list_apps` → `Ok(vec![])`). Linux implements
+  per-app capture too (§5.2). All OS dependencies are already declared in `hfa-capture/Cargo.toml`
   under `[target.'cfg(target_os = "…")'.dependencies]` (see §10), so OS work packages only edit their `src/<os>.rs`.
 - macOS note: `objc2-core-audio` 0.3.2 (default features) already binds everything the tap backend needs:
   `AudioHardwareCreateProcessTap`/`AudioHardwareDestroyProcessTap`, `CATapDescription` (`initStereoGlobalTapButExcludeProcesses`,
   `initStereoMixdownOfProcesses`, `setPrivate`, `setMuteBehavior`, `UUID`), `CATapMuteBehavior`,
   `AudioHardwareCreateAggregateDevice` and `kAudioAggregateDeviceTapListKey`.
+
+### 5.2 Refinements made by `feat/capture-linux` (the code in `core/hfa-capture/src/linux.rs` is authoritative)
+
+- Every Linux source runs one thread (`hfa-pw-capture`) with its own PipeWire `MainLoop`/`Context`/`Core` and one
+  input stream (`node.name`/`application.name` = `headphone-for-all`, `media.category=Capture`, `media.role=Music`)
+  offering only F32LE interleaved 48 kHz stereo (PipeWire's adapter converts). The stream is connected in `open_*`,
+  which waits (≤ 5 s) for the negotiated format, so `format()` is the negotiated one and a missing daemon is an
+  `open_*` error (`CaptureError::Backend("cannot connect to the PipeWire daemon …")`), never a panic. Buffers
+  captured before `start` are dropped. The `process` callback runs on the capture thread's loop (no `RT_PROCESS`)
+  and only converts into a preallocated scratch buffer and pushes into the `PcmSink`.
+- `SystemMix`: `stream.capture.sink=true` + autoconnect → monitor of the default sink (follows default-sink changes).
+- `SystemMixExcludingSelf` is **implemented** (not a monitor fallback): the stream is left unconnected
+  (`node.autoconnect=false`, `node.always-process=true` so silence flows while nothing is linked) and the backend
+  links the output ports of every `Stream/Output/Audio` node whose process id ≠ ours into the stream's input ports
+  (`link-factory`, `object.linger=false`), tracking streams as they come and go. Channel routing: same name, else
+  left/right/centre onto FL/FR, LFE dropped.
+- `Process { pid }`: the same linking restricted to the streams of `pid` **and its descendants** (`/proc/<pid>/stat`
+  parent walk). Errors: `pid == 0` → `InvalidArgument`, no `/proc/<pid>` → `NotFound`; a process that is not playing
+  yet is fine (its streams are linked when they appear).
+- A stream's pid is the node's `application.process.id` (pipewire-pulse clients), else the owning client's
+  `application.process.id`, else the client's `pipewire.sec.pid`.
+- `list_apps()` returns one `CaptureApp` per process with a playback stream (paused streams included), name =
+  `application.name`, sorted by name; **this process is never listed**.
+- `capabilities()` probes the daemon (a connect, no round trip): `system_mix = per_app = true` when reachable,
+  both `false` otherwise (the reason is in `notes`); `mutes_local_output = false`.
 
 ## 6. `hfa-core` (networking + engines; tokio)
 
