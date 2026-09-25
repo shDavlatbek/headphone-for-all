@@ -112,6 +112,11 @@ jni = "0.22.4"
 proptest = "1.11.0"
 tempfile = "3.27.0"
 
+# The sinc resampler is ~30x slower unoptimized; keep debug builds and tests (e.g. the
+# hfa-audio drift simulation) usable. Only this dependency is affected.
+[profile.dev.package.rubato]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
