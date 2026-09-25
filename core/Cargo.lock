@@ -1144,6 +1144,7 @@ dependencies = [
  "hfa-proto",
  "jni",
  "log",
+ "ndk-context",
  "parking_lot",
  "serde",
  "serde_json",
