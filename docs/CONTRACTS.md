@@ -1630,6 +1630,29 @@ the version comes from `app/pubspec.yaml` without the `+build` part.
 - macOS: `macos/build-dmg.sh` → `Headphone_for_All-<ver>-macos.dmg` (create-dmg or hdiutil; optional Developer ID
   signing with the hardened runtime and `notarytool` notarization, credentials only from the environment).
 
+### 8.11 Refinements made by `fix/ffi-cli` (the code in `core/hfa-ffi` and `core/hfa-cli` is authoritative)
+
+These supersede the matching statements of §8.5 and the "Open" list of §8.9.
+
+**C ABI (`c_api.rs`, `hfa_ext.h`).**
+- **Trust, not just a key.** `hfa_ext_sender_start` requires the resolved hub key (`hub_key`, or the key of the
+  trusted `hub_device_id`) to be **in the trust store**; a key that is merely known (a scanned URI whose pairing
+  never completed, a hub forgotten since) → `HFA_ERR_CONFIG` "the hub is not paired ...". Before, such a key
+  started a sender that asked for pairing and failed silently in the background.
+- **No mDNS on iOS.** On iOS an empty `hub_host` is refused with `HFA_ERR_CONFIG` ("hub_host is required"): the
+  extension has no multicast entitlement, so discovery by `hub_device_id` could never succeed.
+- **New `int32_t hfa_ext_sender_state(HfaExtSender *handle, char *buf, uint32_t len)`.** Writes a NUL-terminated
+  JSON object `{"state": "connecting"|"pairing"|"streaming"|"reconnecting"|"stopped"|"failed", "error":
+  <failure reason when failed, else the last non-fatal error>|null, "hub_name": String|null, "bitrate", "loss_pct",
+  "rtt_ms", "level_db", "hub_gain", "hub_muted", "hub_priority"}` (state and metrics from `SenderHandle::status()`,
+  the rest folded from the engine's events by a task on the handle's runtime). Returns the JSON length without
+  the NUL, `snprintf`-style: if it is `>= len` only an empty string was written; negative = `HFA_ERR_*`. `failed`
+  is final. It needs only shared access, and so does `hfa_ext_push_pcm` now (the converter has its own lock):
+  the two may run concurrently for one handle; neither may overlap `hfa_ext_sender_stop`.
+- **`SampleHandler`** polls it every second (under its lock). On `failed` it stops the sender, writes
+  `broadcast_status.json` `{state: "finished", message: <reason and what to do>}`, posts the finished Darwin
+  notification and calls `finishBroadcastWithError`, so the app and the user learn why nothing plays.
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |

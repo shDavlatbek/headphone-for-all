@@ -11,6 +11,7 @@
 //!                          uint32_t frames, uint32_t channels, uint32_t rate);
 //! int32_t hfa_ext_sender_stop(HfaExtSender *handle);
 //! const char *hfa_ext_last_error(void);
+//! int32_t hfa_ext_sender_state(HfaExtSender *handle, char *buf, uint32_t len);
 //! ```
 //!
 //! `config_json` (unknown keys are ignored):
@@ -21,11 +22,11 @@
 //! ```
 //!
 //! - `data_dir` (required): the App Group directory the app initialized, so the extension
-//!   uses the app's identity, settings and paired hubs. Pairing never happens here: the hub
-//!   must already be trusted (by `hub_key`, or by `hub_device_id` in the trust store).
+//!   uses the app's identity, settings and paired hubs. Pairing never happens here: the hub's
+//!   key (`hub_key`, or the key of `hub_device_id`) must be in the trust store.
 //! - `hub_host` (default `""`) / `hub_port` (default 0 = the port in the settings, or
-//!   `hfa_proto::DEFAULT_PORT` when that is 0 too): an empty
-//!   host means "find `hub_device_id` over mDNS".
+//!   `hfa_proto::DEFAULT_PORT` when that is 0 too): an empty host means "find
+//!   `hub_device_id` over mDNS", which is refused on iOS (no multicast entitlement there).
 //! - `hub_device_id`, `hub_key` (optional, may be `null`): see `SenderStartDto`.
 //! - `label` (default `"iOS audio"`): the stream label shown on the hub.
 //!
@@ -37,6 +38,10 @@
 //! successful call). The returned pointer stays valid until the next `hfa_ext_*` call on
 //! that thread.
 //!
+//! Connection progress: [`hfa_ext_sender_start`] returns once the engine runs; the connection
+//! is made in the background. [`hfa_ext_sender_state`] reports it (a small JSON document,
+//! `failed` being final), so the extension can end the broadcast with the reason.
+//!
 //! PCM: the extension's feed is registered as 48 kHz stereo and every buffer is converted
 //! ([`PcmConverter`]: `to_stereo`, plus a resampler when the rate is not 48 kHz; the converter
 //! is rebuilt when rate or channels change mid-stream).
@@ -46,18 +51,25 @@ use std::ffi::{c_char, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hfa_audio::AudioFormat;
 use hfa_capture::{CaptureTarget, ExternalFeed};
-use hfa_core::{Identity, SenderConfig, SenderEngine, SenderHandle, Settings, TrustStore};
-use serde::Deserialize;
+use hfa_core::{
+    Identity, SenderConfig, SenderEngine, SenderEvent, SenderHandle, SenderState, SenderStatus,
+    Settings, TrustStore,
+};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
+use tokio::sync::broadcast;
 
 use crate::error::panic_message;
 use crate::hub_target::{self, HubRequest};
 use crate::pcm::{format_is_valid, PcmConverter, MAX_SAMPLES_PER_CALL};
 use crate::runtime::{block_on, build_runtime};
+use crate::sender_meta::{self, SenderMeta};
 
 /// Success.
 pub const HFA_OK: i32 = 0;
@@ -152,9 +164,19 @@ struct ExtConfig {
     label: Option<String>,
 }
 
+/// Whether the extension can find a hub over mDNS. Not on iOS: mdns-sd needs the restricted
+/// multicast entitlement there, which the broadcast extension does not have, so an empty
+/// `hub_host` would reconnect forever without ever finding the hub.
+const EXT_CAN_DISCOVER: bool = !cfg!(target_os = "ios");
+
 impl ExtConfig {
     /// Parses and checks the fields that need no I/O.
     fn parse(json: &str) -> Result<Self, ExtError> {
+        Self::parse_for(json, EXT_CAN_DISCOVER)
+    }
+
+    /// [`ExtConfig::parse`] for a platform where mDNS discovery works (`can_discover`) or not.
+    fn parse_for(json: &str, can_discover: bool) -> Result<Self, ExtError> {
         let cfg: ExtConfig = serde_json::from_str(json)
             .map_err(|e| ExtError::new(HFA_ERR_CONFIG, format!("config json: {e}")))?;
         if cfg.data_dir.as_os_str().is_empty() {
@@ -168,6 +190,13 @@ impl ExtConfig {
             return Err(ExtError::new(
                 HFA_ERR_CONFIG,
                 "config: hub_host or hub_device_id is required",
+            ));
+        }
+        if cfg.hub_host.trim().is_empty() && !can_discover {
+            return Err(ExtError::new(
+                HFA_ERR_CONFIG,
+                "config: hub_host is required (the hub cannot be found over mDNS here): \
+                 enter the hub's address in the app",
             ));
         }
         if let Some(key) = cfg.hub_key.as_deref().filter(|k| !k.trim().is_empty()) {
@@ -185,16 +214,41 @@ impl ExtConfig {
     }
 }
 
+/// The extension never pairs, so the hub's key must be in the trust store: a key that is
+/// merely known (a scanned URI whose pairing never completed, a hub forgotten since) would
+/// make the engine ask for pairing and give up in the background.
+fn check_hub_trusted(expected_key: Option<&[u8; 32]>, trust: &TrustStore) -> Result<(), ExtError> {
+    match expected_key {
+        Some(key) if trust.is_trusted(key) => Ok(()),
+        _ => Err(ExtError::new(
+            HFA_ERR_CONFIG,
+            "the hub is not paired: pair it in the app first (pairing never happens in the extension)",
+        )),
+    }
+}
+
 /// Opaque handle to a running extension sender. Created by [`hfa_ext_sender_start`] and
 /// destroyed by [`hfa_ext_sender_stop`].
+///
+/// [`hfa_ext_push_pcm`] and [`hfa_ext_sender_state`] only need shared access (the converter
+/// has its own lock), so they may run on different threads at the same time.
 pub struct HfaExtSender {
     runtime: Runtime,
     /// `None` only in unit tests (no engine).
     sender: Option<SenderHandle>,
+    /// Facts from the engine's events (hub name, errors, hub controls), kept up to date by a
+    /// forwarder task on `runtime`.
+    meta: Arc<Mutex<SenderMeta>>,
     feed_id: u32,
     feed: ExternalFeed,
-    converter: PcmConverter,
+    converter: Mutex<PcmConverter>,
 }
+
+// The handle is used from the extension's threads through a raw pointer.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<HfaExtSender>();
+};
 
 fn next_ext_feed_id() -> u32 {
     static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -223,12 +277,7 @@ fn start_ext_sender(cfg: &ExtConfig) -> Result<Box<HfaExtSender>, ExtError> {
         &identity.public_key(),
     )
     .map_err(|e| ExtError::new(HFA_ERR_CONFIG, format!("config: {e}")))?;
-    if target.expected_key.is_none() {
-        return Err(ExtError::new(
-            HFA_ERR_CONFIG,
-            "the hub is not paired: pair it in the app first (pairing never happens in the extension)",
-        ));
-    }
+    check_hub_trusted(target.expected_key.as_ref(), &trust)?;
     let runtime =
         build_runtime("hfa-ext").map_err(|e| ExtError::new(HFA_ERR_ENGINE, e.to_string()))?;
     let feed_id = next_ext_feed_id();
@@ -249,13 +298,19 @@ fn start_ext_sender(cfg: &ExtConfig) -> Result<Box<HfaExtSender>, ExtError> {
             .map_err(engine_err("sender"))
     })();
     match started {
-        Ok(sender) => Ok(Box::new(HfaExtSender {
-            runtime,
-            sender: Some(sender),
-            feed_id,
-            feed,
-            converter: PcmConverter::new(),
-        })),
+        Ok(sender) => {
+            // Subscribed right after the start, so no event (e.g. `Connected`) is missed.
+            let meta = Arc::new(Mutex::new(SenderMeta::new(sender.status(), None)));
+            runtime.spawn(fold_events(sender.events(), Arc::clone(&meta)));
+            Ok(Box::new(HfaExtSender {
+                runtime,
+                sender: Some(sender),
+                meta,
+                feed_id,
+                feed,
+                converter: Mutex::new(PcmConverter::new()),
+            }))
+        }
         Err(e) => {
             hfa_capture::unregister_external(feed_id);
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
@@ -336,9 +391,9 @@ pub unsafe extern "C" fn hfa_ext_push_pcm(
                         format!("buffer too large: {frames} frames x {channels} ch"),
                     )
                 })?;
-            // SAFETY: `handle` is a live pointer from `hfa_ext_sender_start`, used by one
-            // thread at a time (function contract).
-            let sender = unsafe { &mut *handle };
+            // SAFETY: `handle` is a live pointer from `hfa_ext_sender_start` (function
+            // contract); only shared access is needed.
+            let sender = unsafe { &*handle };
             // SAFETY: `samples` points to `frames * channels` readable floats (contract).
             let pcm = unsafe { std::slice::from_raw_parts(samples, len) };
             sender.push(pcm, channels, rate)
@@ -347,14 +402,136 @@ pub unsafe extern "C" fn hfa_ext_push_pcm(
 }
 
 impl HfaExtSender {
-    fn push(&mut self, pcm: &[f32], channels: u32, rate: u32) -> Result<i32, ExtError> {
-        let converted = self
-            .converter
+    fn push(&self, pcm: &[f32], channels: u32, rate: u32) -> Result<i32, ExtError> {
+        let mut converter = self.converter.lock();
+        let converted = converter
             .convert(pcm, channels, rate)
             .map_err(|e| ExtError::new(HFA_ERR_ENGINE, e.to_string()))?;
         self.feed.push(converted);
         Ok(HFA_OK)
     }
+
+    /// The JSON document of [`hfa_ext_sender_state`].
+    fn state_json(&self) -> String {
+        let meta = self.meta.lock();
+        // The handle's status is live; the events add what it lacks.
+        let status = match &self.sender {
+            Some(sender) => sender.status(),
+            None => SenderStatus {
+                state: SenderState::Stopped,
+                ..meta.status.clone()
+            },
+        };
+        let (state, _) = sender_meta::state_str(&status.state);
+        let doc = ExtState {
+            state,
+            error: meta.error_for(&status.state),
+            hub_name: meta.hub_name.as_deref(),
+            bitrate: status.bitrate,
+            loss_pct: status.loss_pct,
+            rtt_ms: status.rtt_ms,
+            level_db: status.level_db,
+            hub_gain: meta.hub.gain,
+            hub_muted: meta.hub.muted,
+            hub_priority: meta.hub.priority,
+        };
+        // Serializing strings, numbers and booleans cannot fail (a non-finite float would
+        // become `null`); keep a minimal document as the fallback anyway.
+        serde_json::to_string(&doc).unwrap_or_else(|_| format!("{{\"state\":\"{state}\"}}"))
+    }
+}
+
+/// The document written by [`hfa_ext_sender_state`].
+#[derive(Serialize)]
+struct ExtState<'a> {
+    state: &'static str,
+    error: Option<&'a str>,
+    hub_name: Option<&'a str>,
+    bitrate: u32,
+    loss_pct: f32,
+    rtt_ms: f32,
+    level_db: f32,
+    hub_gain: f32,
+    hub_muted: bool,
+    hub_priority: bool,
+}
+
+/// Folds the engine's events into `meta` until its channel closes (the engine stopped) or
+/// the handle's runtime shuts down.
+async fn fold_events(mut rx: broadcast::Receiver<SenderEvent>, meta: Arc<Mutex<SenderMeta>>) {
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if let SenderEvent::StateChanged(state) = &event {
+                    tracing::info!(
+                        state = sender_meta::state_str(state).0,
+                        "extension sender state"
+                    );
+                }
+                meta.lock().apply(event);
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Writes the sender's current state as a NUL-terminated UTF-8 JSON object into `buf`:
+///
+/// ```json
+/// {"state": "connecting|pairing|streaming|reconnecting|stopped|failed",
+///  "error": "<failure reason when failed, else the last non-fatal error>" | null,
+///  "hub_name": "Desk" | null, "bitrate": 128000, "loss_pct": 0.5, "rtt_ms": 3.2,
+///  "level_db": -18.5, "hub_gain": 1.0, "hub_muted": false, "hub_priority": false}
+/// ```
+///
+/// Returns the length of the JSON in bytes without the NUL (like `snprintf`). If that is
+/// `>= len`, nothing was written except an empty string (when `len > 0`): call again with a
+/// buffer of at least the returned length + 1. Negative: an `HFA_ERR_*` code.
+///
+/// `failed` is final (e.g. "pairing required", a key mismatch): the extension should end
+/// the broadcast with the error. May be called from any thread, also while another thread
+/// is inside [`hfa_ext_push_pcm`] with the same handle, but not concurrently with (or after)
+/// [`hfa_ext_sender_stop`].
+///
+/// # Safety
+/// `handle` must be null or a live pointer returned by [`hfa_ext_sender_start`]. `buf` must
+/// be null (only with `len == 0`) or point to at least `len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn hfa_ext_sender_state(
+    handle: *mut HfaExtSender,
+    buf: *mut c_char,
+    len: u32,
+) -> i32 {
+    boundary(
+        |code| code,
+        || {
+            if handle.is_null() || (buf.is_null() && len > 0) {
+                return Err(ExtError::new(
+                    HFA_ERR_INVALID_ARGUMENT,
+                    "handle or buf is null",
+                ));
+            }
+            // SAFETY: a live pointer from `hfa_ext_sender_start` (contract); shared access.
+            let sender = unsafe { &*handle };
+            let json = sender.state_json();
+            let needed = i32::try_from(json.len())
+                .map_err(|_| ExtError::new(HFA_ERR_INTERNAL, "state document too large"))?;
+            let len = len as usize;
+            if len == 0 {
+                return Ok(needed);
+            }
+            // SAFETY: `buf` points to `len` writable bytes (contract).
+            let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), len) };
+            if json.len() < len {
+                out[..json.len()].copy_from_slice(json.as_bytes());
+                out[json.len()] = 0;
+            } else {
+                out[0] = 0;
+            }
+            Ok(needed)
+        },
+    )
 }
 
 /// Stops the sender and frees the handle. Returns [`HFA_OK`] or a negative error code (the
@@ -511,9 +688,10 @@ mod tests {
         let handle = Box::into_raw(Box::new(HfaExtSender {
             runtime: build_runtime("hfa-ext-test").expect("runtime"),
             sender: None,
+            meta: Arc::new(Mutex::new(SenderMeta::new(SenderStatus::default(), None))),
             feed_id,
             feed,
-            converter: PcmConverter::new(),
+            converter: Mutex::new(PcmConverter::new()),
         }));
         let mono = [0.25_f32; 480];
         // SAFETY: `handle` is live until hfa_ext_sender_stop; buffers hold frames*channels.
@@ -560,6 +738,166 @@ mod tests {
         source.stop();
     }
 
+    /// Reads the state document through the C ABI (growing the buffer as told).
+    fn state(handle: *mut HfaExtSender) -> serde_json::Value {
+        let mut buf = vec![0 as c_char; 8];
+        loop {
+            // SAFETY: live handle; `buf` holds `buf.len()` writable bytes.
+            let n = unsafe { hfa_ext_sender_state(handle, buf.as_mut_ptr(), buf.len() as u32) };
+            assert!(n >= 0, "state failed: {n} {:?}", last_error());
+            let n = n as usize;
+            if n < buf.len() {
+                // SAFETY: NUL-terminated by hfa_ext_sender_state.
+                let text = unsafe { CStr::from_ptr(buf.as_ptr()) }
+                    .to_str()
+                    .expect("utf-8");
+                assert_eq!(text.len(), n);
+                return serde_json::from_str(text).expect("json");
+            }
+            // Too small: nothing but an empty string was written.
+            assert_eq!(buf[0], 0);
+            buf = vec![0 as c_char; n + 1];
+        }
+    }
+
+    #[test]
+    fn state_follows_snprintf_rules() {
+        let feed_id = next_ext_feed_id();
+        let feed = hfa_capture::register_external(feed_id, AudioFormat::INTERNAL);
+        let handle = Box::into_raw(Box::new(HfaExtSender {
+            runtime: build_runtime("hfa-ext-test").expect("runtime"),
+            sender: None,
+            meta: Arc::new(Mutex::new(SenderMeta::new(SenderStatus::default(), None))),
+            feed_id,
+            feed,
+            converter: Mutex::new(PcmConverter::new()),
+        }));
+        // SAFETY: live handle; null buffers only with len 0.
+        unsafe {
+            let needed = hfa_ext_sender_state(handle, std::ptr::null_mut(), 0);
+            assert!(needed > 20, "{needed}");
+            assert_eq!(
+                hfa_ext_sender_state(handle, std::ptr::null_mut(), 4),
+                HFA_ERR_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                hfa_ext_sender_state(std::ptr::null_mut(), std::ptr::null_mut(), 0),
+                HFA_ERR_INVALID_ARGUMENT
+            );
+            // Exactly the length without room for the NUL is too small.
+            let mut buf = vec![b'x' as c_char; needed as usize];
+            assert_eq!(
+                hfa_ext_sender_state(handle, buf.as_mut_ptr(), buf.len() as u32),
+                needed
+            );
+            assert_eq!(buf[0], 0);
+        }
+        handle_meta(handle).lock().apply(SenderEvent::HubControl {
+            gain: 0.25,
+            muted: true,
+            priority: true,
+        });
+        let doc = state(handle);
+        assert_eq!(doc["state"], "stopped");
+        assert_eq!(doc["error"], serde_json::Value::Null);
+        assert_eq!(doc["hub_gain"], 0.25);
+        assert_eq!(doc["hub_muted"], true);
+        assert_eq!(doc["hub_priority"], true);
+        // SAFETY: live handle, not used afterwards.
+        assert_eq!(unsafe { hfa_ext_sender_stop(handle) }, HFA_OK);
+    }
+
+    fn handle_meta(handle: *mut HfaExtSender) -> Arc<Mutex<SenderMeta>> {
+        // SAFETY: a live handle created by the test.
+        Arc::clone(&unsafe { &*handle }.meta)
+    }
+
+    fn b64url(key: &[u8; 32]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
+    }
+
+    /// A known but untrusted hub key is refused at start (the engine would otherwise ask
+    /// for pairing and give up in the background).
+    #[test]
+    fn an_untrusted_hub_key_is_not_paired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = serde_json::json!({
+            "data_dir": dir.path(),
+            "hub_host": "127.0.0.1",
+            "hub_port": 9,
+            "hub_key": b64url(&[7u8; 32]),
+        });
+        assert!(start(&json.to_string()).is_null());
+        let err = last_error().expect("error");
+        assert!(err.contains("not paired"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_host_is_refused_where_mdns_cannot_work() {
+        let json = r#"{"data_dir": "/g", "hub_device_id": "ab12-cd34-ef56-7890"}"#;
+        assert!(ExtConfig::parse_for(json, true).is_ok());
+        let err = ExtConfig::parse_for(json, false).expect_err("no mDNS");
+        assert_eq!(err.code, HFA_ERR_CONFIG);
+        assert!(err.message.contains("hub_host is required"), "{err:?}");
+        let with_host = r#"{"data_dir": "/g", "hub_host": "10.0.0.2"}"#;
+        assert!(ExtConfig::parse_for(with_host, false).is_ok());
+    }
+
+    /// The headline case of the state query: the extension trusts the hub, but the hub does
+    /// not know this device (it was forgotten there), so the engine fails with "pairing
+    /// required" after the start succeeded. Only `hfa_ext_sender_state` can tell.
+    #[test]
+    fn a_hub_refusal_after_start_is_reported_as_failed() {
+        let runtime = build_runtime("hfa-ext-hub").expect("runtime");
+        let hub_dir = tempfile::tempdir().expect("tempdir");
+        let mut hub_settings = Settings::load_or_default(hub_dir.path()).expect("settings");
+        hub_settings.port = 0;
+        hub_settings.device_name = "Desk".into();
+        let hub = block_on(
+            &runtime,
+            hfa_core::HubEngine::start(hfa_core::HubConfig {
+                settings: hub_settings,
+                output: hfa_capture::open_output(&hfa_capture::OutputTarget::Null, 20)
+                    .expect("null output"),
+                advertise: false,
+            }),
+        )
+        .expect("runtime")
+        .expect("hub");
+        let hub_key = Identity::load_or_create(hub_dir.path(), "Desk")
+            .expect("hub identity")
+            .public_key();
+
+        let ext_dir = tempfile::tempdir().expect("tempdir");
+        TrustStore::load(ext_dir.path())
+            .expect("trust")
+            .add(hfa_core::TrustedPeer::new(hub_key, "Desk"))
+            .expect("trust the hub");
+        let json = serde_json::json!({
+            "data_dir": ext_dir.path(),
+            "hub_host": "127.0.0.1",
+            "hub_port": hub.local_port(),
+            "hub_key": b64url(&hub_key),
+        });
+        let handle = start(&json.to_string());
+        assert!(!handle.is_null(), "{:?}", last_error());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let doc = loop {
+            let doc = state(handle);
+            if doc["state"] == "failed" || std::time::Instant::now() > deadline {
+                break doc;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(doc["state"], "failed", "{doc}");
+        let error = doc["error"].as_str().expect("error text");
+        assert!(error.contains("pairing"), "{error}");
+        // SAFETY: live handle, not used afterwards.
+        assert_eq!(unsafe { hfa_ext_sender_stop(handle) }, HFA_OK);
+        block_on(&runtime, hub.stop()).expect("runtime");
+    }
+
     /// `include/hfa_ext.h` must declare the same codes and functions as this module.
     #[test]
     fn header_matches_the_rust_constants() {
@@ -581,6 +919,7 @@ mod tests {
             "int32_t hfa_ext_push_pcm(HfaExtSender *handle, const float *samples, uint32_t frames,\n                         uint32_t channels, uint32_t rate);",
             "int32_t hfa_ext_sender_stop(HfaExtSender *handle);",
             "const char *hfa_ext_last_error(void);",
+            "int32_t hfa_ext_sender_state(HfaExtSender *handle, char *buf, uint32_t len);",
         ] {
             assert!(header.contains(f), "header lacks `{f}`");
         }

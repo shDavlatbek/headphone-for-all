@@ -213,14 +213,7 @@ pub(crate) fn discovery_event_dto(
 
 /// The state string of [`SenderStatusDto::state`] and the failure reason, if any.
 pub(crate) fn sender_state_str(s: &SenderState) -> (&'static str, Option<&str>) {
-    match s {
-        SenderState::Connecting => ("connecting", None),
-        SenderState::Pairing => ("pairing", None),
-        SenderState::Streaming => ("streaming", None),
-        SenderState::Reconnecting => ("reconnecting", None),
-        SenderState::Stopped => ("stopped", None),
-        SenderState::Failed(reason) => ("failed", Some(reason.as_str())),
-    }
+    crate::sender_meta::state_str(s)
 }
 
 /// Builds a [`SenderStatusDto`]. The error is the failure reason when failed, else

@@ -9,13 +9,15 @@
  *   {
  *     "data_dir":      "<App Group container>/hfa",   required: identity, settings, paired hubs
  *     "hub_host":      "192.168.1.20",                 "" = find hub_device_id over mDNS
+ *                                                      (refused on iOS: no multicast there)
  *     "hub_port":      47810,                          0 or missing = settings port (47810 if that is 0)
  *     "hub_device_id": "ab12-cd34-ef56-7890" | null,
  *     "hub_key":       "<base64url static key>" | null,
  *     "label":         "iPhone"                        missing = "iOS audio"
  *   }
- * The hub must already be paired by the app (hub_key given, or hub_device_id trusted):
- * pairing never happens inside the extension.
+ * The hub must already be paired by the app: its key (hub_key, or the key of hub_device_id)
+ * must be in the trust store, otherwise HFA_ERR_CONFIG. Pairing never happens inside the
+ * extension.
  *
  * Errors: every function returns HFA_OK or a negative HFA_ERR_* code
  * (hfa_ext_sender_start: a handle or NULL). After a failure, hfa_ext_last_error() describes
@@ -52,7 +54,8 @@ typedef struct HfaExtSender HfaExtSender;
 
 /*
  * Starts a sender streaming the PCM pushed with hfa_ext_push_pcm to the configured hub.
- * Returns once the engine runs (the connection is made in the background), or NULL.
+ * Returns once the engine runs (the connection is made in the background: poll
+ * hfa_ext_sender_state), or NULL.
  */
 HfaExtSender *hfa_ext_sender_start(const char *config_json);
 
@@ -60,8 +63,8 @@ HfaExtSender *hfa_ext_sender_start(const char *config_json);
  * Pushes `frames` frames of interleaved float PCM in [-1, 1] with `channels` channels
  * (1..=8) at `rate` Hz (8000..=192000); at most 1536000 samples per call. Every buffer is
  * converted to 48 kHz stereo; the format may change between calls. Audio pushed while the
- * sender is still connecting is dropped (HFA_OK). Do not call concurrently with the same
- * handle.
+ * sender is still connecting is dropped (HFA_OK). Do not call it concurrently with itself
+ * for the same handle (hfa_ext_sender_state may run meanwhile).
  */
 int32_t hfa_ext_push_pcm(HfaExtSender *handle, const float *samples, uint32_t frames,
                          uint32_t channels, uint32_t rate);
@@ -71,6 +74,21 @@ int32_t hfa_ext_sender_stop(HfaExtSender *handle);
 
 /* Message of the last failed hfa_ext_* call on this thread, or NULL. */
 const char *hfa_ext_last_error(void);
+
+/*
+ * Writes the sender's state as NUL-terminated UTF-8 JSON into buf:
+ *   {"state": "connecting" | "pairing" | "streaming" | "reconnecting" | "stopped" | "failed",
+ *    "error": failure reason when failed, else the last non-fatal error, or null,
+ *    "hub_name": "Desk" | null, "bitrate": 128000, "loss_pct": 0.5, "rtt_ms": 3.2,
+ *    "level_db": -18.5, "hub_gain": 1.0, "hub_muted": false, "hub_priority": false}
+ * Returns the JSON length in bytes without the NUL, like snprintf: if it is >= len, only an
+ * empty string was written (len > 0); call again with at least that length + 1. Negative:
+ * an HFA_ERR_* code. "failed" is final (e.g. pairing required, key mismatch): end the
+ * broadcast with the error. May run while another thread is in hfa_ext_push_pcm with the
+ * same handle, but never concurrently with or after hfa_ext_sender_stop. buf may be NULL
+ * only when len is 0.
+ */
+int32_t hfa_ext_sender_state(HfaExtSender *handle, char *buf, uint32_t len);
 
 #ifdef __cplusplus
 }

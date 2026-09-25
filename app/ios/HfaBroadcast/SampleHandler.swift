@@ -36,6 +36,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
   /// Failures already logged (a bad format would otherwise log for every buffer).
   private var loggedFailures = Set<String>()
   private var loggedPushError = false
+  /// Polls `hfa_ext_sender_state` while the sender runs (guarded by `lock`).
+  private var stateTimer: DispatchSourceTimer?
+  /// Queue of `stateTimer`; `lastSenderState` is only used on it.
+  private let stateQueue = DispatchQueue(label: "\(HfaShared.broadcastExtensionBundleId).state")
+  private var lastSenderState: String?
+  /// How often the sender state is polled.
+  private static let statePollInterval = DispatchTimeInterval.seconds(1)
 
   // MARK: - Broadcast lifecycle
 
@@ -46,6 +53,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
       lock.lock()
       sender = handle
       lock.unlock()
+      startStatePolling()
       Self.log.info("broadcast started")
       BroadcastStatus(state: "started", message: nil, timestamp: Date().timeIntervalSince1970)
         .write()
@@ -140,7 +148,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
     lock.lock()
     let handle = sender
     sender = nil
+    let timer = stateTimer
+    stateTimer = nil
     lock.unlock()
+    timer?.cancel()
     guard let handle else { return false }
     if hfa_ext_sender_stop(handle) != 0 {
       Self.log.error(
@@ -172,6 +183,88 @@ final class SampleHandler: RPBroadcastSampleHandler {
         Self.log.error("dropping audio: \(text, privacy: .public)")
       }
     }
+  }
+
+  // MARK: - Sender state
+
+  /// The fields of the `hfa_ext_sender_state` document the extension uses.
+  private struct SenderStateInfo: Decodable {
+    let state: String
+    let error: String?
+  }
+
+  /// The connection to the hub is made in the background after `hfa_ext_sender_start`, and a
+  /// refusal by the hub (pairing required, key mismatch) is final. Without polling, the user
+  /// would see a running broadcast that never plays.
+  private func startStatePolling() {
+    let timer = DispatchSource.makeTimerSource(queue: stateQueue)
+    timer.schedule(
+      deadline: .now() + Self.statePollInterval, repeating: Self.statePollInterval,
+      leeway: .milliseconds(200))
+    timer.setEventHandler { [weak self] in self?.pollSenderState() }
+    lock.lock()
+    // The broadcast may already have finished (stopSender ran): then do not poll at all.
+    guard sender != nil else {
+      lock.unlock()
+      return
+    }
+    stateTimer = timer
+    lock.unlock()
+    timer.resume()
+  }
+
+  /// Reads the sender state; ends the broadcast with the reason once the sender failed.
+  private func pollSenderState() {
+    lock.lock()
+    guard let handle = sender else {
+      lock.unlock()
+      return
+    }
+    let json = Self.readSenderState(handle)
+    lock.unlock()
+    guard let json, let info = try? JSONDecoder().decode(SenderStateInfo.self, from: Data(json.utf8))
+    else { return }
+    if info.state != lastSenderState {
+      lastSenderState = info.state
+      Self.log.info("sender state: \(info.state, privacy: .public)")
+    }
+    if info.state == "failed" {
+      failBroadcast(reason: info.error ?? "unknown error")
+    }
+  }
+
+  /// `hfa_ext_sender_state` as a string (the buffer grows once if the document is larger).
+  private static func readSenderState(_ handle: OpaquePointer) -> String? {
+    var buffer = [CChar](repeating: 0, count: 512)
+    for _ in 0..<2 {
+      let count = buffer.count
+      let written = buffer.withUnsafeMutableBufferPointer {
+        hfa_ext_sender_state(handle, $0.baseAddress, UInt32(count))
+      }
+      if written < 0 { return nil }
+      if Int(written) < count {
+        return String(
+          decoding: buffer.prefix(Int(written)).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+      }
+      buffer = [CChar](repeating: 0, count: Int(written) + 1)
+    }
+    return nil
+  }
+
+  /// Stops the sender and ends the broadcast with `reason` (once).
+  private func failBroadcast(reason: String) {
+    guard stopSender() else { return }
+    let error = Self.error(
+      .senderFailed,
+      "The headphone hub did not accept this iPhone (\(reason)). Pair this iPhone with the hub again in the Headphone for All app, then start the broadcast again."
+    )
+    Self.log.error("sender failed: \(reason, privacy: .public)")
+    BroadcastStatus(
+      state: "finished", message: error.localizedDescription,
+      timestamp: Date().timeIntervalSince1970
+    ).write()
+    HfaShared.postDarwinNotification(HfaShared.broadcastFinishedNotification)
+    finishBroadcastWithError(error)
   }
 
   // MARK: - Helpers

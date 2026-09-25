@@ -32,6 +32,7 @@ mod logging;
 mod manager;
 pub mod pcm;
 mod runtime;
+mod sender_meta;
 
 #[cfg(target_os = "android")]
 pub mod android;

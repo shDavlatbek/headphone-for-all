@@ -30,7 +30,7 @@ use std::time::Duration;
 use hfa_core::config::SETTINGS_FILE;
 use hfa_core::{
     HubConfig, HubEngine, HubEvent, HubHandle, Identity, SenderConfig, SenderEngine, SenderEvent,
-    SenderHandle, SenderState, SenderStatus, Settings, TrustStore,
+    SenderHandle, SenderState, Settings, TrustStore,
 };
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
@@ -45,6 +45,7 @@ use crate::error::{FfiError, Result};
 use crate::feeds;
 use crate::hub_target::{self, HubRequest};
 use crate::runtime::{block_on, build_runtime};
+use crate::sender_meta::SenderMeta;
 
 /// Device buffer size asked from the hub output (ms).
 pub const OUTPUT_BUFFER_MS: u32 = 20;
@@ -105,35 +106,13 @@ struct AppContext {
     identity: Identity,
 }
 
-/// Sender facts learned from its events (the handle's status has no hub name or errors).
-#[derive(Debug, Clone)]
-struct SenderMeta {
-    status: SenderStatus,
-    hub_name: Option<String>,
-    last_error: Option<String>,
-}
-
-impl SenderMeta {
-    fn dto(&self) -> SenderStatusDto {
-        convert::sender_status_dto(
-            &self.status,
-            self.hub_name.as_deref(),
-            self.last_error.as_deref(),
-        )
-    }
-
-    /// Folds one engine event into the snapshot.
-    fn apply(&mut self, event: SenderEvent) {
-        match event {
-            SenderEvent::StateChanged(state) => self.status.state = state,
-            SenderEvent::Connected { name, .. } | SenderEvent::Paired { name, .. } => {
-                self.hub_name = Some(name);
-            }
-            SenderEvent::Status(status) => self.status = status,
-            SenderEvent::Error(message) => self.last_error = Some(message),
-            SenderEvent::HubControl { .. } => {}
-        }
-    }
+/// The status to send for a sender's folded events.
+fn meta_dto(meta: &SenderMeta) -> SenderStatusDto {
+    convert::sender_status_dto(
+        &meta.status,
+        meta.hub_name.as_deref(),
+        meta.last_error.as_deref(),
+    )
 }
 
 struct HubSlot {
@@ -530,12 +509,8 @@ impl EngineManager {
                 // source of the hub name) is not lost.
                 let events = handle.events();
                 // A capture fallback warning (macOS) is shown as the last non-fatal error.
-                let meta = Arc::new(Mutex::new(SenderMeta {
-                    status: handle.status(),
-                    hub_name: None,
-                    last_error: warning,
-                }));
-                let initial = meta.lock().dto();
+                let meta = Arc::new(Mutex::new(SenderMeta::new(handle.status(), warning)));
+                let initial = meta_dto(&meta.lock());
                 self.sender_sinks.broadcast(&initial);
                 let forwarder = self.runtime.spawn(forward_sender_events(
                     events,
@@ -723,7 +698,7 @@ async fn forward_sender_events(
                 let dto = {
                     let mut meta = meta.lock();
                     meta.apply(event);
-                    meta.dto()
+                    meta_dto(&meta)
                 };
                 sinks.broadcast(&dto);
             }
@@ -739,6 +714,7 @@ async fn forward_sender_events(
 mod tests {
     use super::*;
     use crate::api::sender::CaptureSourceDto;
+    use hfa_core::SenderStatus;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test sink recording what it receives; closes after `capacity` deliveries.
@@ -935,11 +911,7 @@ mod tests {
         let m = EngineManager::new().expect("manager");
         let rec = Recorder::new(1000);
         m.sender_sinks.add(Box::new(rec.clone()));
-        let meta = Arc::new(Mutex::new(SenderMeta {
-            status: SenderStatus::default(),
-            hub_name: None,
-            last_error: None,
-        }));
+        let meta = Arc::new(Mutex::new(SenderMeta::new(SenderStatus::default(), None)));
         let (tx, rx) = broadcast::channel(512);
         let task = m.runtime.spawn(forward_sender_events(
             rx,
@@ -995,11 +967,7 @@ mod tests {
         let m = EngineManager::new().expect("manager");
         let rec = Recorder::new(10);
         m.sender_sinks.add(Box::new(rec.clone()));
-        let meta = Arc::new(Mutex::new(SenderMeta {
-            status: SenderStatus::default(),
-            hub_name: None,
-            last_error: None,
-        }));
+        let meta = Arc::new(Mutex::new(SenderMeta::new(SenderStatus::default(), None)));
         let (tx, rx) = broadcast::channel(16);
         let task = m.runtime.spawn(forward_sender_events(
             rx,
