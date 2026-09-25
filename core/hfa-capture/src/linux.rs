@@ -137,8 +137,10 @@ linked because the applications feeding them are already captured directly; soun
 the sink only through such a relay without an application stream behind it (e.g. a microphone \
 loopback) or that is written straight to ALSA hardware is therefore missed. Per-app capture \
 includes child processes; sandboxed (Flatpak) PulseAudio clients are listed only when their host \
-pid can be determined. Requires a running PipeWire daemon (pipewire-pulse setups included) and \
-libpipewire-0.3 at run time.";
+pid can be determined. The captured audio keeps playing on this device's own speakers too; mute or \
+turn down this device's output to avoid an echo in the room (the capture is taken before the device \
+volume, so it is not affected). Requires a running PipeWire daemon (pipewire-pulse setups \
+included) and libpipewire-0.3 at run time.";
 
 // ---------------------------------------------------------------------------------------------
 // Platform-module interface
