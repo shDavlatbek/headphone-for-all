@@ -9,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'src/api/hfa_api.dart';
 import 'src/app.dart';
 import 'src/bootstrap.dart';
+import 'src/licenses.dart';
 import 'src/platform/desktop_integration.dart';
 import 'src/platform/native_channel.dart';
 import 'src/state/core_providers.dart';
@@ -18,6 +19,7 @@ const demoMode = bool.fromEnvironment('HFA_FAKE');
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  registerRustLicenses();
   try {
     await initDesktopWindow();
   } catch (e) {
