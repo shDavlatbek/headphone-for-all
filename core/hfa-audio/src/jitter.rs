@@ -31,8 +31,20 @@
 //!   time constant of [`TARGET_DECAY_MS`] of pushed audio, clamped to
 //!   `min_target_ms..=max_target_ms` (and to `capacity · frame_ms`). Before two packets were
 //!   seen the target is `initial_target_ms` (clamped the same way).
-//! - [`JitterBuffer::reset`] drops packets and playout state but keeps the statistics and the
-//!   jitter/target estimate (they describe the network, not the stream).
+//! - **Stretching.** The target can rise instantly, but the buffer level could otherwise only
+//!   follow through the drift controller (≤ 2 ms/s). So while primed, when the buffer is more
+//!   than [`STRETCH_THRESHOLD_FRAMES`] frames below the target, [`JitterBuffer::pop`] returns
+//!   [`Pop::Stretch`] instead of a frame (at most once every [`STRETCH_MIN_INTERVAL`] pops): the
+//!   caller synthesizes one frame (Opus PLC) without consuming a packet, so the buffer grows by
+//!   one frame. Counted in [`JitterStats::stretched`].
+//! - **Reset.** [`JitterBuffer::reset`] drops packets and playout state but keeps the
+//!   statistics and the jitter/target estimate (they describe the network, not the stream).
+//!   `seq` keeps increasing across a `FLAG_RESET` (it is never reused), so the buffer keeps a
+//!   **sequence floor**: after `reset()` every packet at or before the highest `seq` ever
+//!   pushed is [`PushResult::TooLate`], so a pre-reset straggler reordered behind the reset
+//!   packet is never played after it. [`JitterBuffer::reset_at`] sets the floor exactly (the
+//!   hub passes the `FLAG_RESET` packet's `seq`: everything older is `TooLate`, the reset
+//!   packet and later ones may still arrive in any order).
 
 use std::collections::VecDeque;
 
@@ -40,6 +52,13 @@ use serde::{Deserialize, Serialize};
 
 /// Time constant (in ms of pushed audio) of the target's slow decay towards the raw target.
 pub const TARGET_DECAY_MS: f64 = 8_000.0;
+
+/// [`Pop::Stretch`] is returned while `target_ms − buffered_ms` exceeds this many frames.
+pub const STRETCH_THRESHOLD_FRAMES: f64 = 2.0;
+
+/// Minimum number of pops between two [`Pop::Stretch`] results (spreads the inserted
+/// concealment frames out so each one is short and isolated).
+pub const STRETCH_MIN_INTERVAL: u32 = 10;
 
 /// Media timestamp rate (samples per second) used for the jitter estimate.
 const TIMESTAMP_RATE_HZ: f64 = 48_000.0;
@@ -101,6 +120,10 @@ pub enum Pop {
     },
     /// Not primed or ran dry: the caller should output silence/PLC and wait.
     Underrun,
+    /// The buffer is well below the (risen) target: the caller should synthesize one frame
+    /// (e.g. `OpusDecoder::conceal`) **without** a packet being consumed, which grows the
+    /// buffer by one frame. The next pop continues in `seq` order.
+    Stretch,
 }
 
 /// Cumulative statistics.
@@ -117,6 +140,9 @@ pub struct JitterStats {
     pub duplicate: u64,
     /// Current RFC 3550 interarrival jitter estimate in ms.
     pub jitter_ms: f32,
+    /// Frames synthesized on request ([`Pop::Stretch`]) to grow the buffer towards the target.
+    #[serde(default)]
+    pub stretched: u64,
 }
 
 /// `seq + n` (wrapping); `seq` is only `None` before the first packet, where 0 is used.
@@ -137,7 +163,13 @@ pub struct JitterBuffer {
     count: usize,
     /// Set once something was popped or skipped: `next_seq` can no longer move backwards.
     anchored: bool,
+    /// Highest `seq` ever pushed (wrap-aware), kept across resets.
+    highest_seq: Option<u32>,
+    /// After `reset()`: packets at or before this `seq` are `TooLate` (until anchored).
+    floor: Option<u32>,
     primed: bool,
+    /// Pops left before another [`Pop::Stretch`] may be returned.
+    stretch_cooldown: u32,
     stats: JitterStats,
     /// RFC 3550 jitter estimate in ms.
     jitter_ms: f64,
@@ -156,7 +188,10 @@ impl JitterBuffer {
             next_seq: None,
             count: 0,
             anchored: false,
+            highest_seq: None,
+            floor: None,
             primed: false,
+            stretch_cooldown: 0,
             stats: JitterStats::default(),
             jitter_ms: 0.0,
             prev_arrival: None,
@@ -237,6 +272,19 @@ impl JitterBuffer {
         }
     }
 
+    /// `true` if `seq` is at or before the post-reset floor (a pre-reset packet).
+    fn below_floor(&self, seq: u32) -> bool {
+        self.floor
+            .is_some_and(|floor| (seq.wrapping_sub(floor) as i32) <= 0)
+    }
+
+    /// Rejects a packet as too late (updates the statistics and the jitter estimate).
+    fn too_late(&mut self, timestamp: u32, arrival_us: u64) -> PushResult {
+        self.stats.late += 1;
+        self.update_jitter(timestamp, arrival_us);
+        PushResult::TooLate
+    }
+
     /// Inserts a packet. `timestamp` is the media timestamp (48 kHz samples) and
     /// `arrival_us` the local monotonic arrival time in microseconds.
     pub fn push(
@@ -247,6 +295,16 @@ impl JitterBuffer {
         payload: Vec<u8>,
     ) -> PushResult {
         let cap = self.capacity();
+        if self
+            .highest_seq
+            .is_none_or(|h| (seq.wrapping_sub(h) as i32) > 0)
+        {
+            self.highest_seq = Some(seq);
+        }
+        if !self.anchored && self.below_floor(seq) {
+            // A packet from before the last reset (reordered behind the reset packet).
+            return self.too_late(timestamp, arrival_us);
+        }
         let Some(next) = self.next_seq else {
             // First packet after new/reset.
             self.update_jitter(timestamp, arrival_us);
@@ -261,9 +319,7 @@ impl JitterBuffer {
         let dist = seq.wrapping_sub(next) as i32;
         if dist < 0 {
             if self.anchored {
-                self.stats.late += 1;
-                self.update_jitter(timestamp, arrival_us);
-                return PushResult::TooLate;
+                return self.too_late(timestamp, arrival_us);
             }
             // Start-up reordering: extend the window backwards.
             let back = dist.unsigned_abs() as usize;
@@ -331,7 +387,7 @@ impl JitterBuffer {
         }
     }
 
-    /// Takes the next frame in `seq` order.
+    /// Takes the next frame in `seq` order (or asks for a stretch frame, see the module docs).
     pub fn pop(&mut self) -> Pop {
         self.check_primed();
         if !self.primed {
@@ -341,6 +397,15 @@ impl JitterBuffer {
             // Ran dry: re-prime before playing again.
             self.primed = false;
             return Pop::Underrun;
+        }
+        if self.stretch_cooldown > 0 {
+            self.stretch_cooldown -= 1;
+        } else if self.target_ms - self.buffered_ms()
+            > STRETCH_THRESHOLD_FRAMES * f64::from(self.config.frame_ms)
+        {
+            self.stretch_cooldown = STRETCH_MIN_INTERVAL - 1;
+            self.stats.stretched += 1;
+            return Pop::Stretch;
         }
         match self.advance() {
             Some(payload) => Pop::Packet(payload),
@@ -376,15 +441,33 @@ impl JitterBuffer {
         }
     }
 
-    /// Drops all packets and state (e.g. on `FLAG_RESET`). Statistics are kept, as are the
-    /// jitter estimate and adaptive target.
+    /// Drops all packets and playout state. Statistics are kept, as are the jitter estimate
+    /// and adaptive target. Every packet at or before the highest `seq` pushed so far is
+    /// rejected as [`PushResult::TooLate`] afterwards (`seq` is never reused, so such a packet
+    /// predates the reset). Prefer [`JitterBuffer::reset_at`] on `FLAG_RESET`: it also rejects
+    /// pre-reset packets that were never seen before the reset.
     pub fn reset(&mut self) {
+        let floor = self.highest_seq;
+        self.reset_state(floor);
+    }
+
+    /// Like [`JitterBuffer::reset`], for a stream that restarts at `first_seq` (the seq of the
+    /// `FLAG_RESET` packet, which the caller pushes next): every packet **before**
+    /// `first_seq` (wrap-aware) is rejected as [`PushResult::TooLate`], while `first_seq` and
+    /// later packets may arrive in any order.
+    pub fn reset_at(&mut self, first_seq: u32) {
+        self.reset_state(Some(first_seq.wrapping_sub(1)));
+    }
+
+    fn reset_state(&mut self, floor: Option<u32>) {
         self.slots.clear();
         self.next_seq = None;
         self.count = 0;
         self.anchored = false;
         self.primed = false;
+        self.stretch_cooldown = 0;
         self.prev_arrival = None;
+        self.floor = floor;
     }
 }
 
@@ -532,6 +615,16 @@ mod tests {
     fn sequence_wraparound() {
         let mut jb = JitterBuffer::new(fixed_cfg());
         let start = u32::MAX - 2;
+        // Timing relative to `start` (continuous across the wrap).
+        let push = |jb: &mut JitterBuffer, seq: u32| {
+            let n = u64::from(seq.wrapping_sub(start));
+            jb.push(
+                seq,
+                seq.wrapping_mul(480),
+                n * 10_000,
+                seq.to_be_bytes().to_vec(),
+            )
+        };
         let order = [start, start + 2, start + 1, 0, 2, 1, 3];
         for s in order {
             assert_eq!(push(&mut jb, s), PushResult::Accepted, "seq {s}");
@@ -610,6 +703,56 @@ mod tests {
     }
 
     #[test]
+    fn stretches_to_follow_a_rising_target() {
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        let mut next_pop = 0_u32;
+        let mut stretch_at = Vec::new();
+        // One push and one pop per 10 ms tick; after 2 s the arrival jitter jumps to ±15 ms.
+        for tick in 0..600_u32 {
+            let extra = if tick >= 200 && tick % 2 == 1 {
+                30_000
+            } else {
+                0
+            };
+            let arrival = u64::from(tick) * 10_000 + extra;
+            assert_eq!(
+                jb.push(tick, tick * 480, arrival, tick.to_be_bytes().to_vec()),
+                PushResult::Accepted
+            );
+            match jb.pop() {
+                Pop::Packet(p) => {
+                    assert_eq!(p, next_pop.to_be_bytes().to_vec(), "order kept");
+                    next_pop += 1;
+                }
+                Pop::Stretch => stretch_at.push(tick),
+                Pop::Underrun => assert!(tick < 4, "underrun at tick {tick}"),
+                Pop::Missing { .. } => panic!("nothing is lost"),
+            }
+            if tick == 199 {
+                // Steady state before the jump: no stretching needed.
+                assert!(stretch_at.is_empty(), "{stretch_at:?}");
+            }
+        }
+        let target = jb.target_ms();
+        assert!(target > 90.0, "target rose: {target}");
+        // The buffer followed the target within the threshold, far faster than drift
+        // correction (≤ 2 ms/s) could, with isolated, spaced-out stretch frames.
+        // (Measured after the tick's pop, which removed one frame.)
+        let buffered = jb.buffered_ms() + 10.0;
+        assert!(
+            target - buffered <= STRETCH_THRESHOLD_FRAMES * 10.0,
+            "buffered {buffered} vs target {target}"
+        );
+        assert!(!stretch_at.is_empty());
+        assert!(stretch_at
+            .windows(2)
+            .all(|w| w[1] - w[0] >= STRETCH_MIN_INTERVAL));
+        assert!(*stretch_at.last().unwrap() < 350, "{stretch_at:?}");
+        assert_eq!(jb.stats().stretched, stretch_at.len() as u64);
+        assert_eq!(jb.stats().lost, 0);
+    }
+
+    #[test]
     fn adaptive_target_grows_fast_and_decays_slowly() {
         let mut jb = JitterBuffer::new(JitterConfig::default());
         assert_eq!(jb.target_ms(), 40.0);
@@ -658,11 +801,68 @@ mod tests {
         assert!(!jb.is_primed());
         assert_eq!(jb.buffered_ms(), 0.0);
         assert_eq!(jb.pop(), Pop::Underrun);
-        // After a reset any seq starts a new window (even an old one).
-        for s in 0..3 {
+        // Pre-reset packets (seq is never reused) are too late, even before the first pop.
+        assert_eq!(push(&mut jb, 3), PushResult::TooLate);
+        // The stream continues with higher seqs; start-up reordering still works among them.
+        for s in [5, 4, 6] {
             assert_eq!(push(&mut jb, s), PushResult::Accepted);
         }
-        assert_eq!(jb.pop(), pkt(0));
+        assert_eq!(jb.pop(), pkt(4));
         assert_eq!(jb.stats().received, 7);
+        assert_eq!(jb.stats().late, 1);
+    }
+
+    #[test]
+    fn reset_rejects_pre_reset_stragglers() {
+        // Reviewer scenario: push 0..5, pop 3, reset, then the reset packet 10 arrives before
+        // the reordered pre-reset packet 9.
+        let mut jb = JitterBuffer::new(fixed_cfg());
+        for s in 0..6 {
+            push(&mut jb, s);
+        }
+        for s in 0..3 {
+            assert_eq!(jb.pop(), pkt(s));
+        }
+        jb.reset_at(10);
+        assert_eq!(push(&mut jb, 10), PushResult::Accepted);
+        assert_eq!(push(&mut jb, 9), PushResult::TooLate, "pre-reset straggler");
+        assert_eq!(push(&mut jb, 5), PushResult::TooLate);
+        // Post-reset packets may still be reordered among themselves (12 before 11).
+        assert_eq!(push(&mut jb, 12), PushResult::Accepted);
+        assert_eq!(push(&mut jb, 11), PushResult::Accepted);
+        assert_eq!(jb.pop(), pkt(10));
+        assert_eq!(jb.pop(), pkt(11));
+        assert_eq!(jb.pop(), pkt(12));
+        assert_eq!(jb.stats().late, 2);
+
+        // reset_at also works when the reset packet itself is not the first to arrive.
+        let mut jb = JitterBuffer::new(fixed_cfg());
+        push(&mut jb, 0);
+        jb.reset_at(20);
+        assert_eq!(push(&mut jb, 21), PushResult::Accepted);
+        assert_eq!(push(&mut jb, 19), PushResult::TooLate);
+        assert_eq!(push(&mut jb, 20), PushResult::Accepted);
+        assert_eq!(push(&mut jb, 22), PushResult::Accepted);
+        assert_eq!(jb.pop(), pkt(20));
+
+        // Plain reset(): the floor is the highest seq seen, across the u32 wrap.
+        let mut jb = JitterBuffer::new(fixed_cfg());
+        for s in [u32::MAX - 1, u32::MAX, 0] {
+            push(&mut jb, s);
+        }
+        jb.reset();
+        assert_eq!(push(&mut jb, u32::MAX), PushResult::TooLate);
+        assert_eq!(push(&mut jb, 0), PushResult::TooLate);
+        assert_eq!(push(&mut jb, 2), PushResult::Accepted);
+        assert_eq!(
+            push(&mut jb, 1),
+            PushResult::Accepted,
+            "post-reset reordering"
+        );
+        assert_eq!(push(&mut jb, 3), PushResult::Accepted);
+        // (The helper's arrival times jump at the wrap, so the target is high: just check
+        // what is buffered.)
+        assert_eq!(jb.buffered_ms(), 30.0);
+        assert_eq!(jb.stats().late, 2);
     }
 }

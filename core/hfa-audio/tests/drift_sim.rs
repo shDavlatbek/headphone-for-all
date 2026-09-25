@@ -45,12 +45,41 @@ struct Report {
     ppm_std: f64,
     min_buffered_ms: f64,
     out_of_order: u64,
+    /// `Pop::Stretch` frames over the whole run.
+    stretched: u64,
+    /// `Pop::Stretch` frames after convergence.
+    stretched_after_convergence: u64,
+    /// Packets that arrived after their slot was played, concealed or skipped.
+    late: u64,
+    /// Tick of the last underrun after playout started (0 = none).
+    last_underrun_tick: u64,
+}
+
+/// Arrival jitter: uniform in `[0, before_us)` until `step_tick`, then `[0, after_us)`.
+#[derive(Debug, Clone, Copy)]
+struct Jitter {
+    before_us: f64,
+    step_tick: u64,
+    after_us: f64,
+    /// `false` emulates a hub that ignores `Pop::Stretch` (pops again instead), as a control.
+    honor_stretch: bool,
+}
+
+impl Jitter {
+    fn constant(max_us: f64) -> Self {
+        Self {
+            before_us: max_us,
+            step_tick: u64::MAX,
+            after_us: max_us,
+            honor_stretch: true,
+        }
+    }
 }
 
 fn simulate(
     sender_ppm: f64,
     seconds: u64,
-    max_jitter_us: f64,
+    jitter: Jitter,
     seed: u64,
     drift_cfg: DriftConfig,
 ) -> Report {
@@ -86,6 +115,11 @@ fn simulate(
         // Generate every packet sent before now (arrivals may land later).
         while (next_send as f64) * send_period_us <= now_us {
             let sent = next_send as f64 * send_period_us;
+            let max_jitter_us = if tick >= jitter.step_tick {
+                jitter.after_us
+            } else {
+                jitter.before_us
+            };
             let arrival = sent + 1_000.0 + rng.next_f64() * max_jitter_us;
             in_flight.push(Reverse((arrival as u64, next_send)));
             next_send += 1;
@@ -101,6 +135,7 @@ fn simulate(
             match jb.push(seq, ts, arrival, idx.to_le_bytes().to_vec()) {
                 PushResult::Accepted => {}
                 PushResult::Overflow => report.overflows += 1,
+                PushResult::TooLate => report.late += 1,
                 other => panic!("unexpected push result {other:?} for idx {idx}"),
             }
         }
@@ -125,9 +160,20 @@ fn simulate(
                     pcm.fill(0.0);
                     rs.process(&pcm, &mut fifo).unwrap();
                 }
+                Pop::Stretch if !jitter.honor_stretch => {}
+                Pop::Stretch => {
+                    // The hub conceals one frame without consuming a packet.
+                    report.stretched += 1;
+                    if tick > converge_after_ticks {
+                        report.stretched_after_convergence += 1;
+                    }
+                    pcm.fill(0.1);
+                    rs.process(&pcm, &mut fifo).unwrap();
+                }
                 Pop::Underrun => {
                     if started {
                         report.underruns_after_start += 1;
+                        report.last_underrun_tick = tick;
                     }
                     fifo.resize(FRAME, 0.0); // silence for this tick
                 }
@@ -177,12 +223,23 @@ fn simulate(
 /// then legitimately varies by more than one packet).
 fn check(sender_ppm: f64, max_jitter_us: f64, extra_band_frames: f64, seed: u64) {
     assert_eq!(f64::from(JitterConfig::default().frame_ms), FRAME_MS);
-    let r = simulate(sender_ppm, 600, max_jitter_us, seed, DriftConfig::default());
+    let r = simulate(
+        sender_ppm,
+        600,
+        Jitter::constant(max_jitter_us),
+        seed,
+        DriftConfig::default(),
+    );
     eprintln!("{sender_ppm:+} ppm, jitter {max_jitter_us} us: {r:?}");
     assert_eq!(r.underruns_after_start, 0, "underruns: {r:?}");
     assert_eq!(r.overflows, 0, "overflows: {r:?}");
+    assert_eq!(r.late, 0, "late packets: {r:?}");
     assert_eq!(r.missing, 0, "missing frames: {r:?}");
     assert_eq!(r.out_of_order, 0, "{r:?}");
+    assert_eq!(
+        r.stretched_after_convergence, 0,
+        "stretching in steady state: {r:?}"
+    );
     // Instantaneous level (whole packets) within ±1 frame of the (fractional) target.
     assert!(
         r.frames_outside_band <= extra_band_frames,
@@ -232,8 +289,63 @@ fn without_correction_the_buffer_drifts_away() {
         max_ppm: 0.0,
         ..DriftConfig::default()
     };
-    let slow = simulate(-300.0, 300, 8_000.0, 7, off);
+    let slow = simulate(-300.0, 300, Jitter::constant(8_000.0), 7, off);
+    // The draining buffer runs dry (the target is too low for stretching to kick in).
     assert!(slow.underruns_after_start > 0, "{slow:?}");
-    let fast = simulate(300.0, 300, 8_000.0, 8, off);
+    let fast = simulate(300.0, 300, Jitter::constant(8_000.0), 8, off);
     assert!(fast.worst_avg_error_ms > 40.0, "{fast:?}");
+}
+
+/// A sudden jitter increase (2 ms → 40 ms after 30 s) raises the target at once. The first
+/// late packets right at the step cannot be absorbed by any buffer sized for 2 ms of jitter,
+/// but stretch frames then grow the buffer to the new target within about a second (the
+/// drift controller alone manages ≤ 2 ms/s), so playout does not keep running dry or
+/// concealing late packets. Control: the same runs with the stretch requests ignored.
+#[test]
+fn jitter_step_is_followed_by_stretching_without_repeated_underruns() {
+    let step_tick = 30 * 100;
+    let jitter = Jitter {
+        before_us: 2_000.0,
+        step_tick,
+        after_us: 40_000.0,
+        honor_stretch: true,
+    };
+    let seeds = [
+        0xA5A5_5A5A_1234_4321,
+        0x0BAD_F00D_DEAD_BEEF,
+        0x7777_1234_ABCD_0001,
+        0x5555_AAAA_0000_FFFF,
+    ];
+    // Audible glitches: underruns plus frames concealed because their packet came too late.
+    let glitches = |r: &Report| r.underruns_after_start + r.missing;
+    let (mut total, mut control_total) = (0, 0);
+    for seed in seeds {
+        let r = simulate(300.0, 45, jitter, seed, DriftConfig::default());
+        eprintln!("jitter step: {r:?}");
+        // (A few packets delayed past their slot right at the step are concealed: `missing`.)
+        assert_eq!(r.out_of_order, 0, "{r:?}");
+        assert!(r.stretched > 0, "{r:?}");
+        assert!(
+            r.last_underrun_tick < step_tick + 200,
+            "underruns continue 2 s after the step: {r:?}"
+        );
+        total += glitches(&r);
+        // Control: a hub that ignores stretch requests.
+        let control = simulate(
+            300.0,
+            45,
+            Jitter {
+                honor_stretch: false,
+                ..jitter
+            },
+            seed,
+            DriftConfig::default(),
+        );
+        eprintln!("jitter step, stretch ignored: {control:?}");
+        control_total += glitches(&control);
+    }
+    assert!(
+        3 * total < control_total,
+        "glitches with stretching: {total}, without: {control_total}"
+    );
 }
