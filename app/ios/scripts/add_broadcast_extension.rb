@@ -16,9 +16,11 @@
 #
 # What it does:
 # - Runner: adds HfaPlatformChannel.swift, BroadcastPickerFactory.swift, Shared/HfaShared.swift
-#   to the Sources phase and CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements (App Group).
+#   to the Sources phase, CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements (App Group) and
+#   PRODUCT_BUNDLE_IDENTIFIER = $(HFA_BUNDLE_ID) (ios/Identity.xcconfig).
 # - RunnerTests: also compiles HfaBroadcast/PcmInterleaver.swift (unit tests of the converter).
-# - HfaBroadcast (com.apple.product-type.app-extension, bundle io.github.shdavlatbek.hfa.broadcast):
+# - HfaBroadcast (com.apple.product-type.app-extension, bundle $(HFA_BROADCAST_BUNDLE_ID), i.e.
+#   io.github.shdavlatbek.hfa.broadcast unless Identity.local.xcconfig overrides HFA_BUNDLE_ID):
 #   sources SampleHandler.swift, PcmInterleaver.swift, Shared/HfaShared.swift; first build phase
 #   "Build Rust sender (hfa-ffi)" runs scripts/build_rust_ext.sh (-> $BUILT_PRODUCTS_DIR/libhfa_ext.a);
 #   links libhfa_ext.a plus the system frameworks/libraries the Rust static library needs.
@@ -32,7 +34,9 @@ IOS_DIR = File.expand_path('..', __dir__)
 PROJECT_PATH = File.join(IOS_DIR, 'Runner.xcodeproj')
 
 EXT_NAME = 'HfaBroadcast'
-EXT_BUNDLE_ID = 'io.github.shdavlatbek.hfa.broadcast'
+# Bundle ids come from ios/Identity.xcconfig (included by the targets' base configurations).
+RUNNER_BUNDLE_ID = '$(HFA_BUNDLE_ID)'
+EXT_BUNDLE_ID = '$(HFA_BROADCAST_BUNDLE_ID)'
 DEPLOYMENT_TARGET = '15.0'
 RUST_PHASE_NAME = 'Build Rust sender (hfa-ffi)'
 EMBED_PHASE_NAME = 'Embed Foundation Extensions'
@@ -158,7 +162,8 @@ RUNNER_SOURCES.each { |name| ensure_source(runner, ensure_file(runner_group, nam
 ensure_source(runner, shared_swift)
 ensure_file(runner_group, 'Runner.entitlements')
 runner.build_configurations.each do |config|
-  set_settings(config, 'CODE_SIGN_ENTITLEMENTS' => 'Runner/Runner.entitlements')
+  set_settings(config, 'CODE_SIGN_ENTITLEMENTS' => 'Runner/Runner.entitlements',
+                       'PRODUCT_BUNDLE_IDENTIFIER' => RUNNER_BUNDLE_ID)
 end
 
 # --- Extension target ------------------------------------------------------------------------

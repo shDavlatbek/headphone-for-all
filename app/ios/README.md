@@ -20,6 +20,7 @@ broadcast upload extension streams what the phone plays).
 | `scripts/add_broadcast_extension.rb` | adds everything above to `Runner.xcodeproj` (idempotent; the result is committed) |
 | `scripts/verify_xcodeproj.rb` | prints targets / build phases and checks the project invariants |
 | `RunnerTests/RunnerTests.swift` | XCTest: config/status JSON formats and the PCM converter |
+| `Identity.xcconfig` | `HFA_BUNDLE_ID` (app), `HFA_BROADCAST_BUNDLE_ID` (extension), `HFA_APP_GROUP`; override them in a git-ignored `Identity.local.xcconfig` |
 
 ## Platform channel (iOS)
 
@@ -52,7 +53,7 @@ background after `hfa_ext_sender_start` returned (see Known limitations).
 
 ## Broadcast extension `HfaBroadcast`
 
-- Bundle id `io.github.shdavlatbek.hfa.broadcast`, iOS 15, principal class `SampleHandler`,
+- Bundle id `$(HFA_BROADCAST_BUNDLE_ID)` (`io.github.shdavlatbek.hfa.broadcast` by default), iOS 15, principal class `SampleHandler`,
   `RPBroadcastProcessMode = RPBroadcastProcessModeSampleBuffer`, App Group entitlement.
 - `broadcastStarted` reads `broadcast_config.json` (the C ABI keys), replaces its `data_dir` with
   `<container>/hfa` resolved in the extension's own process (a stored absolute container path can be
@@ -107,6 +108,28 @@ It adds the `HfaBroadcast` target (Debug/Release/Profile, base configuration
 depend on it, compiles the new Runner sources, sets `CODE_SIGN_ENTITLEMENTS` for Runner and
 compiles `PcmInterleaver.swift` into RunnerTests as well.
 
+### Identity (bundle ids, App Group, team)
+
+`ios/Identity.xcconfig` is the only place that names them; Runner's `Flutter/Debug.xcconfig` /
+`Release.xcconfig` and `HfaBroadcast/HfaBroadcast.xcconfig` include it:
+
+| Setting | Default | Used by |
+|---|---|---|
+| `HFA_BUNDLE_ID` | `io.github.shdavlatbek.hfa` | Runner `PRODUCT_BUNDLE_IDENTIFIER` |
+| `HFA_BROADCAST_BUNDLE_ID` | `$(HFA_BUNDLE_ID).broadcast` | HfaBroadcast `PRODUCT_BUNDLE_IDENTIFIER`; the `HfaBroadcastExtension` Info.plist key (the picker's `preferredExtension`, the Darwin notification names `<id>.started` / `.finished`) |
+| `HFA_APP_GROUP` | `group.$(HFA_BUNDLE_ID)` | both `.entitlements` files; the `HfaAppGroup` Info.plist key (`HfaShared.appGroupId`) |
+
+To build with another team, create `ios/Identity.local.xcconfig` (git-ignored, included at the end of
+`Identity.xcconfig`):
+
+```
+HFA_BUNDLE_ID = com.example.hfa
+DEVELOPMENT_TEAM = ABCDE12345
+```
+
+Xcode expands the settings in the Info.plists and the entitlements; `verify_xcodeproj.rb` checks that nothing
+names the ids directly.
+
 ## What is verified where
 
 On Linux (this repository's dev container):
@@ -130,10 +153,11 @@ Only on a real iPhone (ReplayKit broadcasts do not run in the Simulator): everyt
 
 ## Manual test (iPhone + a hub on the same Wi-Fi)
 
-1. Signing: give the App ID `io.github.shdavlatbek.hfa` **and** `io.github.shdavlatbek.hfa.broadcast`
-   the App Groups capability with `group.io.github.shdavlatbek.hfa`; select your team for both
-   targets in Xcode (Runner and HfaBroadcast). Without the App Group the extension reports
-   "cannot reach its shared storage".
+1. Signing: App IDs and App Groups belong to one team, so unless you are the owner of
+   `io.github.shdavlatbek.hfa`, create `ios/Identity.local.xcconfig` with `HFA_BUNDLE_ID = <your prefix>`
+   (and `DEVELOPMENT_TEAM = <your team id>`); see Identity (below). Give the App IDs `$(HFA_BUNDLE_ID)` **and**
+   `$(HFA_BUNDLE_ID).broadcast` the App Groups capability with `group.$(HFA_BUNDLE_ID)` (Xcode's automatic
+   signing does this). Without the App Group the app stops at start-up with `NO_APP_GROUP`.
 2. `flutter run --release` on the iPhone. Allow local network access when asked.
 3. Start a hub on another device (the app, or the `hfa` CLI), pair the iPhone (QR or PIN) and choose
    that hub as the target: the app writes `broadcast_config.json`.

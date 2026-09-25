@@ -24,6 +24,10 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>HfaAppGroup</key>
+	<string>$(HFA_APP_GROUP)</string>
+	<key>HfaBroadcastExtension</key>
+	<string>$(HFA_BROADCAST_BUNDLE_ID)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSBonjourServices</key>

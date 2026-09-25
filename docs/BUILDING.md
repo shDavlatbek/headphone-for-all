@@ -309,11 +309,12 @@ git status                             # commit everything it changed
   `AudioToolbox`, `CoreAudio`, `CoreFoundation`, `Foundation`, `-lobjc` (and the extension `-liconv`,
   `CoreMedia`, `ReplayKit`). When Apple-side Rust dependencies change, compare with
   `cargo rustc -p hfa-ffi --target aarch64-apple-ios --lib --crate-type staticlib -- --print native-static-libs`.
-- App and extension share identity and pairings through the **App Group**
-  `group.io.github.shdavlatbek.hfa`. To install on a device: give both App IDs
-  (`io.github.shdavlatbek.hfa`, `io.github.shdavlatbek.hfa.broadcast`) the App Groups capability with
-  that group, select your team for **both** targets in `app/ios/Runner.xcworkspace`, then
-  `flutter run --release` or `flutter build ipa`. A device build without the App Group stops at start-up
+- App and extension share identity and pairings through the **App Group** `group.$(HFA_BUNDLE_ID)`
+  (default `group.io.github.shdavlatbek.hfa`). The bundle ids and the group are set only in
+  `app/ios/Identity.xcconfig`; with your own team create `app/ios/Identity.local.xcconfig` (git-ignored)
+  with `HFA_BUNDLE_ID = <your prefix>` and `DEVELOPMENT_TEAM = <team id>`. To install on a device: give both
+  App IDs (`$(HFA_BUNDLE_ID)`, `$(HFA_BUNDLE_ID).broadcast`) the App Groups capability with that group
+  (automatic signing does it), then `flutter run --release` or `flutter build ipa`. A device build without the App Group stops at start-up
   with an error (`NO_APP_GROUP`): a private container would hide the pairings from the extension. Only
   Simulator builds fall back to the app's own container.
 - ReplayKit broadcasts do not run in the Simulator; audio from DRM-protected apps is silent. The

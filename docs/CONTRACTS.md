@@ -1584,6 +1584,17 @@ app also writes as a `finished` status. `broadcast_status.json` readers treat an
 as running. New method **`getBroadcastStatus`** → `{broadcasting: bool, state?, message?, timestamp?}` (iOS only;
 other platforms do not implement it).
 
+**iOS identity in one place.** `app/ios/Identity.xcconfig` defines `HFA_BUNDLE_ID` (default
+`io.github.shdavlatbek.hfa`), `HFA_BROADCAST_BUNDLE_ID = $(HFA_BUNDLE_ID).broadcast` and
+`HFA_APP_GROUP = group.$(HFA_BUNDLE_ID)`, optionally overridden by a git-ignored `Identity.local.xcconfig` (also the
+place for `DEVELOPMENT_TEAM`). Runner (`Flutter/Debug.xcconfig`, `Release.xcconfig`) and HfaBroadcast
+(`HfaBroadcast.xcconfig`) include it; `PRODUCT_BUNDLE_IDENTIFIER` is `$(HFA_BUNDLE_ID)` /
+`$(HFA_BROADCAST_BUNDLE_ID)`, both `.entitlements` list `$(HFA_APP_GROUP)`, and both Info.plists carry
+`HfaAppGroup = $(HFA_APP_GROUP)` and `HfaBroadcastExtension = $(HFA_BROADCAST_BUNDLE_ID)`, which
+`HfaShared.appGroupId` / `broadcastExtensionBundleId` read (falling back to the defaults). The Darwin notification
+names are derived: `<broadcastExtensionBundleId>.started` / `.finished` (unchanged for the default ids).
+`verify_xcodeproj.rb` checks all of it. This supersedes the literal ids of §8.2 and §8.9 for iOS.
+
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 
 **Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).
