@@ -27,6 +27,7 @@ pub mod error;
 pub mod external;
 pub mod output_cpal;
 pub mod output_file;
+mod pacer;
 pub mod ring;
 pub mod tone;
 pub mod wav_source;
@@ -46,7 +47,7 @@ mod platform;
 
 pub use error::CaptureError;
 pub use external::{register_external, unregister_external, ExternalFeed};
-pub use ring::{pcm_ring, PcmSink, PcmSource, RingStats};
+pub use ring::{pcm_ring, pcm_ring_with_channels, PcmSink, PcmSource, RingStats};
 
 /// Result type used throughout this crate.
 pub type Result<T> = std::result::Result<T, CaptureError>;
@@ -183,8 +184,10 @@ pub fn open_capture(target: &CaptureTarget) -> Result<Box<dyn CaptureSource>> {
     }
 }
 
-/// Opens (but does not start) an output. `buffer_ms` is the desired device buffer size.
-/// Device outputs use the device's native rate/channels; WAV and null outputs use
+/// Opens (but does not start) an output. `buffer_ms` is the desired device buffer size (the
+/// pull period for WAV and null outputs). Device outputs use 48 kHz when the device supports
+/// it, else the device's default rate, and the device's channel count (see
+/// [`AudioOutput::format`]; the hub resamples to it); WAV and null outputs use
 /// [`AudioFormat::INTERNAL`].
 ///
 /// # Errors
