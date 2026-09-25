@@ -1652,6 +1652,11 @@ These supersede the matching statements of §8.5 and the "Open" list of §8.9.
 - **`SampleHandler`** polls it every second (under its lock). On `failed` it stops the sender, writes
   `broadcast_status.json` `{state: "finished", message: <reason and what to do>}`, posts the finished Darwin
   notification and calls `finishBroadcastWithError`, so the app and the user learn why nothing plays.
+- **Extension log file.** The extension's hfa-ffi build has no `flutter` feature and so no console logger; on iOS
+  without `flutter`, the C ABI now installs a `tracing-subscriber` `fmt` subscriber (no ANSI, `RUST_LOG` or `info`)
+  writing to **`<data_dir>/broadcast.log`** (the App Group's `hfa` directory), rotated at 256 KiB to
+  `broadcast.log.1`. No new dependency (a file writer, not the `oslog` crate, whose C shim would break the Linux
+  `cargo check --target aarch64-apple-ios --no-default-features`). Other targets keep `init_tracing`.
 
 ## 9. Work packages and file ownership
 

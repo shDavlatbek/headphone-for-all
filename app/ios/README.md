@@ -158,8 +158,10 @@ phone attached (Console.app works too).
 ## Known limitations
 
 - Rust `tracing` output of the extension is not forwarded to os_log (the extension builds hfa-ffi
-  without the `flutter` feature, whose logger does that); the Swift side logs every failure with
-  `os.Logger` (subsystem `io.github.shdavlatbek.hfa.broadcast`).
+  without the `flutter` feature, whose logger does that). It goes to
+  `<container>/hfa/broadcast.log` instead (capped at 256 KiB, one previous part kept as
+  `broadcast.log.1`); the Swift side logs every failure with `os.Logger` (subsystem
+  `io.github.shdavlatbek.hfa.broadcast`).
 - A hub that disappears later is not reported to the app: the sender keeps reconnecting
   (`hfa_ext_sender_state` says `reconnecting`; only `failed` ends the broadcast).
 - mDNS through the Rust `mdns-sd` crate (hub advertising on iOS, or `hub_host = ""` in the

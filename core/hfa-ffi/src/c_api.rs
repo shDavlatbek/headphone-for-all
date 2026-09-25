@@ -260,7 +260,9 @@ fn engine_err(context: &str) -> impl Fn(hfa_core::CoreError) -> ExtError + '_ {
 }
 
 fn start_ext_sender(cfg: &ExtConfig) -> Result<Box<HfaExtSender>, ExtError> {
-    crate::logging::init_tracing();
+    // Before anything that logs; the directory must exist for the log file.
+    let _ = std::fs::create_dir_all(&cfg.data_dir);
+    crate::logging::init_ext_logging(&cfg.data_dir);
     let settings = Settings::load_or_default(&cfg.data_dir).map_err(engine_err("settings"))?;
     let trust = TrustStore::load(&cfg.data_dir).map_err(engine_err("trust store"))?;
     let identity = Identity::load_or_create(&cfg.data_dir, &settings.device_name)
