@@ -723,19 +723,122 @@ Modules:
 
 ## 8. `hfa-ffi` + Flutter app
 
-- `hfa-ffi` (crate-type `cdylib`, `staticlib`, `rlib`):
-  - `src/api/` is the flutter_rust_bridge v2 API. One global engine manager owns a tokio runtime.
-  - `src/c_api.rs` is the C ABI for the iOS broadcast extension: `hfa_ext_sender_start(config_json)`,
-    `hfa_ext_push_pcm(handle, *const f32, frames, channels, rate)`, `hfa_ext_sender_stop(handle)`.
-  - `src/android.rs` holds the JNI exports for the Kotlin capture service. It pushes PCM into `ExternalFeed`.
-- Flutter app `app/`:
-  - Package `headphone_for_all`, org `io.github.shdavlatbek`.
-  - App ID `io.github.shdavlatbek.hfa`, App Group `group.io.github.shdavlatbek.hfa`, broadcast extension
-    `io.github.shdavlatbek.hfa.broadcast`.
-  - The frb config `app/flutter_rust_bridge.yaml` points `rust_root` at `../core/hfa-ffi`. Dart output goes to `app/lib/src/rust/`.
-  - Riverpod for state. `qr_flutter` shows the QR code, and `mobile_scanner` scans it on mobile.
+### 8.1 Rust FFI crate `core/hfa-ffi` (crate-type `cdylib`, `staticlib`, `rlib`)
 
-### 8.1 Refinements made by `feat/scaffold`
+A single global `EngineManager` (behind `OnceLock` + `parking_lot::Mutex`) owns one tokio multi-thread runtime,
+the loaded `Settings`/`Identity`/`TrustStore`, and at most one `HubHandle` and one `SenderHandle`.
+
+**flutter_rust_bridge v2 API** (`src/api/*.rs`; the Dart names are the lowerCamelCase versions generated into `app/lib/src/rust/`).
+Every call returns a DTO; the engine types never cross the FFI boundary directly.
+
+```rust
+// api/app.rs
+pub fn init_app(data_dir: String, device_name: Option<String>) -> anyhow::Result<AppInfo>;   // idempotent; sets up tracing
+pub struct AppInfo { pub device_id: String, pub device_name: String, pub platform: String, pub version: String, pub capabilities: CapabilitiesDto }
+pub struct CapabilitiesDto { pub system_mix: bool, pub per_app: bool, pub mutes_local_output: bool, pub external_only: bool, pub notes: String }
+pub fn get_settings() -> anyhow::Result<SettingsDto>;
+pub fn update_settings(settings: SettingsDto) -> anyhow::Result<()>;
+pub struct SettingsDto { pub device_name: String, pub port: u16, pub bitrate: u32, pub frame_ms: u8, pub fec: bool, pub jitter_min_ms: u32, pub jitter_max_ms: u32, pub output_device: Option<String> }
+pub fn list_output_devices() -> anyhow::Result<Vec<String>>;
+pub fn trusted_peers() -> anyhow::Result<Vec<TrustedPeerDto>>;            // { device_id, name, paired_at_unix }
+pub fn forget_peer(device_id: String) -> anyhow::Result<()>;
+pub fn parse_pairing_uri(uri: String) -> anyhow::Result<PairingUriDto>;  // { host, port, hub_id, token, name }
+
+// api/hub.rs
+pub fn hub_start() -> anyhow::Result<HubStatusDto>;                      // { running, port, device_name, source_count }
+pub fn hub_stop() -> anyhow::Result<()>;
+pub fn hub_status() -> HubStatusDto;
+pub fn hub_sources() -> Vec<SourceDto>;   // { stream_id, device_id, device_name, label, platform, gain, muted, priority, active, loss_pct, jitter_ms, buffer_ms, latency_ms, level_db }
+pub fn hub_set_gain(stream_id: u32, gain: f32) -> anyhow::Result<()>;
+pub fn hub_set_muted(stream_id: u32, muted: bool) -> anyhow::Result<()>;
+pub fn hub_set_priority(stream_id: u32, priority: bool) -> anyhow::Result<()>;
+pub fn hub_set_master_gain(gain: f32) -> anyhow::Result<()>;
+pub fn hub_start_pairing() -> anyhow::Result<PairingInfoDto>;            // { pin, token, uri, expires_at_unix }
+pub fn hub_cancel_pairing() -> anyhow::Result<()>;
+pub fn hub_events(sink: StreamSink<HubEventDto>) -> anyhow::Result<()>;  // enum: SourceAdded(SourceDto) | SourceRemoved{stream_id} | SourceUpdated(SourceDto) | PairingCompleted{device_id, name} | PairingFailed{reason} | Error{message}
+
+// api/sender.rs
+pub fn discover_hubs(sink: StreamSink<DiscoveryEventDto>) -> anyhow::Result<()>; // enum: Found(HubInfoDto{device_id,name,addrs,port,platform}) | Lost{device_id}
+pub fn stop_discovery() -> anyhow::Result<()>;
+pub fn list_capture_apps() -> anyhow::Result<Vec<CaptureAppDto>>;       // { pid, name }
+pub fn sender_start(request: SenderStartDto) -> anyhow::Result<()>;
+pub struct SenderStartDto { pub hub_host: String, pub hub_port: u16, pub hub_device_id: Option<String>, pub hub_key: Option<String>, pub pairing_secret: Option<String>, pub source: CaptureSourceDto, pub label: String }
+// hub_key = base64url static key from a pairing URI (-> SenderConfig.expected_hub_key); hub_device_id = fingerprint from discovery;
+// when hub_key is None the FFI looks the key up in the TrustStore by hub_device_id (a trusted hub), else pairing must supply trust.
+pub enum CaptureSourceDto { System, SystemExcludingSelf, Process { pid: u32 }, Tone { freq_hz: f32 }, External { feed_id: u32, sample_rate: u32, channels: u16 } }
+pub fn sender_stop() -> anyhow::Result<()>;
+pub fn sender_status() -> SenderStatusDto;  // { state: String ("idle"|"connecting"|"pairing"|"streaming"|"reconnecting"|"stopped"|"failed"), error: Option<String>, hub_name: Option<String>, bitrate, loss_pct, rtt_ms, level_db }
+pub fn sender_events(sink: StreamSink<SenderStatusDto>) -> anyhow::Result<()>;
+```
+
+`CaptureSourceDto::External` registers `hfa_capture::register_external(feed_id, format)` before starting the sender.
+Native code then pushes PCM into that feed.
+
+**C ABI for the iOS broadcast extension** (`src/c_api.rs`, header `core/hfa-ffi/include/hfa_ext.h` checked in):
+
+```c
+typedef struct HfaExtSender HfaExtSender;
+// config_json: {"data_dir": "...", "hub_host": "...", "hub_port": 47810, "hub_device_id": "...|null", "hub_key": "b64url|null", "label": "iPhone"}
+HfaExtSender *hfa_ext_sender_start(const char *config_json);          // NULL on error
+int32_t hfa_ext_push_pcm(HfaExtSender *h, const float *interleaved, uint32_t frames, uint32_t channels, uint32_t sample_rate); // 0 = ok
+int32_t hfa_ext_sender_stop(HfaExtSender *h);                         // frees h; HFA_OK or error code (§8.4)
+const char *hfa_ext_last_error(void);                                 // thread-local, valid until next call
+```
+
+The extension shares identity and trust with the app. `data_dir` is the App Group container, so the extension
+reuses the pairing the app already did. Pairing never happens inside the extension.
+
+**JNI for Android** (`src/android.rs`, `#[cfg(target_os = "android")]`). The class is `io.github.shdavlatbek.hfa.NativeBridge`:
+
+```
+external fun pushPcm(feedId: Int, data: FloatArray, frames: Int, channels: Int, sampleRate: Int): Int   // 0 = ok
+external fun pushPcm16(feedId: Int, data: ShortArray, frames: Int, channels: Int, sampleRate: Int): Int
+```
+
+These are exported as `Java_io_github_shdavlatbek_hfa_NativeBridge_pushPcm` / `..._pushPcm16`. Kotlin calls
+`System.loadLibrary("hfa_ffi")`; it is the same `.so` that flutter_rust_bridge loads.
+
+### 8.2 Flutter app `app/`
+
+- Package `headphone_for_all`, org `io.github.shdavlatbek`.
+  - App ID `io.github.shdavlatbek.hfa` (Android applicationId, iOS/macOS bundle id).
+  - iOS broadcast extension bundle id `io.github.shdavlatbek.hfa.broadcast`, App Group `group.io.github.shdavlatbek.hfa`.
+- `app/flutter_rust_bridge.yaml`: `rust_input: crate::api`, `rust_root: ../core/hfa-ffi/`, `dart_output: lib/src/rust`.
+  The native build uses frb's `rust_builder` (cargokit) at `app/rust_builder/`.
+- State: `flutter_riverpod`. QR code: `qr_flutter` shows it and `mobile_scanner` scans it (Android/iOS only).
+  Desktop tray: `tray_manager` + `window_manager`.
+- Dart layout:
+  - `lib/main.dart`
+  - `lib/src/app.dart`
+  - `lib/src/state/` (providers)
+  - `lib/src/screens/` (home, hub, sender, pairing, settings, about)
+  - `lib/src/widgets/`
+  - `lib/src/platform/native_channel.dart` (wrapper for the channel below)
+  - `lib/src/rust/` (generated; never edit by hand)
+
+### 8.3 Platform channel `MethodChannel('hfa/platform')`
+
+Dart side: `lib/src/platform/native_channel.dart`, owned by feat/app.
+Native side: Android `MainActivity.kt` plus services (feat/android); iOS/macOS `AppDelegate.swift` (feat/apple).
+Desktop Windows/Linux don't register the channel, so Dart must treat `MissingPluginException` as "not needed".
+
+| Method | Args | Result | Android | iOS | macOS |
+|---|---|---|---|---|---|
+| `getDataDir` | – | `String` | `filesDir/hfa` | App Group container `/hfa` | Application Support `/hfa` |
+| `startSystemCapture` | `{feedId:int, sampleRate:int, channels:int}` | `bool` (started) | MediaProjection consent → foreground `CaptureService` (type `mediaProjection`) → `AudioPlaybackCapture` → `NativeBridge.pushPcm` | returns `false` (use the broadcast picker) | not used (Rust captures directly) |
+| `stopSystemCapture` | – | `null` | stops the service | – | – |
+| `startHubService` | – | `null` | foreground `HubService` (type `mediaPlayback`) + keeps a `MulticastLock` | activates `AVAudioSession(.playback, .mixWithOthers)` | – |
+| `stopHubService` | – | `null` | stops it, releases the lock | deactivates the session | – |
+| `acquireMulticastLock` / `releaseMulticastLock` | – | `null` | `WifiManager.MulticastLock` | no-op | no-op |
+| `writeBroadcastConfig` | `{hubHost, hubPort, hubDeviceId, hubKey, label}` | `null` | – | writes `broadcast_config.json` into the App Group container for the extension | – |
+| `captureSupport` | – | `{supported:bool, reason:String}` | API ≥ 29 | `{supported:true, reason:"broadcast"}` | – |
+
+iOS also registers the platform view `hfa/broadcast_picker`, which wraps an `RPSystemBroadcastPickerView`
+whose `preferredExtension` is the broadcast extension's bundle id.
+
+Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `{type: "captureStopped"|"captureError"|"broadcastStarted"|"broadcastFinished", message?: String}`.
+
+### 8.4 Refinements made by `feat/scaffold`
 
 - C ABI (`c_api.rs`, `#[no_mangle] unsafe extern "C"`, never panics across the boundary):
   `hfa_ext_sender_start(config_json: *const c_char) -> *mut HfaExtSender` (null on failure),
@@ -758,15 +861,16 @@ Modules:
 | `feat/scaffold` | the workspace, every crate's `Cargo.toml`, `lib.rs` module wiring, stub signatures, `.gitignore`, licences, `rustfmt.toml` |
 | `feat/proto` | `core/hfa-proto/**` |
 | `feat/audio` | `core/hfa-audio/**` |
-| `feat/capture` | `core/hfa-capture/**` except `linux.rs`, `windows.rs`, `macos.rs` bodies |
+| `feat/capture-common` | `core/hfa-capture/**` except the `linux.rs`, `windows.rs`, `macos.rs` bodies |
 | `feat/capture-linux` / `-windows` / `-macos` | the matching `core/hfa-capture/src/<os>.rs` (+ that OS's deps in `hfa-capture/Cargo.toml`) |
-| `feat/core-engine` | `core/hfa-core/**` |
-| `feat/cli` | `core/hfa-cli/**` |
-| `feat/ffi` | `core/hfa-ffi/**` |
-| `feat/app` | `app/lib/**`, `app/pubspec.yaml`, `app/test/**`, frb config |
+| `feat/core-net` | `core/hfa-core/src/{config,identity,pairing,control,discovery,media}.rs`, `hfa-core/Cargo.toml`, `hfa-core/tests/net_*.rs` |
+| `feat/core-engine` | `core/hfa-core/src/{sender,hub,lib}.rs` (+ private helper modules it adds), `hfa-core/tests/engine_*.rs` |
+| `feat/cli` | `core/hfa-cli/**`, the README "Try it" section |
+| `feat/ffi` | `core/hfa-ffi/**`, creation of `app/` (`flutter create`), `app/flutter_rust_bridge.yaml`, `app/rust_builder/**`, `app/lib/src/rust/**` (generated), the minimal first `app/lib/main.dart`, app identifiers |
+| `feat/app` | `app/lib/**` (except generated `lib/src/rust/**`), `app/pubspec.yaml`, `app/test/**`, `app/assets/**` |
 | `feat/android` | `app/android/**` |
 | `feat/apple` | `app/ios/**`, `app/macos/**` |
-| `feat/desktop` | `app/windows/**`, `app/linux/**`, packaging |
+| `feat/desktop` | `app/windows/**`, `app/linux/**`, `packaging/**` |
 | `feat/ci` | `.github/**`, `docs/BUILDING.md` |
 
 ## 10. Dependency choices (all versions live in `core/Cargo.toml` `[workspace.dependencies]`)
