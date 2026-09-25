@@ -21,7 +21,8 @@
 //!   }
 //! }
 //! message Hello { uint32 protocol_version = 1; string device_id = 2; string device_name = 3;
-//!                 string platform = 4; string app_version = 5; Role role = 6; }
+//!                 string platform = 4; string app_version = 5; Role role = 6;
+//!                 bool pairing_required = 7; }
 //! message PairStart   { PairMethod method = 1; }
 //! message PairSpake   { bytes msg = 1; }
 //! message PairConfirm { bytes mac = 1; }
@@ -92,6 +93,11 @@ pub struct Hello {
     /// [`Role`] as `i32` (use [`Hello::role()`] / [`Hello::set_role`]).
     #[prost(enumeration = "Role", tag = "6")]
     pub role: i32,
+    /// Hub → sender only: `true` if the hub does not trust the sender's static key and the
+    /// sender must pair before anything else. Senders send `false`; hubs ignore it. A sender
+    /// that does not trust the hub pairs regardless of this flag (see `hfa-core` `control`).
+    #[prost(bool, tag = "7")]
+    pub pairing_required: bool,
 }
 
 /// Sender → hub: begin pairing with the given method.
@@ -102,16 +108,19 @@ pub struct PairStart {
     pub method: i32,
 }
 
-/// SPAKE2 message (both directions).
+/// SPAKE2 message (both directions). `Debug` prints only the length.
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct PairSpake {
     /// The SPAKE2 message bytes.
     #[prost(bytes = "vec", tag = "1")]
     pub msg: Vec<u8>,
 }
 
-/// Key-confirmation MAC (both directions), see [`crate::PairingKey::confirm_mac`].
+/// Key-confirmation MAC (both directions), see [`crate::PairingKey::confirm_mac`]. `Debug`
+/// prints only the length.
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct PairConfirm {
     /// HMAC-SHA256 confirmation value (32 bytes).
     #[prost(bytes = "vec", tag = "1")]
@@ -130,7 +139,11 @@ pub struct PairResult {
 }
 
 /// Sender → hub: announce a media stream.
+///
+/// `Debug` redacts `media_key`, so logging a whole [`ControlMessage`] never leaks it. Receivers
+/// should turn `media_key` into a [`crate::MediaKey`] (which zeroizes on drop) right away.
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct StreamStart {
     /// Random stream id used in media headers.
     #[prost(uint32, tag = "1")]
@@ -153,6 +166,39 @@ pub struct StreamStart {
     /// The 32-byte [`crate::MediaKey`] for this stream.
     #[prost(bytes = "vec", tag = "7")]
     pub media_key: Vec<u8>,
+}
+
+impl std::fmt::Debug for PairSpake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairSpake")
+            .field("msg", &format_args!("<{} bytes>", self.msg.len()))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PairConfirm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairConfirm")
+            .field("mac", &format_args!("<{} bytes>", self.mac.len()))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for StreamStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamStart")
+            .field("stream_id", &self.stream_id)
+            .field("sample_rate", &self.sample_rate)
+            .field("channels", &self.channels)
+            .field("frame_ms", &self.frame_ms)
+            .field("bitrate", &self.bitrate)
+            .field("label", &self.label)
+            .field(
+                "media_key",
+                &format_args!("<redacted {} bytes>", self.media_key.len()),
+            )
+            .finish()
+    }
 }
 
 /// Hub → sender: the stream is accepted; send media to `udp_port`.
@@ -392,5 +438,51 @@ impl Iterator for FrameDecoder {
     /// Returns the next complete message, or `None` if more bytes are needed.
     fn next(&mut self) -> Option<Self::Item> {
         todo!("feat/proto")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let key = vec![0xAB_u8; 32];
+        let msg = ControlMessage::new(Body::StreamStart(StreamStart {
+            stream_id: 7,
+            sample_rate: 48_000,
+            channels: 2,
+            frame_ms: 10,
+            bitrate: 128_000,
+            label: "System audio".into(),
+            media_key: key,
+        }));
+        let text = format!("{msg:?}");
+        assert!(text.contains("stream_id: 7"), "{text}");
+        assert!(text.contains("<redacted 32 bytes>"), "{text}");
+        assert!(!text.contains("171"), "decimal key bytes leaked: {text}");
+        assert!(!text.to_lowercase().contains("ab, ab"), "{text}");
+
+        let spake = format!("{:?}", PairSpake { msg: vec![171; 33] });
+        assert!(
+            spake.contains("<33 bytes>") && !spake.contains("171"),
+            "{spake}"
+        );
+        let confirm = format!("{:?}", PairConfirm { mac: vec![171; 32] });
+        assert!(
+            confirm.contains("<32 bytes>") && !confirm.contains("171"),
+            "{confirm}"
+        );
+    }
+
+    #[test]
+    fn hello_pairing_required_is_field_7() {
+        use prost::Message;
+        let hello = Hello {
+            pairing_required: true,
+            ..Default::default()
+        };
+        // Field 7, wire type 0 (varint) = key 0x38, value 1.
+        assert_eq!(hello.encode_to_vec(), vec![0x38, 0x01]);
     }
 }

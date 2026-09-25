@@ -4,14 +4,20 @@
 //! - AAD = the 16-byte encoded [`MediaHeader`].
 //! - Output datagram = `header ‖ ciphertext ‖ tag` (tag = [`crate::AEAD_TAG_LEN`] bytes).
 //!
-//! Every stream uses a fresh [`MediaKey`] (sent inside the Noise-protected `StreamStart`), and
-//! `seq` is never reused for a key.
+//! Every stream uses a fresh [`MediaKey`] (sent inside the Noise-protected `StreamStart`).
+//! `seq` is strictly increasing for the lifetime of a key: it never resets (not even with
+//! [`crate::FLAG_RESET`]) and never wraps, so a `(key, nonce)` pair is never reused. A stream
+//! that must restart at `seq = 0` gets a new `stream_id` *and* a new key.
+//!
+//! Replay protection: [`MediaOpener`] keeps a [`ReplayWindow`] and rejects datagrams whose
+//! `seq` was already accepted or is older than [`crate::replay::REPLAY_WINDOW`] packets.
 
 use std::fmt;
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::media::MediaHeader;
+use crate::replay::ReplayWindow;
 use crate::Result;
 
 /// A 256-bit media key for one stream. The bytes are wiped on drop; `Debug` never prints them.
@@ -84,10 +90,11 @@ impl MediaSealer {
     }
 }
 
-/// Decrypts and authenticates datagrams of one stream (hub side).
+/// Decrypts and authenticates datagrams of one stream (hub side), with replay protection.
 pub struct MediaOpener {
     key: MediaKey,
     stream_id: u32,
+    replay: ReplayWindow,
 }
 
 impl MediaOpener {
@@ -96,6 +103,7 @@ impl MediaOpener {
         Self {
             key: key.clone(),
             stream_id,
+            replay: ReplayWindow::new(),
         }
     }
 
@@ -104,13 +112,20 @@ impl MediaOpener {
         self.stream_id
     }
 
-    /// Parses the header, checks the stream id, authenticates and decrypts the payload.
+    /// Parses the header, checks the stream id, rejects replays, authenticates and decrypts
+    /// the payload.
+    ///
+    /// Order: decode header → stream id → [`ReplayWindow::check`] (cheap, before decryption)
+    /// → AEAD open → [`ReplayWindow::accept`] (only after authentication succeeded, so forged
+    /// datagrams can never advance or poison the window). `FLAG_RESET` does not reset the
+    /// window.
     ///
     /// # Errors
-    /// Header errors from [`MediaHeader::decode`], [`crate::ProtoError::StreamMismatch`], or
+    /// Header errors from [`MediaHeader::decode`], [`crate::ProtoError::StreamMismatch`],
+    /// [`crate::ProtoError::Replay`] for a duplicate or too old `seq`, or
     /// [`crate::ProtoError::Crypto`] if authentication fails.
-    pub fn open(&self, _datagram: &[u8]) -> Result<(MediaHeader, Vec<u8>)> {
-        let _ = &self.key;
+    pub fn open(&mut self, _datagram: &[u8]) -> Result<(MediaHeader, Vec<u8>)> {
+        let _ = (&self.key, &self.replay);
         todo!("feat/proto")
     }
 }

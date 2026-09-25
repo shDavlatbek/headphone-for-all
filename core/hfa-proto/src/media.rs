@@ -17,8 +17,14 @@ use crate::{Result, MEDIA_HEADER_LEN};
 pub const FLAG_FEC: u8 = 0x01;
 /// Silence keep-alive (discontinuous transmission). The payload is empty.
 pub const FLAG_DTX: u8 = 0x02;
-/// The sender restarted the stream (sequence/timestamp discontinuity); the hub must reset
-/// the jitter buffer and decoder state for this stream.
+/// Timestamp / codec-state discontinuity (e.g. the sender restarted its capture or encoder):
+/// the hub resets the jitter buffer and decoder of this stream.
+///
+/// It **never** resets `seq`. `seq` is part of the AEAD nonce, so it keeps increasing for the
+/// lifetime of the stream's [`crate::MediaKey`], and the opener's replay window
+/// ([`crate::ReplayWindow`]) is *not* reset by this flag (a replayed `FLAG_RESET` datagram is
+/// rejected like any other replay). A sender that needs to start over at `seq = 0` announces
+/// a new stream: a new `StreamStart` with a fresh `stream_id` and a fresh key.
 pub const FLAG_RESET: u8 = 0x04;
 
 /// The plaintext header in front of every media datagram. It is authenticated as AEAD
@@ -29,7 +35,9 @@ pub struct MediaHeader {
     pub flags: u8,
     /// Random per-stream identifier chosen by the sender.
     pub stream_id: u32,
-    /// Packet counter, +1 per datagram. Also part of the AEAD nonce, so never reused per key.
+    /// Packet counter, +1 per datagram, starting at 0. It is part of the AEAD nonce, so it is
+    /// strictly increasing for the lifetime of a key: it never resets (not even with
+    /// [`FLAG_RESET`]) and never wraps (after `u32::MAX` the sender must start a new stream).
     pub seq: u32,
     /// Media timestamp of the first sample in the packet, in 48 kHz samples.
     pub timestamp: u32,

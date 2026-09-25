@@ -5,6 +5,7 @@
 //!
 //! - [`media`]: the 16-byte UDP media header ([`MediaHeader`]).
 //! - [`crypto`]: ChaCha20-Poly1305 sealing of media datagrams ([`MediaSealer`], [`MediaOpener`]).
+//! - [`replay`]: the sliding anti-replay window used by [`MediaOpener`].
 //! - [`control`]: prost control messages ([`ControlMessage`]) and length-prefixed framing.
 //! - [`noise`]: the Noise XX handshake that protects the TCP control channel.
 //! - [`pairing`]: SPAKE2 PIN/token pairing bound to the Noise handshake hash.
@@ -22,6 +23,7 @@ pub mod identity;
 pub mod media;
 pub mod noise;
 pub mod pairing;
+pub mod replay;
 pub mod uri;
 
 pub use control::{encode_frame, ControlMessage, FrameDecoder};
@@ -31,6 +33,7 @@ pub use identity::fingerprint;
 pub use media::{MediaHeader, FLAG_DTX, FLAG_FEC, FLAG_RESET};
 pub use noise::{NoiseHandshake, NoiseTransport, StaticKeypair, NOISE_PATTERN};
 pub use pairing::{generate_pin, generate_token, PairingKey, PairingRole, PairingSession};
+pub use replay::{ReplayWindow, REPLAY_WINDOW};
 pub use uri::PairingUri;
 
 /// Result type used throughout this crate.

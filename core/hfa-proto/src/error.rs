@@ -33,6 +33,12 @@ pub enum ProtoError {
     /// AEAD sealing or opening failed (wrong key, tampered data, or bad tag).
     #[error("authentication failed")]
     Crypto,
+    /// A media datagram's `seq` was already received or is older than the replay window.
+    #[error("replayed or too old media packet (seq {seq})")]
+    Replay {
+        /// The rejected sequence number.
+        seq: u32,
+    },
     /// A key or other fixed-length value had the wrong length.
     #[error("invalid key: {0}")]
     InvalidKey(String),
