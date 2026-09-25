@@ -56,6 +56,14 @@ entitlements above. **If manual testing on a Mac shows taps failing only because
 set `com.apple.security.app-sandbox` to `false` in both entitlements files (this is a
 Developer ID / notarized DMG build, not a Mac App Store one) and document the macOS version here.
 
+## Privacy manifest
+
+`Runner/PrivacyInfo.xcprivacy` (copied into `Contents/Resources` by the Resources phase; added by
+`scripts/configure_xcodeproj.rb`): no tracking, no collected data, required-reason APIs FileTimestamp `C617.1`
+(Rust `std::fs` metadata calls `stat`/`fstat`) and SystemBootTime `35F9.1` (cpal's Core Audio backend calls
+`mach_absolute_time`). Needed only for a Mac App Store upload; harmless for the Developer ID DMG. Same content as
+the iOS manifests.
+
 ## Deployment target
 
 `MACOSX_DEPLOYMENT_TARGET` stays at Flutter's default (12.0 in this project, pods 10.15): the app

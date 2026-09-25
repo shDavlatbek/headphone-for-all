@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 # configure_xcodeproj.rb - adds the macOS platform-channel source (Runner/HfaPlatformChannel.swift)
-# to app/macos/Runner.xcodeproj and checks the Runner target (docs/CONTRACTS.md §8.3).
+# and the privacy manifest (Runner/PrivacyInfo.xcprivacy) to app/macos/Runner.xcodeproj and checks the Runner target (docs/CONTRACTS.md §8.3).
 #
 # Idempotent; the resulting project.pbxproj is committed. `--check` only verifies (exit 1 on a
 # problem) and prints the targets and build phases.
@@ -16,6 +16,9 @@ require 'xcodeproj'
 MACOS_DIR = File.expand_path('..', __dir__)
 PROJECT_PATH = File.join(MACOS_DIR, 'Runner.xcodeproj')
 SOURCES = %w[HfaPlatformChannel.swift].freeze
+# Privacy manifest (required-reason APIs of the Rust core: stat/fstat → FileTimestamp C617.1,
+# cpal's mach_absolute_time → SystemBootTime 35F9.1), copied into Contents/Resources.
+RESOURCES = %w[PrivacyInfo.xcprivacy].freeze
 ENTITLEMENTS = {
   'Debug' => 'Runner/DebugProfile.entitlements',
   'Profile' => 'Runner/DebugProfile.entitlements',
@@ -35,6 +38,15 @@ unless check_only
 
     puts "configure_xcodeproj: Runner compiles #{name}"
     runner.source_build_phase.add_file_reference(ref, true)
+    changed = true
+  end
+  RESOURCES.each do |name|
+    ref = group.files.find { |f| f.path == name } || group.new_reference(name)
+    ref.last_known_file_type = 'text.xml' if name.end_with?('.xcprivacy')
+    next if runner.resources_build_phase.files_references.include?(ref)
+
+    puts "configure_xcodeproj: Runner copies #{name}"
+    runner.resources_build_phase.add_file_reference(ref, true)
     changed = true
   end
   if changed
@@ -72,6 +84,11 @@ errors = []
 compiled = runner.source_build_phase.files_references.map(&:path)
 (SOURCES + %w[AppDelegate.swift MainFlutterWindow.swift]).each do |name|
   errors << "Runner does not compile #{name}" unless compiled.include?(name)
+end
+resources = runner.resources_build_phase.files_references.compact.map(&:path)
+RESOURCES.each do |name|
+  errors << "Runner does not copy #{name}" unless resources.include?(name)
+  errors << "missing Runner/#{name}" unless File.exist?(File.join(MACOS_DIR, 'Runner', name))
 end
 runner.build_configurations.each do |config|
   want = ENTITLEMENTS[config.name]

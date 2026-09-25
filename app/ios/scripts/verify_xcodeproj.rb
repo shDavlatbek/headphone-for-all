@@ -72,6 +72,14 @@ if runner && ext
     check.call(!sources.call(ext).include?(f), "HfaBroadcast must not compile #{f}")
   end
 
+  # App Store Connect rejects binaries whose required-reason API use is not declared.
+  { runner => 'Runner', ext => 'HfaBroadcast' }.each do |target, dir|
+    manifest = target.resources_build_phase.files_references.find { |f| f.path == 'PrivacyInfo.xcprivacy' }
+    check.call(manifest && File.exist?(File.join(IOS_DIR, dir, 'PrivacyInfo.xcprivacy')) &&
+               manifest.real_path.to_s == File.join(IOS_DIR, dir, 'PrivacyInfo.xcprivacy'),
+               "#{target.name} does not copy #{dir}/PrivacyInfo.xcprivacy")
+  end
+
   first = ext.build_phases.first
   check.call(first.is_a?(Xcodeproj::Project::Object::PBXShellScriptBuildPhase) &&
              first.shell_script.include?('build_rust_ext.sh'),

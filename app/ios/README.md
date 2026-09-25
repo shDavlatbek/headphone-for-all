@@ -20,6 +20,7 @@ broadcast upload extension streams what the phone plays).
 | `scripts/add_broadcast_extension.rb` | adds everything above to `Runner.xcodeproj` (idempotent; the result is committed) |
 | `scripts/verify_xcodeproj.rb` | prints targets / build phases and checks the project invariants |
 | `RunnerTests/RunnerTests.swift` | XCTest: config/status JSON formats and the PCM converter |
+| `Runner/PrivacyInfo.xcprivacy`, `HfaBroadcast/PrivacyInfo.xcprivacy` | privacy manifests (Resources of both targets): no tracking, no collected data; required-reason APIs FileTimestamp `C617.1` (Rust `std::fs` metadata → `stat`/`fstat`) and SystemBootTime `35F9.1` (cpal's Core Audio backend → `mach_absolute_time`). Re-check with `nm -u` of the built binaries when dependencies change |
 | `Identity.xcconfig` | `HFA_BUNDLE_ID` (app), `HFA_BROADCAST_BUNDLE_ID` (extension), `HFA_APP_GROUP`; override them in a git-ignored `Identity.local.xcconfig` |
 
 ## Platform channel (iOS)

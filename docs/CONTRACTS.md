@@ -1595,6 +1595,17 @@ place for `DEVELOPMENT_TEAM`). Runner (`Flutter/Debug.xcconfig`, `Release.xcconf
 names are derived: `<broadcastExtensionBundleId>.started` / `.finished` (unchanged for the default ids).
 `verify_xcodeproj.rb` checks all of it. This supersedes the literal ids of §8.2 and §8.9 for iOS.
 
+**Privacy manifests.** `app/ios/Runner/PrivacyInfo.xcprivacy`, `app/ios/HfaBroadcast/PrivacyInfo.xcprivacy` and
+`app/macos/Runner/PrivacyInfo.xcprivacy` are in their targets' Resources phases (added by
+`add_broadcast_extension.rb` / `configure_xcodeproj.rb`, checked by `verify_xcodeproj.rb` / `--check`):
+`NSPrivacyTracking = false`, no tracking domains, no collected data types, and the required-reason APIs
+`NSPrivacyAccessedAPICategoryFileTimestamp` (`C617.1`: Rust `std::fs` metadata → `stat`/`fstat` on files in the app
+or App Group container) and `NSPrivacyAccessedAPICategorySystemBootTime` (`35F9.1`: cpal's Core Audio backend calls
+`mach_absolute_time`). The Rust pod (`rust_lib_headphone_for_all`, a framework inside the app under `use_frameworks!`) has
+no manifest of its own; its use is declared in the app's manifest. If App Store Connect ever names that framework
+in an ITMS-91053 warning, add the same file to `app/rust_builder/{ios,macos}` as a `resource_bundles` entry of the
+podspec. A new Apple-side dependency that calls another required-reason API must be added to all three files.
+
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 
 **Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).
