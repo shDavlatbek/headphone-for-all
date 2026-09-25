@@ -9,6 +9,10 @@
 //! - **Gain ramps.** A source's effective gain (`gain`, or 0 when muted) and the master gain
 //!   move linearly from their previous value to the new one across the samples of one
 //!   [`Mixer::mix`] call, so a step change never produces a click.
+//! - **Fade-in after silence.** A source that has no input slice in a [`Mixer::mix`] call
+//!   (not yet primed, or an underrun: the caller simply leaves its id out) restarts from
+//!   silence, so its next block with audio fades in over one block instead of starting at
+//!   full gain with a hard step. This covers new sources as well as resuming after a gap.
 //! - **Ducking detector.** A priority source is "active" in a block when its post-gain RMS
 //!   level (before ducking; muted = silent) exceeds `duck_threshold_db`. The shared duck gain
 //!   follows `db_to_amplitude(duck_db)` (while any priority source is active) or 1.0 with a
@@ -226,7 +230,8 @@ impl Mixer {
     }
 
     /// Mixes one frame. Each input slice holds `frame_frames * channels` interleaved samples;
-    /// sources without an input this tick contribute silence. `out` (same length) is
+    /// sources without an input this tick contribute silence (and fade in from silence when
+    /// their input returns). `out` (same length) is
     /// overwritten. Must not allocate.
     ///
     /// The block length is `out.len() / channels` frames (normally `frame_frames`); a shorter
@@ -269,19 +274,22 @@ impl Mixer {
 
         // 2. Sources.
         for src in &mut self.sources {
+            src.level = Level::SILENT;
+            if !inputs.iter().any(|&(id, _)| id == src.id) {
+                // No audio this tick: fade in from silence when it resumes.
+                src.current = 0.0;
+                continue;
+            }
             let start = src.current;
             let end = src.target();
             src.current = end;
-            src.level = Level::SILENT;
             let ducked = !src.priority;
             let mut peak = 0.0_f32;
             let mut sum_sq = 0.0_f64;
-            let mut any = false;
             for &(id, input) in inputs {
                 if id != src.id {
                     continue;
                 }
-                any = true;
                 let m = input.len().min(n);
                 let mut duck = duck_start;
                 for (f, (o_frame, i_frame)) in out[..m]
@@ -304,9 +312,7 @@ impl Mixer {
                     }
                 }
             }
-            if any {
-                src.level = level_from_stats(peak, sum_sq, n);
-            }
+            src.level = level_from_stats(peak, sum_sq, n);
         }
         // Advance the shared duck envelope by the whole block.
         let mut duck = duck_start;
@@ -420,6 +426,29 @@ mod tests {
         assert_eq!(m.source_ids().collect::<Vec<_>>(), vec![2]);
         assert_eq!(m.config().channels, 2);
         assert_eq!(m.frame_frames(), FRAMES);
+    }
+
+    #[test]
+    fn fades_in_after_ticks_without_input() {
+        let mut m = mixer();
+        m.add_source(1);
+        // Priming: the hub leaves the source out of `inputs`.
+        let mut out = vec![1.0; FRAMES * 2];
+        m.mix(&[], &mut out);
+        assert!(out.iter().all(|x| *x == 0.0));
+        assert_eq!(m.levels()[0].1, Level::SILENT);
+        // First real block fades in from silence, reaching the gain at its end.
+        let out = run(&mut m, &[(1, 0.5)], 1);
+        assert!(out[0] < 0.01, "first sample {}", out[0]);
+        assert!((out[FRAMES * 2 - 1] - 0.5).abs() < 1e-6);
+        assert!(out.windows(2).all(|w| w[1] >= w[0]), "monotonic ramp");
+        let out = run(&mut m, &[(1, 0.5)], 1);
+        assert!(out.iter().all(|x| (x - 0.5).abs() < 1e-6));
+        // Mid-stream gap (underrun): the source resumes with a fade, not a hard step.
+        m.mix(&[], &mut vec![0.0; FRAMES * 2]);
+        let out = run(&mut m, &[(1, 0.5)], 1);
+        assert!(out[0] < 0.01, "resume sample {}", out[0]);
+        assert!((out[FRAMES * 2 - 1] - 0.5).abs() < 1e-6);
     }
 
     #[test]
