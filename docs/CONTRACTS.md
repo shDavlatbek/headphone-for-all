@@ -255,8 +255,9 @@ Modules:
 - `output_cpal.rs`
 - `output_file.rs`: WAV and Null outputs, real-time paced.
 - `linux.rs`: PipeWire monitor of the default sink (`stream.capture.sink=true`).
-- `windows.rs`: WASAPI loopback via cpal, plus process loopback via the `windows` crate
-  (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, include/exclude tree), plus session enumeration.
+- `windows.rs`: WASAPI loopback of the default render endpoint and process loopback, both directly via the
+  `windows` crate (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, include/exclude tree), plus session
+  enumeration (see §5.2).
 - `macos.rs`: Core Audio process tap (`AudioHardwareCreateProcessTap`, `CATapDescription`, private aggregate
   device, `muteBehavior = mutedWhenTapped`).
 
@@ -327,6 +328,47 @@ Modules:
     process has no Core Audio process object. `list_apps` also returns `Unsupported` before macOS 14.2. A denied
     permission may also just yield silence on some macOS versions.
   - **App requirement (`feat/apple`):** the macOS app's `Info.plist` must contain `NSAudioCaptureUsageDescription`.
+
+### 5.2 Refinements made by `feat/capture-windows` (the code in `core/hfa-capture/src/windows.rs` is authoritative)
+
+- **No cpal for capture on Windows.** System loopback (`open_system(false)`) and process loopback
+  (`open_system(true)`, `open_process(pid)`) share one direct-WASAPI code path: `IAudioClient::Initialize(SHARED,
+  LOOPBACK | EVENTCALLBACK | …)` + `IAudioCaptureClient`. This gives us `AUDCLNT_BUFFERFLAGS_SILENT` handling
+  (pushed as zeros), device-invalidation recovery and identical threading for every mode. cpal is still used for
+  playback (`output_cpal.rs`).
+- **Format.** Every mode first asks for **32-bit float, 48 kHz, stereo** with `AUTOCONVERTPCM` (system loopback also
+  `SRC_DEFAULT_QUALITY`), so capture normally already delivers `AudioFormat::INTERNAL`. Fallbacks: system loopback
+  uses the endpoint mix format (8/16/24/32-bit PCM or 32-bit float, any channel count); process loopback uses 16-bit
+  PCM 48 kHz stereo (the Microsoft sample's format). The backend **always delivers 2 channels** (mono duplicated;
+  with more than two channels the front-left/right pair is kept) at the negotiated rate, which `format()` reports.
+- **Threading.** `open_*` spawns one worker thread per source that enters the COM MTA, activates and initialises the
+  client and reports the format back, so `format()` is valid and open errors (no device, unsupported OS) surface
+  from `open_capture`, not from `start`. `start` hands the `PcmSink` to that thread; `stop` signals a stop event
+  and joins. `start` after `stop` re-prepares the stream (it fails with `Format` if the format changed). COM
+  pointers never cross threads except the activated client handed from the (MTA) activation callback.
+- **Capture loop.** Waits on `[stop, audio]` events with a 20 ms timeout (some Windows builds never signal the
+  event for loopback streams) and drains all packets; no allocation, locking or logging inside. On
+  `AUDCLNT_E_DEVICE_INVALIDATED` / `AUDCLNT_E_SERVICE_NOT_RUNNING` (unplug, audio service restart) it re-opens the
+  stream every 500 ms until it works or `stop` is called. System loopback also registers an `IMMNotificationClient`
+  (Windows does not reroute a stream opened on a concrete `IMMDevice`): `OnDefaultDeviceChanged(eRender, eConsole)`
+  signals a third event in the wait set and the stream is re-opened on the new default output. Other capture
+  errors are re-opened after 500 ms, up to 5 times in a row without a delivered packet; a re-open that keeps
+  landing on a different output format (10 tries) ends the worker. A `start` after the worker ended prepares a
+  fresh one instead of returning `AlreadyRunning`. A pending process-loopback activation (max 10 s) watches the
+  stop event, so `stop` never blocks on it; its activation parameters are owned by the completion handler, so
+  they outlive an abandoned wait. The thread registers with MMCSS ("Pro Audio").
+- **Errors.** Process-loopback activation failures map to `Unsupported` (message names Windows 10 build 20348,
+  works from 19041), `E_ACCESSDENIED` to `PermissionDenied`; no default output device → `NotFound`;
+  `open_process(0)` → `InvalidArgument`; a pid that does not exist → `NotFound`.
+- **`list_apps`** runs on a short-lived MTA helper thread (never touches the caller's COM apartment), walks the
+  sessions of **every active render endpoint** (a superset of the default one), skips system sounds, expired
+  sessions, pid 0 and our own pid, names processes by executable stem (`Spotify`), falling back to the session
+  display name or `Process <pid>`, and returns them deduplicated by pid and sorted by name.
+- Verified: `cargo clippy --target x86_64-pc-windows-gnu --all-targets -D warnings`; the unit tests pass under wine 9
+  on Linux, and a wine end-to-end run (PipeWire null sink + winepulse, with the endpoint switched to the capture
+  device in a scratch copy because wine has no loopback) captured a 440 Hz tone at the expected level with no
+  overruns, stopped in under 10 ms and restarted. Wine has no loopback or process loopback, so those two
+  activations still need a real Windows 10/11 check.
 
 ## 6. `hfa-core` (networking + engines; tokio)
 
