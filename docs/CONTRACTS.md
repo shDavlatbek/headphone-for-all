@@ -160,7 +160,8 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
 - `FrameDecoder`: an undecodable or body-less frame (including an unknown oneof variant from a newer peer) yields
   `Some(Err(Decode | InvalidMessage))` for that frame only, and decoding continues. A length prefix above
   `MAX_CONTROL_FRAME` yields `FrameTooLarge` **without allocating** and **poisons** the decoder (buffer dropped, later
-  input ignored, the same error repeats; `is_poisoned()`): the caller closes the connection. `Debug` prints sizes only.
+  input ignored; the error is returned **once**, then `next()` returns `None`, so error-skipping loops end; check
+  `is_poisoned()` / `poison_error()`): the caller closes the connection. `Debug` prints sizes only.
 - Media: `MediaOpener::open` rejects datagrams shorter than header + tag (`Truncated{needed: 32}`) or longer than
   `MAX_DATAGRAM` (`FrameTooLarge`); extra `MediaOpener::highest_seq()`. `MediaSealer::seal` does not allocate when
   `out` has capacity (reuse one buffer per stream). `hfa-proto/Cargo.toml` enables `chacha20poly1305/zeroize`.
@@ -184,6 +185,10 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
   port 1..=65535 digits only, `id` = exactly 32 bytes of unpadded base64url, token base64url alphabet ≤ `MAX_TOKEN_LEN` = 128,
   host name `[A-Za-z0-9._-]{1,253}`, name ≤ `MAX_NAME_LEN` = 256 bytes without control characters, total ≤ `MAX_URI_LEN` = 2048);
   unknown parameters are ignored, surrounding whitespace is trimmed. Constant `URI_PATH = "pair"`.
+  **Build it with `PairingUri::new(host: &str, port, hub_id, token, name: &str) -> Result<PairingUri>`** (review fix):
+  it validates host (IPv6 with or without brackets), port ≠ 0 and token (`InvalidUri`) and sanitizes the free-form name
+  with `sanitize_name(&str) -> String` (re-exported; drops control characters, truncates on a char boundary to
+  `MAX_NAME_LEN`), so `to_string()` always parses back. `Display` also sanitizes the name.
 - Identity: extra `is_fingerprint(&str) -> bool` (re-exported) and `FINGERPRINT_LEN = 19`, e.g. to tell a device id from
   a name in `HubAddress::Discover`.
 

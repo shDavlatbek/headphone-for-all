@@ -55,6 +55,10 @@ fn invalid(msg: impl Into<String>) -> ProtoError {
 ///
 /// `Debug` redacts the token. `Display` (the URI itself) necessarily contains the token, so
 /// never log `to_string()`.
+///
+/// Build it with [`PairingUri::new`], which validates `host` and `token` and sanitizes `name`,
+/// so that `to_string()` always parses back. `Display` also applies [`sanitize_name`] to the
+/// name, but writes `host` and `token` as they are.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingUri {
     /// Hub host (IP address or host name).
@@ -67,6 +71,54 @@ pub struct PairingUri {
     pub token: String,
     /// Hub display name.
     pub name: String,
+}
+
+impl PairingUri {
+    /// Builds a URI whose [`Display`](fmt::Display) output is guaranteed to parse back.
+    ///
+    /// `host` is validated like the `h` parameter (an IPv6 address may be given with or without
+    /// brackets and is stored without), `port` must be non-zero and `token` must be non-empty
+    /// base64url of at most [`MAX_TOKEN_LEN`] chars. `name` is a free-form display name (e.g. a
+    /// user-edited device name) and is sanitized with [`sanitize_name`] instead of rejected.
+    ///
+    /// # Errors
+    /// [`ProtoError::InvalidUri`] for a bad host, port 0 or a bad token.
+    pub fn new(
+        host: &str,
+        port: u16,
+        hub_id: [u8; 32],
+        token: impl Into<String>,
+        name: &str,
+    ) -> Result<Self, ProtoError> {
+        let host = if host.parse::<Ipv6Addr>().is_ok() {
+            host.to_string()
+        } else {
+            parse_host(host)?
+        };
+        if port == 0 {
+            return Err(invalid("port out of range"));
+        }
+        Ok(Self {
+            host,
+            port,
+            hub_id,
+            token: parse_token(token.into())?,
+            name: sanitize_name(name),
+        })
+    }
+}
+
+/// Makes a display name acceptable for the `n` parameter: drops control characters and
+/// truncates (on a character boundary) to at most [`MAX_NAME_LEN`] bytes.
+pub fn sanitize_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(MAX_NAME_LEN));
+    for c in name.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > MAX_NAME_LEN {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl fmt::Debug for PairingUri {
@@ -101,7 +153,7 @@ impl fmt::Display for PairingUri {
             self.port,
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.hub_id),
             utf8_percent_encode(&self.token, VALUE),
-            utf8_percent_encode(&self.name, VALUE),
+            utf8_percent_encode(&sanitize_name(&self.name), VALUE),
         )
     }
 }
@@ -287,6 +339,46 @@ mod tests {
     }
 
     #[test]
+    fn display_sanitizes_names_that_parse_would_reject() {
+        let long = "漢".repeat(100); // 300 bytes
+        for name in [long.as_str(), "Living\nroom\u{7}", "\u{0}"] {
+            let uri = PairingUri {
+                name: name.into(),
+                ..sample()
+            };
+            let back: PairingUri = uri.to_string().parse().unwrap();
+            assert_eq!(back.name, sanitize_name(name));
+        }
+        assert_eq!(sanitize_name(&long), "漢".repeat(85));
+        assert_eq!(sanitize_name("Living\nroom\u{7}"), "Livingroom");
+    }
+
+    #[test]
+    fn new_validates_host_port_and_token() {
+        let id = [7; 32];
+        let ok = PairingUri::new("fe80::1", 1, id, "tok_-", "Hub").unwrap();
+        assert_eq!(ok.host, "fe80::1");
+        assert_eq!(
+            PairingUri::new("[::1]", 1, id, "t", "Hub").unwrap().host,
+            "::1"
+        );
+        assert_eq!(ok.to_string().parse::<PairingUri>().unwrap(), ok);
+        for (host, port, token) in [
+            ("a b", 1, "t"),
+            ("", 1, "t"),
+            ("host", 0, "t"),
+            ("host", 1, ""),
+            ("host", 1, "has space"),
+            ("host", 1, "plus+slash/"),
+        ] {
+            assert!(
+                PairingUri::new(host, port, id, token, "Hub").is_err(),
+                "{host} {port} {token}"
+            );
+        }
+    }
+
+    #[test]
     fn exact_format() {
         let text = sample().to_string();
         assert_eq!(
@@ -453,6 +545,20 @@ mod tests {
             let uri = PairingUri { host, port, hub_id, token, name };
             let text = uri.to_string();
             prop_assert!(text.is_ascii());
+            prop_assert_eq!(text.parse::<PairingUri>().unwrap(), uri);
+        }
+
+        /// `new` + `Display` round-trips any Unicode name (long, with control characters).
+        #[test]
+        fn new_roundtrips_arbitrary_names(host in host_strategy(), port in 1u16.., hub_id: [u8; 32],
+                                          token in "[A-Za-z0-9_-]{1,64}",
+                                          name in "\\PC{0,20}(\\p{Cc}\\PC{0,20}){0,5}\\PC{0,300}") {
+            let uri = PairingUri::new(&host, port, hub_id, token, &name).unwrap();
+            prop_assert!(uri.name.len() <= MAX_NAME_LEN);
+            prop_assert!(!uri.name.chars().any(char::is_control));
+            prop_assert!(name.starts_with(&uri.name) || name.chars().any(char::is_control));
+            let text = uri.to_string();
+            prop_assert!(text.len() <= MAX_URI_LEN);
             prop_assert_eq!(text.parse::<PairingUri>().unwrap(), uri);
         }
 
