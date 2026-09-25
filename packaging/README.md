@@ -23,7 +23,10 @@ Identifiers used everywhere (keep them in sync with `docs/CONTRACTS.md` §8.2 / 
 - Application id `io.github.shdavlatbek.hfa` (Linux GApplication id, `.desktop` / AppStream / Flatpak id,
   Windows AppUserModelID, Apple bundle id), display name **Headphone for All**, executable
   `headphone_for_all`.
-- Windows single-instance mutex `io.github.shdavlatbek.hfa.SingleInstance` (runner + Inno Setup `AppMutex`).
+- Windows single-instance mutex `io.github.shdavlatbek.hfa.SingleInstance` (runner + Inno Setup `AppMutex`),
+  main window class `io.github.shdavlatbek.hfa.MainWindow`, registered window messages
+  `io.github.shdavlatbek.hfa.Activate` / `io.github.shdavlatbek.hfa.Quit`, and the `--autostart` argument
+  (runner + installer).
 
 ## Icon
 
@@ -54,10 +57,17 @@ indigo and headphone shape.
 first page offers "install for all users"). It installs the whole Flutter release folder
 (`build\windows\x64\runner\Release`: `headphone_for_all.exe`, `flutter_windows.dll`, `hfa_ffi.dll`, the
 plugin DLLs and `data\`) plus the MSVC runtime DLLs, and creates a Start-menu shortcut (optional desktop
-shortcut and "start when I sign in"), all carrying the app's AppUserModelID. With an all-users install it
+shortcut and "start when I sign in"), all carrying the app's AppUserModelID. The sign-in shortcut passes
+`--autostart`, so the app starts hidden in the tray instead of opening its window at every sign-in. With an all-users install it
 can add an inbound Windows Firewall rule for the program on **private** networks, which a hub needs
-(without it Windows asks the first time the hub listens). `AppMutex` makes Setup and Uninstall ask the
-user to quit a running instance (the app keeps running in the tray). Uninstalling keeps the user data in
+(without it Windows asks the first time the hub listens). A running app is quit before files are
+replaced or removed: Setup asks first (OK/Cancel; OK when silent or with `/SUPPRESSMSGBOXES`), Uninstall
+does it after the uninstall confirmation. Both post the registered `io.github.shdavlatbek.hfa.Quit` message
+to the main window (also when it is hidden in the tray), which quits at once, and wait up to 10 s for the
+single-instance mutex to go away. `AppMutex` stays as the fallback (for example an instance started as
+administrator, which a per-user Setup may not message); its message tells the user to use **Quit** in
+the tray icon's menu, since closing the window only hides it there while the hub runs. The runner also
+exits on `WM_ENDSESSION`, so Restart Manager (`CloseApplications=yes`, sign-out) can close it. Uninstalling keeps the user data in
 `%APPDATA%\io.github.shdavlatbek\Headphone for All\` unless the user agrees to delete it. The minimum OS
 is Windows 10 2004 (process-loopback capture).
 
@@ -96,7 +106,9 @@ same release build (`dart run msix:create`). It needs an `msix_config` block in 
 `logo_path: packaging/icon/out/png/hfa-512.png`, `capabilities: internetClientServer,privateNetworkClientServer`,
 and `store: true` for a Store upload. Differences to keep in mind: an MSIX app's `%APPDATA%` is
 virtualized per package (a different data folder than the Inno Setup install), Store builds must not add
-firewall rules or autostart entries themselves (use the `startup_task` option of `msix_config`), and the
+firewall rules or autostart entries themselves (use the `startup_task` option of `msix_config`; a
+startup task cannot pass `--autostart`, so the runner would have to check the activation kind
+(`AppInstance.GetActivatedEventArgs`, `ActivationKind::StartupTask`) to start hidden), and the
 single-instance mutex keeps working unchanged.
 
 ## Linux

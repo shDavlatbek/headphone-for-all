@@ -14,8 +14,10 @@
         pwsh packaging/windows/build-installer.ps1 -Build
 
 .PARAMETER Version
-    Version shown by the installer (numeric, up to four parts). Defaults to the
-    "version:" of app\pubspec.yaml without its "+build" suffix.
+    Version shown by the installer and used in the file name: numeric (up to
+    four parts) with an optional SemVer pre-release suffix, for example 1.2.3
+    or 1.2.3-beta.1. The Windows version resource gets the numeric part only.
+    Defaults to the "version:" of app\pubspec.yaml without its "+build" suffix.
 
 .PARAMETER Arch
     x64 (default) or arm64: selects the Flutter build folder.
@@ -96,8 +98,12 @@ if (-not $Version) {
     if (-not $line) { throw 'Cannot read the version from app\pubspec.yaml; pass -Version' }
     $Version = $line.Matches[0].Groups[1].Value
 }
-if ($Version -notmatch '^\d+(\.\d+){0,3}$') {
-    throw "Version '$Version' must be numeric (for example 1.2.3) for the Windows version resource"
+if ($Version -match '^(\d+(?:\.\d+){0,3})(-[0-9A-Za-z.-]+)?$') {
+    # Windows version resources take up to four numbers only.
+    $NumericVersion = $Matches[1]
+}
+else {
+    throw "Version '$Version' must be numeric with an optional pre-release suffix (for example 1.2.3 or 1.2.3-beta.1)"
 }
 
 if (-not $SourceDir) { $SourceDir = Join-Path $AppDir "build\windows\$Arch\runner\Release" }
@@ -129,7 +135,7 @@ try {
     }
 
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-    & $iscc "/DAppVersion=$Version" "/DAppArch=$Arch" "/DSourceDir=$staging" "/DOutputDir=$OutputDir" $IssFile
+    & $iscc "/DAppVersion=$Version" "/DAppVersionNumeric=$NumericVersion" "/DAppArch=$Arch" "/DSourceDir=$staging" "/DOutputDir=$OutputDir" $IssFile
     if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
     Write-Information "wrote $(Join-Path $OutputDir "Headphone_for_All-$Version-windows-$Arch-setup.exe")" -InformationAction Continue
 }
