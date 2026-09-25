@@ -26,6 +26,11 @@ pub enum HubAddress {
         port: u16,
     },
     /// Resolve through mDNS by device id or display name (`--hub <name-or-id>`).
+    ///
+    /// mDNS records are unauthenticated, so: when several hubs match a name, trusted hubs
+    /// (in the sender's [`crate::TrustStore`]) are preferred; when `name_or_id` is a device
+    /// id, the engine checks after the handshake that the fingerprint of the hub's Noise
+    /// static key equals it and fails with [`crate::CoreError::KeyMismatch`] otherwise.
     Discover {
         /// Device id (exact) or display name (case-insensitive).
         name_or_id: String,
@@ -42,7 +47,13 @@ pub struct SenderConfig {
     pub capture: Box<dyn CaptureSource>,
     /// Label shown on the hub (e.g. "System audio").
     pub label: String,
-    /// PIN or token, needed only if the hub does not trust this device yet.
+    /// The hub's Noise static public key, if known in advance (`PairingUri::hub_id`, or a
+    /// trusted peer chosen by the caller). Passed to [`crate::ControlChannel::connect`], which
+    /// fails with [`crate::CoreError::KeyMismatch`] if the hub presents another key.
+    pub expected_hub_key: Option<[u8; 32]>,
+    /// PIN or token, needed whenever pairing is: this device does not trust the hub yet, or
+    /// the hub does not trust this device. Without it such a connection fails with
+    /// [`crate::CoreError::PairingRequired`]; the sender never streams to an untrusted hub.
     pub pairing_secret: Option<String>,
 }
 
@@ -53,6 +64,7 @@ impl fmt::Debug for SenderConfig {
             .field("settings", &self.settings)
             .field("capture", &self.capture.describe())
             .field("label", &self.label)
+            .field("expected_hub_key", &self.expected_hub_key)
             .field(
                 "pairing_secret",
                 &self.pairing_secret.as_ref().map(|_| "<redacted>"),

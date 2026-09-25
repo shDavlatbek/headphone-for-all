@@ -83,14 +83,67 @@ pub fn default_data_dir() -> Option<PathBuf> {
         .map(|d| d.data_dir().to_path_buf())
 }
 
-/// Host name from the environment (`HOSTNAME` / `COMPUTERNAME`), or `"hfa-device"`.
+/// The name this device shows to other devices by default.
+///
+/// Order: the OS host name (`gethostname` on unix, `COMPUTERNAME` on Windows), then the
+/// `HOSTNAME` / `COMPUTERNAME` / `HOST` environment variables, then `hfa-XXXX` with four random
+/// hex digits (so unnamed devices can still be told apart; the value is persisted by
+/// [`Settings::save`]). A trailing `.local` is stripped and `localhost` is ignored (Android
+/// and iOS report `localhost`; the Flutter app sets [`Settings::device_name`] to the device
+/// model there).
 pub fn default_device_name() -> String {
-    ["HOSTNAME", "COMPUTERNAME"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok())
-        .map(|s| s.trim().to_owned())
-        .find(|s| !s.is_empty())
-        .unwrap_or_else(|| "hfa-device".to_owned())
+    os_host_name()
+        .or_else(|| {
+            ["HOSTNAME", "COMPUTERNAME", "HOST"]
+                .iter()
+                .filter_map(|k| std::env::var(k).ok())
+                .find_map(|s| clean_host_name(&s))
+        })
+        .unwrap_or_else(|| format!("hfa-{:04x}", rand::random::<u16>()))
+}
+
+/// Normalizes a host name for display; `None` if it is empty or `localhost`.
+fn clean_host_name(raw: &str) -> Option<String> {
+    let name = raw.trim().trim_end_matches('.');
+    let name = name
+        .strip_suffix(".local")
+        .or_else(|| name.strip_suffix(".localdomain"))
+        .unwrap_or(name)
+        .trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("localhost") {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+/// The host name reported by the OS.
+#[cfg(unix)]
+fn os_host_name() -> Option<String> {
+    // POSIX host names are at most 255 bytes (HOST_NAME_MAX); one extra byte for the NUL.
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes; gethostname writes at most that
+    // many bytes and we never read past the buffer (the NUL search is bounded by its length).
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    clean_host_name(&String::from_utf8_lossy(&buf[..end]))
+}
+
+/// The host name reported by the OS (`COMPUTERNAME` is set by Windows for every process).
+#[cfg(windows)]
+fn os_host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .and_then(|s| clean_host_name(&s))
+}
+
+/// No OS host name source on this target.
+#[cfg(not(any(unix, windows)))]
+fn os_host_name() -> Option<String> {
+    None
 }
 
 #[cfg(test)]
@@ -105,6 +158,41 @@ mod tests {
         assert!(s.fec);
         assert!(s.jitter_min_ms < s.jitter_max_ms);
         assert!(!s.device_name.is_empty());
+    }
+
+    #[test]
+    fn host_name_cleanup() {
+        assert_eq!(clean_host_name(" desk \n").as_deref(), Some("desk"));
+        assert_eq!(
+            clean_host_name("MacBook-Pro.local").as_deref(),
+            Some("MacBook-Pro")
+        );
+        assert_eq!(
+            clean_host_name("MacBook-Pro.local.").as_deref(),
+            Some("MacBook-Pro")
+        );
+        assert_eq!(clean_host_name("box.localdomain").as_deref(), Some("box"));
+        assert_eq!(
+            clean_host_name("desk.example.org").as_deref(),
+            Some("desk.example.org")
+        );
+        assert_eq!(clean_host_name("localhost"), None);
+        assert_eq!(clean_host_name("LOCALHOST"), None);
+        assert_eq!(clean_host_name("   "), None);
+        assert_eq!(clean_host_name(".local"), None);
+    }
+
+    /// The device name must come from the kernel, not from `HOSTNAME` (which shells do not
+    /// export, and GUI/mobile processes never see).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_name_is_the_kernel_host_name() {
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("hostname");
+        if let Some(expected) = clean_host_name(&kernel) {
+            assert_eq!(default_device_name(), expected);
+        } else {
+            assert!(default_device_name().starts_with("hfa-"));
+        }
     }
 
     #[test]

@@ -842,6 +842,7 @@ dependencies = [
  "hfa-capture",
  "hfa-proto",
  "if-addrs",
+ "libc",
  "mdns-sd",
  "parking_lot",
  "rand 0.10.3",

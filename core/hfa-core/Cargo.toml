@@ -28,6 +28,10 @@ directories = { workspace = true }
 mdns-sd = { workspace = true }
 if-addrs = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# gethostname() for the default device name.
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

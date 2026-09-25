@@ -53,6 +53,10 @@ pub enum CoreError {
     /// The connection or engine is closed.
     #[error("closed")]
     Closed,
+    /// A media stream used its last sequence number (`u32::MAX`); `seq` never wraps, so the
+    /// sender must start a new stream (new id and key).
+    #[error("sequence numbers of stream {0} exhausted")]
+    SequenceExhausted(u32),
     /// A stream id / source is unknown.
     #[error("unknown stream {0}")]
     UnknownStream(u32),
