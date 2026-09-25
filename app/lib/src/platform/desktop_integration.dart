@@ -6,6 +6,7 @@ library;
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dbus/dbus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -22,12 +23,77 @@ const trayIconAsset = 'assets/tray_icon.png';
 bool get isDesktopHost =>
     !kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
 
-/// Prepares the window before `runApp` (desktop only): intercepts the close
-/// button so [DesktopIntegration] can hide to the tray instead.
+/// Prepares the window manager before `runApp` (desktop only).
+///
+/// The close button is intercepted only while [DesktopIntegration] is
+/// mounted (it is the listener that handles the close), so the splash and
+/// the startup error screen close normally.
 Future<void> initDesktopWindow() async {
   if (!isDesktopHost) return;
   await windowManager.ensureInitialized();
-  await windowManager.setPreventClose(true);
+}
+
+/// How the tray icon of [os] (`Platform.operatingSystem`) reacts to clicks.
+///
+/// cnativeapi opens the context menu only for the configured trigger (the
+/// default is none), and on Linux it exposes the menu over StatusNotifierItem
+/// only with [tray.ContextMenuTrigger.clicked] (no click events arrive
+/// there). So: Linux and macOS open the menu on click; Windows opens it on
+/// right click and toggles the window on left click.
+({tray.ContextMenuTrigger menuTrigger, bool clickTogglesWindow})
+trayClickPolicy(String os) => switch (os) {
+  'windows' => (
+    menuTrigger: tray.ContextMenuTrigger.rightClicked,
+    clickTogglesWindow: true,
+  ),
+  _ => (
+    menuTrigger: tray.ContextMenuTrigger.clicked,
+    clickTogglesWindow: false,
+  ),
+};
+
+/// What closing the window does.
+enum CloseAction {
+  /// Hide the window; the tray icon brings it back.
+  hideToTray,
+
+  /// Stop sender and hub and quit.
+  quit,
+}
+
+/// Closing hides to the tray only while something runs ([busy]) and a tray
+/// icon is actually shown ([trayUsable]); otherwise the app quits, so the
+/// window is never hidden without a way back.
+CloseAction closeActionFor({required bool busy, required bool trayUsable}) =>
+    busy && trayUsable ? CloseAction.hideToTray : CloseAction.quit;
+
+/// Linux: whether a StatusNotifier host shows tray icons (KDE, or GNOME with
+/// the AppIndicator extension). cnativeapi creates its icon whenever a session
+/// bus exists, so this is asked before hiding the window into the tray.
+/// Any D-Bus failure counts as "no host".
+Future<bool> linuxTrayHostAvailable() async {
+  DBusClient? client;
+  try {
+    client = DBusClient.session();
+    for (final watcher in const [
+      'org.kde.StatusNotifierWatcher',
+      'com.canonical.StatusNotifierWatcher',
+    ]) {
+      if (!await client.nameHasOwner(watcher)) continue;
+      final value = await DBusRemoteObject(
+        client,
+        name: watcher,
+        path: DBusObjectPath('/StatusNotifierWatcher'),
+      ).getProperty(watcher, 'IsStatusNotifierHostRegistered');
+      if (value is DBusBoolean && value.value) return true;
+    }
+    return false;
+  } catch (e) {
+    debugPrint('tray host probe: $e');
+    return false;
+  } finally {
+    unawaited(client?.close());
+  }
 }
 
 /// Wraps the app with the tray icon and the close-to-tray behaviour.
@@ -38,6 +104,8 @@ class DesktopIntegration extends ConsumerStatefulWidget {
     super.key,
     required this.child,
     required this.enabled,
+    this.showTray = true,
+    this.trayHostAvailable,
   });
 
   /// The app.
@@ -45,6 +113,13 @@ class DesktopIntegration extends ConsumerStatefulWidget {
 
   /// Set up the tray and the window listener.
   final bool enabled;
+
+  /// Create the tray icon (false in tests, which have no native tray).
+  final bool showTray;
+
+  /// Whether a created tray icon is actually visible; defaults to
+  /// [linuxTrayHostAvailable] on Linux and `true` elsewhere.
+  final Future<bool> Function()? trayHostAvailable;
 
   @override
   ConsumerState<DesktopIntegration> createState() => _DesktopIntegrationState();
@@ -64,7 +139,9 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
     super.initState();
     if (!widget.enabled) return;
     windowManager.addListener(this);
-    _createTray();
+    // Intercept the close button only while this listener handles it.
+    unawaited(_setPreventClose(true));
+    if (widget.showTray) _createTray();
   }
 
   @override
@@ -72,8 +149,17 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
     if (widget.enabled) {
       windowManager.removeListener(this);
       _disposeTray();
+      if (!_quitting) unawaited(_setPreventClose(false));
     }
     super.dispose();
+  }
+
+  static Future<void> _setPreventClose(bool prevent) async {
+    try {
+      await windowManager.setPreventClose(prevent);
+    } catch (e) {
+      debugPrint('window manager: $e');
+    }
   }
 
   void _createTray() {
@@ -105,10 +191,12 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
         ..addSeparator()
         ..addItem(quit);
       icon.setContextMenu(menu);
-      if (!Platform.isMacOS) {
-        // Windows/Linux: left click toggles the window, right click = menu.
+      final policy = trayClickPolicy(Platform.operatingSystem);
+      // Without a trigger cnativeapi never opens (or, on Linux, exposes) it.
+      icon.setContextMenuTrigger(policy.menuTrigger);
+      if (policy.clickTogglesWindow) {
         icon.addListener((event) {
-          if (event is tray.TrayIconClickedEvent) _toggleWindow();
+          if (event is tray.TrayIconClickedEvent) unawaited(_toggleWindow());
         });
       }
       icon.setVisible(true);
@@ -202,12 +290,27 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
       ref.read(hubControllerProvider).running ||
       ref.read(senderControllerProvider).isLive;
 
+  Future<bool> _trayUsable() async {
+    if (_trayIcon == null) return false;
+    final probe =
+        widget.trayHostAvailable ??
+        (Platform.isLinux ? linuxTrayHostAvailable : null);
+    if (probe == null) return true;
+    return probe().timeout(const Duration(seconds: 2), onTimeout: () => false);
+  }
+
   @override
-  void onWindowClose() {
-    if (_busy && _trayIcon != null) {
-      unawaited(_hideWindow());
-    } else {
-      unawaited(_quit());
+  void onWindowClose() => unawaited(_onClose());
+
+  Future<void> _onClose() async {
+    final busy = _busy;
+    final trayUsable = busy && await _trayUsable();
+    if (!mounted) return;
+    switch (closeActionFor(busy: busy, trayUsable: trayUsable)) {
+      case CloseAction.hideToTray:
+        await _hideWindow();
+      case CloseAction.quit:
+        await _quit();
     }
   }
 

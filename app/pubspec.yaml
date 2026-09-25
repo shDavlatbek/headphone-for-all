@@ -44,6 +44,7 @@ dependencies:
   mobile_scanner: ^7.4.2
   tray_manager: ^0.7.0
   window_manager: ^0.5.2
+  dbus: ^0.8.0
 
 dev_dependencies:
   flutter_test:
