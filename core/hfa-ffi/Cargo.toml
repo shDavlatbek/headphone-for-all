@@ -1,0 +1,30 @@
+[package]
+name = "hfa-ffi"
+description = "headphone-for-all FFI: flutter_rust_bridge API, C ABI for the iOS broadcast extension, JNI for Android capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = ["bundled-opus"]
+# Build libopus from bundled source (static). Disable to link the system libopus.
+bundled-opus = ["hfa-core/bundled-opus"]
+
+[dependencies]
+hfa-proto = { workspace = true }
+hfa-audio = { workspace = true }
+hfa-capture = { workspace = true }
+hfa-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { workspace = true }

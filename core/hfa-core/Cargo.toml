@@ -1,0 +1,37 @@
+[package]
+name = "hfa-core"
+description = "headphone-for-all networking and engines: config, identity, discovery, control channel, pairing, sender and hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["bundled-opus"]
+# Build libopus from bundled source (static). Disable to link the system libopus.
+bundled-opus = ["hfa-audio/bundled-opus", "hfa-capture/bundled-opus"]
+
+[dependencies]
+hfa-proto = { workspace = true }
+hfa-audio = { workspace = true }
+hfa-capture = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+directories = { workspace = true }
+mdns-sd = { workspace = true }
+if-addrs = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# gethostname() for the default device name.
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

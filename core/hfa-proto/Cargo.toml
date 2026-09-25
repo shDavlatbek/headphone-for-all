@@ -1,0 +1,27 @@
+[package]
+name = "hfa-proto"
+description = "headphone-for-all wire format, control messages, crypto and pairing (sans-IO)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+prost = { workspace = true }
+snow = { workspace = true }
+spake2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+base64 = { workspace = true }
+percent-encoding = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
