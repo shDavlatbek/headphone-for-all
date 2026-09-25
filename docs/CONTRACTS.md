@@ -916,6 +916,11 @@ Modules:
   (lost + played + overflowed)`. `StreamCounters` gains `overflowed` and `skipped` (`#[serde(default)]`).
 - **`StreamStats.latency_ms` / `Stats.latency_ms`** use the audio actually queued in the jitter buffer while it is
   primed (its target before playout starts) + frame + output ring fill target + the output's latency.
+- **Reordered `FLAG_RESET` (hub, `hub_mixer.rs`).** `seq` only grows, so a `FLAG_RESET` packet whose seq is at or
+  below the highest seq already pushed (`JitterBuffer::highest_seq()`, new) was reordered behind later packets of
+  the same restart: it no longer calls `reset_at` (which discarded those packets for good — the replay window had
+  already accepted them). Instead **new `JitterBuffer::lower_floor(seq)`** lowers the post-reset floor so the late
+  reset packet still joins the buffer, as long as nothing was played since the reset (otherwise it is `TooLate`).
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

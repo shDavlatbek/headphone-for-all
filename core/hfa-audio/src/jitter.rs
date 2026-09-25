@@ -547,6 +547,30 @@ impl JitterBuffer {
         self.reset_state(Some(first_seq.wrapping_sub(1)));
     }
 
+    /// The highest `seq` pushed so far (wrap-aware; kept across resets), `None` before the
+    /// first packet.
+    pub fn highest_seq(&self) -> Option<u32> {
+        self.highest_seq
+    }
+
+    /// For a `FLAG_RESET` packet with seq `first_seq` that arrives **after** later packets of
+    /// the same restart (reordered): if playout has not started since the last reset, lowers
+    /// the sequence floor so that `first_seq` (and anything between it and the current window)
+    /// is still accepted instead of being [`PushResult::TooLate`]. Does nothing once a frame
+    /// was played or skipped, or when there was no reset. Unlike [`JitterBuffer::reset_at`],
+    /// buffered packets are kept.
+    pub fn lower_floor(&mut self, first_seq: u32) {
+        if self.anchored {
+            return;
+        }
+        let wanted = first_seq.wrapping_sub(1);
+        if let Some(floor) = self.floor.as_mut() {
+            if (wanted.wrapping_sub(*floor) as i32) < 0 {
+                *floor = wanted;
+            }
+        }
+    }
+
     fn reset_state(&mut self, floor: Option<u32>) {
         self.slots.clear();
         self.next_seq = None;
@@ -1063,5 +1087,32 @@ mod tests {
             }
         }
         assert_eq!(jb.stats().skipped, 0);
+    }
+
+    #[test]
+    fn lower_floor_admits_a_reordered_reset_packet_until_playout_starts() {
+        // reset_at(11) (the first packet after DTX was 11), then the reset packet 10 arrives.
+        let mut jb = JitterBuffer::new(fixed_cfg());
+        for s in 0..4 {
+            push(&mut jb, s);
+        }
+        jb.reset_at(11);
+        assert_eq!(push(&mut jb, 11), PushResult::Accepted);
+        assert_eq!(push(&mut jb, 12), PushResult::Accepted);
+        assert_eq!(jb.highest_seq(), Some(12));
+        jb.lower_floor(10);
+        assert_eq!(push(&mut jb, 10), PushResult::Accepted);
+        assert_eq!(push(&mut jb, 9), PushResult::TooLate, "pre-reset straggler");
+        assert_eq!(jb.pop(), pkt(10));
+        assert_eq!(jb.pop(), pkt(11));
+        assert_eq!(jb.pop(), pkt(12));
+        assert_eq!(jb.stats().lost, 0);
+        // Once playout started, the floor no longer moves.
+        jb.lower_floor(5);
+        assert_eq!(push(&mut jb, 8), PushResult::TooLate);
+        // Never raised, and a no-op without a reset.
+        let mut jb = JitterBuffer::new(fixed_cfg());
+        jb.lower_floor(100);
+        assert_eq!(push(&mut jb, 3), PushResult::Accepted);
     }
 }

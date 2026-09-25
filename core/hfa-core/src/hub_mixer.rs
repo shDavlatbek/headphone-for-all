@@ -181,9 +181,21 @@ impl StreamState {
             return;
         }
         // A reset packet, or the first audio after keep-alives once the buffer drained (in
-        // case the reset packet itself was lost): restart playout at this packet instead of
-        // counting the keep-alives' sequence numbers as lost.
-        if header.has_flag(FLAG_RESET) || (self.in_dtx && self.jb.buffered_ms() <= 0.0) {
+        // case the reset packet itself was lost or is late): restart playout at this packet
+        // instead of counting the keep-alives' sequence numbers as lost. `seq` only grows, so
+        // a reset packet at or below a seq already pushed was reordered behind later packets
+        // of the same restart: it must not throw those away (they were accepted by the
+        // replay window and would never come back); it only joins them if playout has not
+        // started yet.
+        let reset = header.has_flag(FLAG_RESET);
+        let reordered_reset = reset
+            && self
+                .jb
+                .highest_seq()
+                .is_some_and(|h| (header.seq.wrapping_sub(h) as i32) <= 0);
+        if reordered_reset {
+            self.jb.lower_floor(header.seq);
+        } else if reset || (self.in_dtx && self.jb.buffered_ms() <= 0.0) {
             self.jb.reset_at(header.seq);
             self.reset_pending = true;
             self.net.resets += 1;
@@ -860,6 +872,61 @@ mod tests {
         assert!(!shared.state.lock().reset_pending);
     }
 
+    /// Reviewer scenario: the `FLAG_RESET` packet R arrives after R+1 and R+2 when audio
+    /// resumes after DTX. R+1 already restarted playout (first audio after keep-alives); the
+    /// late R must not reset again and discard R+1/R+2 (the replay window never lets them
+    /// back in, so they would play as PLC and count as network loss).
+    #[test]
+    fn a_reset_packet_reordered_behind_later_packets_keeps_them() {
+        let (shared, mut mix) = stream(10);
+        let pkts = packets(12, false);
+        let t0 = Instant::now();
+        for seq in 0..4u32 {
+            shared.state.lock().on_datagram(
+                &header(0, seq),
+                pkts[seq as usize].clone(),
+                u64::from(seq) * 10_000,
+                t0,
+            );
+        }
+        for _ in 0..8 {
+            mix.fill();
+            if mix.has_input {
+                mix.fifo.drain(..MIX_SAMPLES);
+            }
+        }
+        // Keep-alives 4..=9, then the resumed audio 10.. with R = 10 arriving third.
+        for seq in 4..10u32 {
+            shared
+                .state
+                .lock()
+                .on_datagram(&header(FLAG_DTX, seq), Vec::new(), 0, t0);
+        }
+        let arrival = |seq: u32| 1_000_000 + u64::from(seq) * 10_000;
+        for (seq, flags) in [(11, 0), (12, 0), (10, FLAG_RESET), (13, 0), (14, 0)] {
+            let p = pkts[(seq - 6) as usize].clone();
+            shared
+                .state
+                .lock()
+                .on_datagram(&header(flags, seq), p, arrival(seq), t0);
+        }
+        {
+            let st = shared.state.lock();
+            assert_eq!(st.net.resets, 1, "one restart, not two");
+            assert_eq!(st.jb.buffered_ms(), 50.0, "10..=14 all buffered");
+        }
+        for _ in 0..5 {
+            mix.fill();
+            if mix.has_input {
+                mix.fifo.drain(..MIX_SAMPLES);
+            }
+        }
+        let st = shared.state.lock();
+        assert_eq!(st.jb.stats().lost, 0, "{:?}", st.jb.stats());
+        assert_eq!(st.jb.stats().late, 0, "{:?}", st.jb.stats());
+        assert_eq!(st.mix.concealed, 0, "{:?}", st.mix);
+    }
+
     /// An output that records what it is given, for [`OutputStage`] tests.
     struct FakeOutput {
         format: AudioFormat,
@@ -1176,12 +1243,9 @@ mod tests {
                     .is_some_and(|(h, _)| h.seq * frame_ms <= (tick + 4) * MIX_FRAME_MS)
                 {
                     let (h, payload) = queue.pop_front().expect("queued");
-                    s.state.lock().on_datagram(
-                        &h,
-                        payload,
-                        u64::from(h.seq * frame_ms) * 1000,
-                        t0,
-                    );
+                    s.state
+                        .lock()
+                        .on_datagram(&h, payload, u64::from(h.seq * frame_ms) * 1000, t0);
                 }
             }
         };
