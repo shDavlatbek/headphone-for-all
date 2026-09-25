@@ -10,9 +10,26 @@ constexpr const wchar_t kAppWindowTitle[] = L"Headphone for All";
 
 // Window class of the main window. It is unique to this app (the Flutter
 // template's generic class name is shared by every Flutter app), so a second
-// instance can find the first one's window with FindWindow.
+// instance can find the first one's window with FindWindow. Debug builds use
+// their own class, so that neither a release launch nor the installer finds
+// (and activates or quits) a window of `flutter run`.
+#ifdef _DEBUG
+constexpr const wchar_t kAppWindowClassName[] =
+    L"io.github.shdavlatbek.hfa.MainWindow.Debug";
+#else
 constexpr const wchar_t kAppWindowClassName[] =
     L"io.github.shdavlatbek.hfa.MainWindow";
+#endif
+
+// Whether this build enforces one instance per session. Debug builds do not
+// (like the Flutter template): `flutter run` and integration tests must start
+// their own process even while the installed app runs, instead of handing off
+// to it and exiting.
+#ifdef _DEBUG
+constexpr bool kEnforceSingleInstance = false;
+#else
+constexpr bool kEnforceSingleInstance = true;
+#endif
 
 // Explicit AppUserModelID: groups the taskbar button, pinned shortcuts and
 // notifications of every instance. The installer's shortcuts carry it too.
@@ -20,7 +37,9 @@ constexpr const wchar_t kAppUserModelId[] = L"io.github.shdavlatbek.hfa";
 
 // Named mutex held by the running instance for its whole lifetime. It lives
 // in the session namespace (no "Global\" prefix): one instance per logged-in
-// user session. The installer's AppMutex names it to detect a running app.
+// user session. The installer's AppMutex names it to detect a running app,
+// so its security descriptor lets every user of the session open it for
+// SYNCHRONIZE, also when the app runs elevated (single_instance.cpp).
 constexpr const wchar_t kSingleInstanceMutexName[] =
     L"io.github.shdavlatbek.hfa.SingleInstance";
 

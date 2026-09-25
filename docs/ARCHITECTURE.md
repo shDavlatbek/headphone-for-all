@@ -33,10 +33,10 @@ SENDER                                                   HUB
 |---|---|
 | Core engine | **Rust** workspace (shared by all platforms, compiled as `cdylib`/`staticlib`) |
 | Audio I/O (playback, simple capture) | `cpal` (WASAPI, CoreAudio, ALSA/JACK, AAudio) |
-| Codec | libopus through `opus` / `audiopus` |
+| Codec | libopus through `opusic-sys` (libopus built from bundled source and linked statically by default) |
 | Resampling / drift | `rubato` (variable ratio) |
 | Real-time buffers | `rtrb` (lock-free SPSC) |
-| Networking | `tokio` + UDP (media); TCP for control |
+| Networking | `tokio` + UDP (media); TCP with Noise for control |
 | Serialization (control) | Protobuf (`prost`), so versions can evolve |
 | Discovery | `mdns-sd` (desktop, Android); on iOS a native Bonjour backend (`NWBrowser`/`NWListener`) plugs into `hfa-core`'s platform-backend hook (planned: the Swift side is not written yet, so discovery does not work on iOS today; pairing URIs / direct addresses do) |
 | Security | `snow` (Noise XX), `spake2` (PIN/QR-token pairing), ChaCha20-Poly1305 for media |
@@ -46,7 +46,7 @@ SENDER                                                   HUB
 
 | OS | Where it lives | Implementation |
 |---|---|---|
-| Windows | Rust (`hfa-capture`) | `cpal` loopback for the whole system; `windows` crate for process loopback (exclude our own PID) |
+| Windows | Rust (`hfa-capture`) | `windows` crate for every mode (not cpal): WASAPI loopback of the default render endpoint for the whole system; process loopback (`ActivateAudioInterfaceAsync`, include or exclude a process tree, e.g. our own PID) |
 | macOS | Rust (`hfa-capture`) | `objc2-core-audio`: `AudioHardwareCreateProcessTap` → aggregate device → IOProc |
 | Linux | Rust (`hfa-capture`) | `pipewire` crate: capture stream linked to the default sink monitor |
 | Android | Kotlin (`app/android`) | Foreground service + MediaProjection + `AudioRecord` with `AudioPlaybackCaptureConfiguration`; pushes PCM to Rust through JNI (`hfa-ffi`) |
@@ -154,7 +154,8 @@ headphone-for-all/
 
 ## 7. UI (Flutter)
 
-- **Home:** "Be a hub" / "Send to a hub" toggle, and a list of discovered hubs.
+- **Home:** two role cards, "Headphone is connected here" (hub) and "Send this device's audio" (sender), with
+  their current state. Discovered hubs are listed on the sender screen (and in settings), not on Home.
 - **Hub screen:** connected sources with a live level meter, volume slider, mute, priority star, stats
   (latency, loss). Plus a "Pair new device" button that shows a QR code and PIN.
 - **Sender screen:** the target hub, a capture on/off button, per-app selection where the OS supports it (Windows, macOS),
@@ -181,7 +182,8 @@ headphone-for-all/
 
 - Unit tests: packet (de)serialization, jitter buffer reorder/loss, drift controller convergence (simulated
   clocks at ±200 ppm), limiter.
-- Loopback integration test: `hfa send --source tone:440` → `hfa hub --out wav:<path>` on localhost, with simulated
-  loss and jitter (`tc netem` on Linux). Check the output frequency and continuity.
+- Loopback integration test: `hfa selftest` runs an in-process hub (WAV/null output) and tone senders over
+  localhost through a simulated lossy, jittery network (`--loss`, `--jitter`), then checks the output for
+  missing tones, glitches and latency (CI: 5 % loss, 20 ms jitter).
 - Latency measurement: a click track on the sender, and a mic or loopback on the hub, to measure glass-to-glass latency.
 - Device matrix for manual QA: the Windows/macOS/Linux/Android/iOS × hub/sender combinations listed in the roadmap.

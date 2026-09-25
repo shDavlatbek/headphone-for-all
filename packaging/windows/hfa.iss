@@ -107,8 +107,12 @@ UninstallAppRunningError=Uninstall has detected that %1 is still running.%n%nQui
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "autostart"; Description: "Start {#AppName} when I sign in"; GroupDescription: "Other:"; Flags: unchecked
-Name: "firewall"; Description: "Allow {#AppName} through Windows Firewall on private networks (needed to be a hub)"; GroupDescription: "Other:"; Check: IsAdminInstallMode
+; The app starts hidden in the notification area; it does not start the hub by
+; itself (that is a switch in the app), so the text does not promise more.
+Name: "autostart"; Description: "Start {#AppName} in the notification area when I sign in (switch the hub on from there)"; GroupDescription: "Other:"; Flags: unchecked
+; Private networks only, on purpose: a hub on a network marked Public (the
+; default for a newly joined Wi-Fi) is not covered, see packaging/README.md.
+Name: "firewall"; Description: "Allow {#AppName} through Windows Firewall on private networks (needed to be a hub; mark your network Private)"; GroupDescription: "Other:"; Check: IsAdminInstallMode
 
 [InstallDelete]
 ; Assets of an older version must not linger next to the new ones.

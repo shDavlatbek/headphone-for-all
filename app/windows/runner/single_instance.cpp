@@ -1,15 +1,50 @@
 #include "single_instance.h"
 
+#include <sddl.h>
+
 namespace {
 
 // Delay between two lookups of the first instance's window.
 constexpr DWORD kPollIntervalMs = 100;
 
+// DACL: full access (GA) for SYSTEM, Administrators and the owner; SYNCHRONIZE
+// (0x00100000) for Everyone, which is what OpenMutex in Inno Setup's
+// CheckForMutexes asks for. SACL: medium mandatory label with no-write-up, so
+// an elevated (high integrity) instance's mutex stays visible to medium
+// integrity processes. The name has no "Global\" prefix, so only processes of
+// the same session can reach it.
+constexpr const wchar_t kMutexSecurityDescriptor[] =
+    L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x00100000;;;WD)"
+    L"S:(ML;;NW;;;ME)";
+
 }  // namespace
 
 SingleInstanceGuard::SingleInstanceGuard(const wchar_t* mutex_name) {
-  mutex_ = ::CreateMutexW(nullptr, FALSE, mutex_name);
-  const DWORD error = ::GetLastError();
+  if (mutex_name == nullptr) {
+    return;
+  }
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  attributes.nLength = sizeof(attributes);
+  attributes.bInheritHandle = FALSE;
+  // Without a descriptor (conversion failed) the default one is used, which
+  // still works for non-elevated instances.
+  const bool have_descriptor =
+      ::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          kMutexSecurityDescriptor, SDDL_REVISION_1, &descriptor, nullptr) !=
+      FALSE;
+  attributes.lpSecurityDescriptor = have_descriptor ? descriptor : nullptr;
+  mutex_ = ::CreateMutexW(&attributes, FALSE, mutex_name);
+  DWORD error = ::GetLastError();
+  if (descriptor != nullptr) {
+    ::LocalFree(descriptor);
+  }
+  if (mutex_ == nullptr && have_descriptor && error != ERROR_ACCESS_DENIED) {
+    // The descriptor itself was refused (e.g. a label above this process's
+    // integrity level): fall back to the default one.
+    mutex_ = ::CreateMutexW(nullptr, FALSE, mutex_name);
+    error = ::GetLastError();
+  }
   if (mutex_ == nullptr) {
     // The mutex exists but belongs to a context we may not open (e.g. an
     // elevated instance): another instance is running.

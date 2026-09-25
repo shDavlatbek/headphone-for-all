@@ -136,8 +136,18 @@ if command -v create-dmg > /dev/null 2>&1; then
 else
   log "creating ${dmg} with hdiutil"
   ln -s /Applications "${staging}/Applications"
-  hdiutil create -volname "${APP_NAME}" -srcfolder "${staging}" -fs HFS+ \
-    -format UDZO -imagekey zlib-level=9 -ov "${dmg}"
+  # `hdiutil create` fails now and then with "Resource busy" while XProtect or
+  # Spotlight still scan the staging folder (common on hosted CI runners,
+  # actions/runner-images#7522); retry with a growing pause.
+  attempt=1
+  until hdiutil create -volname "${APP_NAME}" -srcfolder "${staging}" -fs HFS+ \
+    -format UDZO -imagekey zlib-level=9 -ov "${dmg}"; do
+    [[ ${attempt} -lt ${HDIUTIL_ATTEMPTS:-5} ]] || die "hdiutil create failed ${attempt} times"
+    log "hdiutil create failed (attempt ${attempt}); retrying in $((attempt * 5)) s"
+    rm -f "${dmg}"
+    sleep $((attempt * 5))
+    attempt=$((attempt + 1))
+  done
 fi
 
 if [[ -n "${identity}" ]]; then

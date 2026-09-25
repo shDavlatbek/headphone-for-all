@@ -18,7 +18,15 @@ class SingleInstanceGuard {
   // instance unless the mutex already existed or exists in a security context
   // this process may not open (for example an elevated first instance). Any
   // other failure lets the process run, so the app never refuses to start
-  // because of the guard itself.
+  // because of the guard itself. A null |mutex_name| creates nothing: every
+  // process is a first instance (debug builds).
+  //
+  // The mutex gets an explicit security descriptor: full access for SYSTEM,
+  // Administrators and its owner, SYNCHRONIZE for everyone, and a medium
+  // integrity label. The default DACL of an elevated process grants access to
+  // Administrators and SYSTEM only, so a non-elevated installer (Inno Setup's
+  // AppMutex / CheckForMutexes open the mutex for SYNCHRONIZE) would not see
+  // an elevated instance and would try to overwrite its locked files.
   explicit SingleInstanceGuard(const wchar_t* mutex_name);
   ~SingleInstanceGuard();
 

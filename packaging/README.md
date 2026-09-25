@@ -2,14 +2,16 @@
 
 This folder holds everything that turns the Flutter app (`app/`) into installable artifacts for the
 desktop platforms, plus the app icon for every platform. The mobile store builds (APK/AAB, IPA) come
-from `flutter build` and the `app/android` / `app/ios` projects; see `docs/BUILDING.md`.
+from `flutter build` and the `app/android` / `app/ios` projects; see `docs/BUILDING.md`. Tagged
+releases (`.github/workflows/release.yml`) publish all of them, signed where the repository has the
+keys; see "Releasing" in `docs/BUILDING.md`.
 
 | Artifact | Produced by | Built on (CI) | File name |
 |---|---|---|---|
 | App icon rasters | `icon/generate.py` | any (committed) | see [Icon](#icon) |
 | Windows installer | `windows/build-installer.ps1` + `windows/hfa.iss` (Inno Setup) | `windows-latest` | `Headphone_for_All-<ver>-windows-x64-setup.exe` |
-| Linux AppImage | `linux/build-appimage.sh` (appimagetool) | `ubuntu-22.04` | `Headphone_for_All-<ver>-x86_64.AppImage` |
-| Linux Flatpak bundle | `linux/build-flatpak.sh` + `linux/io.github.shdavlatbek.hfa.yml` | `ubuntu-latest` | `Headphone_for_All-<ver>-x86_64.flatpak` |
+| Linux AppImage | `linux/build-appimage.sh` (appimagetool) | `ubuntu:22.04` container | `Headphone_for_All-<ver>-x86_64.AppImage` |
+| Linux Flatpak bundle | `linux/build-flatpak.sh` + `linux/io.github.shdavlatbek.hfa.yml` | `ubuntu-latest`, Flathub's `freedesktop-26.08` builder container (from the Linux job's bundle) | `Headphone_for_All-<ver>-x86_64.flatpak` |
 | macOS disk image | `macos/build-dmg.sh` (create-dmg / hdiutil) | `macos-latest` | `Headphone_for_All-<ver>-macos.dmg` |
 
 Every script writes into `packaging/dist/` (git-ignored) unless it is given `--output` / `-OutputDir`, and
@@ -57,15 +59,28 @@ indigo and headphone shape.
 first page offers "install for all users"). It installs the whole Flutter release folder
 (`build\windows\x64\runner\Release`: `headphone_for_all.exe`, `flutter_windows.dll`, `hfa_ffi.dll`, the
 plugin DLLs and `data\`) plus the MSVC runtime DLLs, and creates a Start-menu shortcut (optional desktop
-shortcut and "start when I sign in"), all carrying the app's AppUserModelID. The sign-in shortcut passes
-`--autostart`, so the app starts hidden in the tray instead of opening its window at every sign-in. With an all-users install it
-can add an inbound Windows Firewall rule for the program on **private** networks, which a hub needs
-(without it Windows asks the first time the hub listens). A running app is quit before files are
+shortcut and "start in the notification area when I sign in"), all carrying the app's AppUserModelID. The
+sign-in shortcut passes `--autostart`, so the app starts hidden in the tray instead of opening its window
+at every sign-in. It only starts the app: the hub is not switched on by itself (there is no "start the hub
+at launch" setting yet), which is why the task says "switch the hub on from there". With an all-users
+install it can add an inbound Windows Firewall rule for the program on **private** networks, which a hub
+needs.
+
+Firewall notes (the rule is private-only on purpose; a Public-profile rule is not offered):
+- Windows 11 puts a newly joined Wi-Fi on the **Public** profile. The private-only rule does not apply
+  there, so the hub is not reachable from other devices until the network is set to Private (Settings →
+  Network & internet → the network → Network profile type → Private), or Windows' own prompt is answered.
+- Without a rule (the default per-user install) Windows asks the first time the hub listens. Allowing
+  needs administrator rights; when a **standard user** is prompted, Windows creates *block* rules, and
+  senders then cannot connect. An administrator can remove those rules (Windows Defender Firewall →
+  Allow an app…, or `wf.msc`) or reinstall for all users with the firewall option.
+- The hub listens on TCP and UDP port 47810; discovery uses mDNS (UDP 5353). A running app is quit before files are
 replaced or removed: Setup asks first (OK/Cancel; OK when silent or with `/SUPPRESSMSGBOXES`), Uninstall
 does it after the uninstall confirmation. Both post the registered `io.github.shdavlatbek.hfa.Quit` message
 to the main window (also when it is hidden in the tray), which quits at once, and wait up to 10 s for the
 single-instance mutex to go away. `AppMutex` stays as the fallback (for example an instance started as
-administrator, which a per-user Setup may not message); its message tells the user to use **Quit** in
+administrator, which a per-user Setup may not message; the runner gives the mutex a security descriptor
+that lets a non-elevated Setup open it for `SYNCHRONIZE`, so such an instance is still detected); its message tells the user to use **Quit** in
 the tray icon's menu, since closing the window only hides it there while the hub runs. The runner also
 exits on `WM_ENDSESSION`, so Restart Manager (`CloseApplications=yes`, sign-out) can close it. Uninstalling keeps the user data in
 `%APPDATA%\io.github.shdavlatbek\Headphone for All\` unless the user agrees to delete it. The minimum OS
@@ -84,20 +99,13 @@ Inno Setup with Chocolatey when `ISCC.exe` is missing, and runs
 `ISCC /DAppVersion=… /DAppArch=x64 /DSourceDir=… /DOutputDir=… hfa.iss`. `-Arch arm64` packages an
 arm64 build. The version must be numeric (Windows version resources).
 
-CI sketch (`windows-latest`, which has Visual Studio with the C++ workload):
+CI (`flutter.yml`, job `windows` on `windows-latest`, which has Visual Studio with the C++ workload)
+runs `flutter build windows --release`, then this script without arguments.
 
-```yaml
-- uses: subosito/flutter-action@v2
-  with: { channel: stable }
-- uses: dtolnay/rust-toolchain@stable
-- run: pwsh packaging/windows/build-installer.ps1 -Build
-- uses: actions/upload-artifact@v4
-  with: { name: windows-installer, path: packaging/dist/*.exe }
-```
-
-Code signing is not configured yet. To sign, run `signtool sign /fd sha256 /tr <timestamp url> /td sha256`
-on `headphone_for_all.exe` and `hfa_ffi.dll` before `ISCC`, and on the setup `.exe` after it (Inno's
-`SignTool=` directive can do the latter), with the certificate from a CI secret.
+Code signing happens in release runs (`release.yml`) when the repository has the
+`WINDOWS_CERTIFICATE_PFX_BASE64` / `WINDOWS_CERTIFICATE_PASSWORD` secrets: `signtool sign /fd sha256 /tr
+<timestamp url> /td sha256` signs `headphone_for_all.exe` and `hfa_ffi.dll` before this script runs, and
+the setup `.exe` after it. To sign locally, do the same with your certificate.
 
 **MSIX (later).** The [`msix`](https://pub.dev/packages/msix) pub package can produce an MSIX from the
 same release build (`dart run msix:create`). It needs an `msix_config` block in `app/pubspec.yaml`
@@ -144,7 +152,8 @@ refuses a bundled libpipewire, downloads `appimagetool` (continuous build from
 github.com/AppImage/appimagetool, cached in `~/.cache/hfa-packaging`) unless `$APPIMAGETOOL` or `PATH`
 provides one, and always runs it with `APPIMAGE_EXTRACT_AND_RUN=1` (no FUSE needed).
 `APPIMAGE_UPDATE_INFO` embeds update information (e.g. `gh-releases-zsync|…`). glibc is not bundled, so
-build on the oldest distribution to support (CI: Ubuntu 22.04). The bundle is not passed through
+build on the oldest distribution to support (CI: an `ubuntu:22.04` container on an `ubuntu-latest`
+runner, since GitHub is retiring its Ubuntu 22.04 runner images). The bundle is not passed through
 `linuxdeploy` on purpose: GTK and libpipewire must come from the host, and the rest of the bundle is
 self-contained already.
 
@@ -194,9 +203,12 @@ drag-to-Applications DMG with [`create-dmg`](https://github.com/create-dmg/creat
 
 **Signing and notarization notes** (no secrets live in this repository):
 
-1. A **Developer ID Application** certificate is needed to distribute outside the Mac App Store. In CI,
-   import the `.p12` (base64 secret + password secret) into a temporary keychain, e.g. with
-   `apple-actions/import-codesign-certs`, and pass the identity with `--sign` or `MACOS_SIGN_IDENTITY`.
+1. A **Developer ID Application** certificate is needed to distribute outside the Mac App Store. Release
+   runs (`release.yml` → `flutter.yml` job `macos`) import the `.p12` from the
+   `MACOS_CERTIFICATE_P12_BASE64` / `MACOS_CERTIFICATE_PASSWORD` secrets into a temporary keychain and
+   pass the identity through `MACOS_SIGN_IDENTITY`; with the `APPLE_API_KEY_P8_BASE64` /
+   `APPLE_API_KEY_ID` / `APPLE_API_ISSUER` secrets they also add `--notarize` (docs/BUILDING.md,
+   "Releasing").
 2. The script signs inside-out (nested frameworks/dylibs, then the app) with `--options runtime`
    (hardened runtime, required for notarization) and `--timestamp`, using
    `app/macos/Runner/Release.entitlements` (owned by feat/apple: App Sandbox, network client/server,

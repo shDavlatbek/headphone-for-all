@@ -215,11 +215,17 @@ MyApplication* my_application_new() {
   // the application to be recognized beyond its binary name.
   g_set_prgname(APPLICATION_ID);
 
-  // Unique (not G_APPLICATION_NON_UNIQUE like the Flutter template): one
-  // instance per session, a second launch raises the first one's window (see
-  // my_application_activate). Without a D-Bus session bus GLib falls back to
-  // a non-unique instance, so the app still starts.
-#if GLIB_CHECK_VERSION(2, 74, 0)
+  // Release and profile builds are unique (not G_APPLICATION_NON_UNIQUE like
+  // the Flutter template): one instance per session, a second launch raises
+  // the first one's window (see my_application_activate). Without a D-Bus
+  // session bus GLib falls back to a non-unique instance, so the app still
+  // starts. Debug builds (no NDEBUG) stay non-unique like the template, so
+  // that `flutter run` and integration tests start their own process instead
+  // of activating an installed instance that is running and exiting. The
+  // application id (and so the data directory) is the same in every build.
+#if !defined(NDEBUG)
+  constexpr GApplicationFlags kFlags = G_APPLICATION_NON_UNIQUE;
+#elif GLIB_CHECK_VERSION(2, 74, 0)
   constexpr GApplicationFlags kFlags = G_APPLICATION_DEFAULT_FLAGS;
 #else
   constexpr GApplicationFlags kFlags = G_APPLICATION_FLAGS_NONE;

@@ -1114,7 +1114,7 @@ Re-enabling IPv6 advertising is a later, separate change.
   `CaptureTarget::from_str`; `--bitrate` 6000..=510000; `--frame-ms` 10|20; extra `--label`.
   `--to` parses into `cli::HostPort { host, port }` (`host`, `host:port`, bare IPv6, `[ipv6]:port`; default port 47810).
 - `hub --out` parses with `OutputTarget::from_str`. `discover --timeout <s>` (default 3).
-  `selftest --seconds` 1..=3600 (default 5; 1..=600 since feat/cli, §7.2), `--loss` 0..=100 % (default 0), `--jitter` ms (default 0).
+  `selftest --seconds` 1..=600 (default 5; §7.2), `--loss` 0..=100 % (default 0), `--jitter` ms (default 0).
 - Files: `src/main.rs` (runtime + tracing + dispatch), `src/cli.rs` (clap types, tested), `src/commands.rs` (bodies).
 
 ### 7.2 Refinements made by `feat/cli` (the code in `core/hfa-cli` is authoritative)
@@ -1890,7 +1890,8 @@ snapshot is `fix/core-sec`'s shared store.
   usual `window_manager` `show` / `focus` events. The main window lets lower integrity levels deliver the
   activate message (`ChangeWindowMessageFilterEx`), so a normal launch also reaches an instance started as
   administrator; when activation still fails the second launch shows an "already running, use the tray icon"
-  message box instead of exiting silently.
+  message box instead of exiting silently. Since fix/desktop-ci-docs the mutex has an explicit security
+  descriptor (SYNCHRONIZE for Everyone, medium label) and debug builds skip the guard (§12.2).
 - **Start hidden:** the argument **`--autostart`** (the installer's "Start when I sign in" shortcut) makes the
   runner skip showing the window on the first frame; it stays hidden until the tray (`windowManager.show()`)
   or a second launch shows it. A second launch that itself carries `--autostart` never activates the running
@@ -1917,7 +1918,8 @@ snapshot is `fix/core-sec`'s shared store.
   title "Headphone for All", default size 960 × 680, minimum 380 × 520 (geometry hints), centred on X11.
 - **Unique `GApplication`** (the template used `G_APPLICATION_NON_UNIQUE`): one instance per D-Bus session; a
   second launch activates the first one, which `gtk_window_present`s its window (also when hidden to the tray),
-  and exits; its command-line arguments are dropped. Without a session bus GLib runs non-unique.
+  and exits; its command-line arguments are dropped. Without a session bus GLib runs non-unique. Debug builds
+  (no `NDEBUG`) are non-unique since fix/desktop-ci-docs (§12.2).
 - The bundle installs `app/linux/icons/hicolor/**` into `data/icons/hicolor/`; the runner sets the window icon
   from those PNGs (found via `/proc/self/exe`) and falls back to the themed icon named after the application
   id. Data directory: `$XDG_DATA_HOME/io.github.shdavlatbek.hfa/hfa` (`path_provider_linux` uses the
@@ -2144,7 +2146,8 @@ Latest stable releases as of 2026-09. Members use `dep = { workspace = true }`.
 
 **Workflows.** `rust.yml` (jobs `fmt`, `test` on ubuntu/windows/macos-latest, `android`, `ios`, `selftest`,
 `pipewire-live`) and `flutter.yml` (jobs `analyze`, `codegen`, `linux`, `linux-appimage`, `android`, `windows`, `macos`, `ios`,
-`apple-unit-tests`). Triggers: push to `main`, `claude/**`, `feat/**`, every `pull_request`, `workflow_dispatch`;
+`apple-unit-tests`; `linux-flatpak` since fix/desktop-ci-docs, §12.2). Triggers: push to `main`, `claude/**`, every `pull_request`, `workflow_dispatch`
+(and `workflow_call` from `release.yml`, §12.2);
 changes that touch only `**.md`, `docs/**` or `LICENSE-*` do not run CI. Concurrency group
 `<workflow>-<ref>`, cancel-in-progress everywhere except `refs/heads/main`. `permissions: contents: read`.
 `dependabot.yml`: weekly cargo (`/core`), pub (`/app`) and github-actions updates, minor/patch grouped,
@@ -2189,7 +2192,7 @@ changes that touch only `**.md`, `docs/**` or `LICENSE-*` do not run CI. Concurr
   `RunnerTests` in their test action.
 - `feat/desktop`: packaging runs **only when the script exists** and with **no arguments**, after the release
   build, from the repository root: `./packaging/windows/build-installer.ps1` (pwsh; uploads
-  `packaging/dist/*.exe`), `bash packaging/linux/build-appimage.sh` (job `linux-appimage` on **ubuntu-22.04** — glibc 2.35, libpipewire
+  `packaging/dist/*.exe`), `bash packaging/linux/build-appimage.sh` (job `linux-appimage` in an **`ubuntu:22.04` container** on ubuntu-latest, §12.2 — glibc 2.35, libpipewire
   0.3.48, as packaging/README.md specifies — after its own `flutter build linux --release`;
   `packaging/dist/*.AppImage`; so the Linux capture code must keep building against libpipewire 0.3.48, i.e. no
   `pipewire` crate `v0_3_49`+ features),
@@ -2197,3 +2200,52 @@ changes that touch only `**.md`, `docs/**` or `LICENSE-*` do not run CI. Concurr
 - Artifacts (14 days): `headphone_for_all-linux-x64` (tar.gz of the bundle), `-linux-appimage`,
   `-android-apk` (release, debug-signed), `-windows-x64` (zip of `runner/Release`), `-windows-x64-setup`,
   `-macos` (zipped `.app`), `-macos-dmg`.
+
+### 12.2 Refinements made by `fix/desktop-ci-docs`
+
+- **AppImage baseline without the retiring runner.** Job `linux-appimage` runs on `ubuntu-latest` with
+  `container: ubuntu:22.04` (GitHub is retiring the Ubuntu 22.04 runner images). The container starts bare: the
+  first step installs `ca-certificates curl git jq unzip xz-utils zip file build-essential` and sets
+  `safe.directory '*'`; the Linux deps are installed without `sudo`. The baseline (glibc 2.35, libpipewire
+  0.3.48) and the "no `v0_3_49`+ pipewire features" rule are unchanged.
+- **`linux-flatpak`** (flutter.yml, `needs: linux`): unpacks the `headphone_for_all-linux-x64` artifact into
+  `app/build/linux/x64/release/` and runs `bash packaging/linux/build-flatpak.sh` in
+  `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08` (`--privileged`); artifact
+  `headphone_for_all-linux-flatpak` (`packaging/dist/*.flatpak`). The manifest's runtime version and the
+  image tag move together.
+- **`flutter.yml` is reusable:** `on.workflow_call.inputs.release` (boolean, default false). With it the
+  `android` job also runs `flutter build appbundle --release` (artifact `headphone_for_all-android-aab`),
+  and the jobs sign when the secrets exist: Android through Gradle (`ANDROID_KEYSTORE_BASE64` →
+  `HFA_ANDROID_KEYSTORE`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`), Windows with
+  `signtool` (`WINDOWS_CERTIFICATE_PFX_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD`: exe + `hfa_ffi.dll` before
+  zipping/packaging, then the setup), macOS with a temporary keychain (`MACOS_CERTIFICATE_P12_BASE64`,
+  `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`) and `--notarize` when `APPLE_API_KEY_P8_BASE64`,
+  `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` are set. Ordinary runs never read the secrets (`inputs.release &&
+  secrets.X || ''`).
+- **`release.yml`** (push of tags `v*`, `workflow_dispatch`): `version` (tag = `v` + pubspec version without
+  `+build` = `core/Cargo.toml` `[workspace.package] version`), `app` (calls flutter.yml with `release: true`,
+  `secrets: inherit`), `cli` (`hfa` for `linux-x86_64` in `ubuntu:22.04`, `windows-x86_64`, `macos-universal`
+  via lipo; `--version` smoke test; `hfa-<ver>-<platform>.tar.gz|.zip` with the licences) and, for tags only,
+  `publish` (`contents: write`; softprops/action-gh-release with `SHA256SUMS`; `-` in the tag = pre-release).
+  Published names: `Headphone_for_All-<ver>-windows-x64-setup.exe`, `…-windows-x64-portable.zip`,
+  `…-x86_64.AppImage`, `…-x86_64.flatpak`, `…-linux-x64.tar.gz`, `…-macos.dmg`, `…-android.apk`,
+  `…-android.aab`. So the artifact names and file globs of flutter.yml are part of this contract. Concurrency
+  group `publish-release-<ref>` (must differ from flutter.yml's `<workflow>-<ref>` in more than case).
+- **Android release signing** (`app/android/app/build.gradle.kts`): `android/key.properties` (`storeFile`
+  relative to `android/app`, `storePassword`, `keyAlias`, `keyPassword`) or the environment
+  `HFA_ANDROID_KEYSTORE`, `HFA_ANDROID_KEYSTORE_PASSWORD`, `HFA_ANDROID_KEY_ALIAS`, `HFA_ANDROID_KEY_PASSWORD`
+  (defaults to the store password). No key → debug key + a Gradle warning when a release task runs;
+  `HFA_ANDROID_REQUIRE_RELEASE_KEY=true` → error; keystore without password/alias or a missing file → error.
+- **Runners.** Windows: the single-instance mutex is created with the SDDL
+  `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x00100000;;;WD)S:(ML;;NW;;;ME)`, so a non-elevated installer's
+  `AppMutex`/`CheckForMutexes` (OpenMutex for SYNCHRONIZE) sees an elevated instance; falls back to the default
+  descriptor if it cannot be built or is refused. Debug builds (`_DEBUG`) skip the guard (`kEnforceSingleInstance`)
+  and use the window class `io.github.shdavlatbek.hfa.MainWindow.Debug`. Linux debug builds use
+  `G_APPLICATION_NON_UNIQUE` with the same application id. Release/profile behaviour is unchanged.
+- **Installer wording.** The `autostart` task reads "Start Headphone for All in the notification area when I sign
+  in (switch the hub on from there)": nothing starts the hub at launch (no such setting exists yet; if the app
+  adds one, the text can promise it). The firewall rule stays `profile=private` (no Public-profile rule).
+- `packaging/macos/build-dmg.sh` retries `hdiutil create` up to `HDIUTIL_ATTEMPTS` (default 5) times.
+- **Docs.** CI push triggers are `main` and `claude/**` (feature branches get CI through pull requests).
+  New: `docs/USER_GUIDE.md` (end-user guide), `docs/ANDROID_APPS.md` (compatibility rules + list, filled from the
+  `.github/ISSUE_TEMPLATE/app-compatibility.yml` reports), "Releasing" in `docs/BUILDING.md`.
