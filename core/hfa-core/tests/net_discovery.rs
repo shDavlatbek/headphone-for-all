@@ -38,11 +38,8 @@ async fn advertise_and_browse() {
     assert_eq!(found.port, 47_999);
     assert_eq!(found.platform, "linux");
     assert!(!found.addrs.is_empty());
-    // IPv4 addresses come first.
-    let first_v6 = found.addrs.iter().position(|a| a.is_ipv6());
-    if let Some(i) = first_v6 {
-        assert!(found.addrs[i..].iter().all(|a| a.is_ipv6()));
-    }
+    // The hub listens on IPv4 only, so only IPv4 addresses are advertised.
+    assert!(found.addrs.iter().all(|a| a.is_ipv4()), "{:?}", found.addrs);
 
     advertiser.stop().expect("stop");
     let lost = tokio::time::timeout(Duration::from_secs(15), async {
