@@ -134,21 +134,67 @@ impl Drop for PacedThread {
     }
 }
 
-/// Test helper: asserts that `frames` frames at `sample_rate` match the wall-clock time
-/// `elapsed` a paced thread ran for, within ±`tolerance` (relative) plus one block.
+/// Test helper: checks from outside that a running paced thread handles audio at real-time
+/// speed, and returns the frames it had handled at the end of the measurement.
+///
+/// `progress` returns the frames the thread has handled so far (read from ring counters).
+/// The thread's start-up latency is not measured: the window starts once the first block has
+/// been handled. Over the following `window` of wall-clock time, the frames handled must match
+/// the elapsed time within ±`tolerance` (relative; absorbs the scheduling latency of the paced
+/// thread on a loaded machine) plus two blocks (at each reading a block may be due but not yet
+/// handled, or half accounted). Each reading is bracketed by two clock readings, so a test
+/// thread that is descheduled around a reading widens the accepted range instead of failing.
 #[cfg(test)]
-pub(crate) fn assert_real_time(
-    frames: usize,
+pub(crate) fn assert_paced_in_real_time(
+    progress: impl Fn() -> usize,
     sample_rate: u32,
-    elapsed: Duration,
     block_frames: usize,
+    window: Duration,
     tolerance: f64,
-) {
-    let expected = elapsed.as_secs_f64() * f64::from(sample_rate);
-    let margin = expected * tolerance + block_frames as f64;
+) -> usize {
+    let read = || {
+        let before = Instant::now();
+        let frames = progress();
+        (before, frames, Instant::now())
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while progress() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the paced thread handled nothing in 10 s"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let (a_before, a_frames, a_after) = read();
+    thread::sleep(window);
+    let (b_before, b_frames, b_after) = read();
+    let frames = b_frames.saturating_sub(a_frames) as f64;
+    let rate = f64::from(sample_rate);
+    let slack = 2.0 * block_frames as f64;
+    let shortest = b_before.saturating_duration_since(a_after).as_secs_f64();
+    let longest = b_after.saturating_duration_since(a_before).as_secs_f64();
+    let (low, high) = (
+        shortest * rate * (1.0 - tolerance) - slack,
+        longest * rate * (1.0 + tolerance) + slack,
+    );
     assert!(
-        (frames as f64 - expected).abs() <= margin,
-        "{frames} frames in {elapsed:?}: expected {expected:.0} ± {margin:.0}"
+        (low..=high).contains(&frames),
+        "{frames} frames handled in {shortest:.4}..{longest:.4} s: expected {low:.0}..={high:.0}"
+    );
+    b_frames
+}
+
+/// Test helper: a paced thread can never get ahead of the clock (block `k` is handled no
+/// earlier than its due time), so the `frames` it handled between just before its start and
+/// just after its stop (`elapsed`) are at most `elapsed` worth of frames. Scheduling latency
+/// only makes it handle less, so this bound holds on any machine.
+#[cfg(test)]
+pub(crate) fn assert_not_ahead_of_real_time(frames: usize, sample_rate: u32, elapsed: Duration) {
+    // One frame of slack for the nanosecond rounding of the due times.
+    let most = elapsed.as_secs_f64() * f64::from(sample_rate) + 1.0;
+    assert!(
+        frames as f64 <= most,
+        "{frames} frames handled in {elapsed:?}: faster than real time (at most {most:.0})"
     );
 }
 

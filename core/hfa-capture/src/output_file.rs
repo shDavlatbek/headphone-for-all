@@ -315,7 +315,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::pacer::assert_real_time;
+    use crate::pacer::{assert_not_ahead_of_real_time, assert_paced_in_real_time};
     use crate::ring::pcm_ring_with_channels;
     use crate::{open_output, OutputTarget};
 
@@ -330,14 +330,16 @@ mod tests {
         // Fill 2 s of audio up front.
         let two_s = vec![0.1f32; format.samples_for_ms(2000)];
         assert_eq!(sink.push(&two_s), two_s.len());
+        let consumed_frames = || (two_s.len() - (sink.capacity() - sink.free())) / 2;
         let t0 = Instant::now();
         out.start(source).expect("start");
-        std::thread::sleep(Duration::from_millis(500));
+        // 10 ms blocks of 480 frames, paced in real time while it runs.
+        assert_paced_in_real_time(consumed_frames, 48_000, 480, Duration::from_secs(1), 0.05);
         out.stop();
         let elapsed = t0.elapsed();
-        let consumed_frames = (two_s.len() - (sink.capacity() - sink.free())) / 2;
-        // ~500 ms = ~24000 frames, in whole 10 ms blocks.
-        assert_real_time(consumed_frames, 48_000, elapsed, 480, 0.05);
+        let consumed = consumed_frames();
+        assert_not_ahead_of_real_time(consumed, 48_000, elapsed);
+        assert_eq!(consumed % 480, 0, "whole 10 ms blocks");
         assert_eq!(underruns.count(), 0);
 
         // Stopped: consumption stops.
@@ -355,12 +357,13 @@ mod tests {
         out.start(source).expect("start");
         let (_sink2, source2) = pcm_ring_with_channels(100, 1);
         assert_eq!(out.start(source2).err(), Some(CaptureError::AlreadyRunning));
-        std::thread::sleep(Duration::from_millis(200));
+        // An empty ring: every 5 ms (40-sample) block is zero-filled, still in real time.
+        let zero_filled = || underruns.count() as usize;
+        assert_paced_in_real_time(zero_filled, 8000, 40, Duration::from_millis(500), 0.05);
         drop(out);
-        // ~200 ms at 8 kHz mono = ~1600 samples zero-filled, in 5 ms (40-sample) blocks.
-        let n = underruns.count() as usize;
+        let n = zero_filled();
+        assert_not_ahead_of_real_time(n, 8000, t0.elapsed());
         assert_eq!(n % 40, 0);
-        assert_real_time(n, 8000, t0.elapsed(), 40, 0.05);
     }
 
     #[test]
@@ -377,12 +380,19 @@ mod tests {
             .map(|i| ((i % 200) as f32 - 100.0) / 128.0)
             .collect();
         let (mut sink, source) = pcm_ring_with_channels(format.samples_for_ms(1000), 2);
+        let underruns = source.stats();
         assert_eq!(sink.push(&content), content.len());
+        // Samples pulled so far: taken from the ring plus zero-filled once it ran dry.
+        let pulled =
+            || content.len() - (sink.capacity() - sink.free()) + underruns.count() as usize;
         let t0 = Instant::now();
         out.start(source).expect("start");
-        std::thread::sleep(Duration::from_millis(300));
+        // Paced in real time (20 ms blocks of 320 frames), measured while it runs.
+        assert_paced_in_real_time(|| pulled() / 2, 16_000, 320, Duration::from_secs(1), 0.05);
         out.stop();
         let elapsed = t0.elapsed();
+        let pulled = pulled();
+        assert_not_ahead_of_real_time(pulled / 2, 16_000, elapsed);
 
         let mut reader = hound::WavReader::open(&path).expect("open written file");
         let spec = reader.spec();
@@ -392,9 +402,10 @@ mod tests {
             .samples::<f32>()
             .collect::<std::result::Result<_, _>>()
             .expect("samples");
-        // Real-time length: ~300 ms of audio, in whole 20 ms blocks.
+        // Every pulled block was written, in whole 20 ms blocks: the content, then silence.
+        assert_eq!(written.len(), pulled);
         assert_eq!(written.len() % format.samples_for_ms(20), 0);
-        assert_real_time(written.len() / 2, 16_000, elapsed, 320, 0.05);
+        assert!(written.len() > content.len(), "ran dry and wrote silence");
         assert_eq!(&written[..content.len()], &content[..]);
         assert!(written[content.len()..].iter().all(|&s| s == 0.0));
     }
