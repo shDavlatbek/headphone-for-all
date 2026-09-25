@@ -1046,7 +1046,20 @@ Clean up after local builds: `rm -rf app/build app/.dart_tool/flutter_build app/
   included, waiting up to 5 s for a starting first instance), calls `AllowSetForegroundWindow` for its process
   and posts the registered message **`io.github.shdavlatbek.hfa.Activate`**; the first instance restores /
   shows the window and brings it to the front, then the second exits with its arguments dropped. Dart sees the
-  usual `window_manager` `show` / `focus` events.
+  usual `window_manager` `show` / `focus` events. The main window lets lower integrity levels deliver the
+  activate message (`ChangeWindowMessageFilterEx`), so a normal launch also reaches an instance started as
+  administrator; when activation still fails the second launch shows an "already running, use the tray icon"
+  message box instead of exiting silently.
+- **Start hidden:** the argument **`--autostart`** (the installer's "Start when I sign in" shortcut) makes the
+  runner skip showing the window on the first frame; it stays hidden until the tray (`windowManager.show()`)
+  or a second launch shows it. A second launch that itself carries `--autostart` never activates the running
+  instance. Dart receives the argument among its entrypoint arguments (`main(List<String> args)`), e.g. to
+  label the tray's show/hide item correctly.
+- **Quit from outside:** the registered message **`io.github.shdavlatbek.hfa.Quit`** posted to the main
+  window destroys it and ends the message loop at once, bypassing `setPreventClose` (the installer and
+  uninstaller use it). `WM_ENDSESSION` with `wParam = TRUE` (sign-out, or Restart Manager's
+  `ENDSESSION_CLOSEAPP`) does the same. Neither runs the Dart quit path, so the hub / sender are not stopped
+  gracefully; the process simply exits. The quit message is not opened to lower integrity levels.
 - **Close to tray:** the runner still quits when the window is destroyed (`SetQuitOnClose(true)`), which is
   what happens when Dart has not called `setPreventClose(true)`. With prevent-close on, `WM_CLOSE` only reaches
   Dart; `windowManager.hide()` (`SW_HIDE`) keeps the message loop running, and `windowManager.destroy()`

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <iostream>
 
 void CreateAndAttachConsole() {
@@ -66,4 +67,10 @@ std::string Utf8FromUtf16(const wchar_t* utf16_string) {
     return std::string();
   }
   return utf8_string;
+}
+
+bool HasArgument(const std::vector<std::string>& arguments,
+                 const char* argument) {
+  return std::find(arguments.begin(), arguments.end(), argument) !=
+         arguments.end();
 }

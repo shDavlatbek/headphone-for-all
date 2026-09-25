@@ -29,6 +29,18 @@ constexpr const wchar_t kSingleInstanceMutexName[] =
 constexpr const wchar_t kActivateMessageName[] =
     L"io.github.shdavlatbek.hfa.Activate";
 
+// Registered window message that asks the main window to quit the app at once,
+// bypassing the Dart close-to-tray handling. The installer and uninstaller
+// (packaging/windows/hfa.iss) post it before they check the AppMutex, so an
+// upgrade or uninstall does not have to wait for the user to find "Quit" in
+// the tray menu.
+constexpr const wchar_t kQuitMessageName[] = L"io.github.shdavlatbek.hfa.Quit";
+
+// Command-line argument of the installer's "Start when I sign in" shortcut:
+// the window stays hidden (the tray icon shows it) instead of appearing on the
+// first frame. The Dart side receives it too, among its entrypoint arguments.
+constexpr const char kAutostartArgument[] = "--autostart";
+
 // Initial and minimum window sizes in logical pixels (scaled by the monitor's
 // DPI). The initial size is clamped to the monitor's work area.
 constexpr unsigned int kInitialWindowWidth = 960;

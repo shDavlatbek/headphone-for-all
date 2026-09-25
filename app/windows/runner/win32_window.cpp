@@ -161,6 +161,15 @@ bool Win32Window::Create(const std::wstring& title,
     return false;
   }
 
+  if (activate_message_ != 0) {
+    // User Interface Privilege Isolation drops messages posted to a window of
+    // a higher integrity level. Without this, launching the app normally
+    // while an elevated instance runs would silently do nothing. Failure only
+    // loses that case (the second instance then reports it).
+    ChangeWindowMessageFilterEx(window, activate_message_, MSGFLT_ALLOW,
+                                nullptr);
+  }
+
   UpdateTheme(window);
 
   return OnCreate();
@@ -199,8 +208,22 @@ Win32Window::MessageHandler(HWND hwnd,
     BringToFront();
     return 0;
   }
+  if (quit_message_ != 0 && message == quit_message_) {
+    QuitApplication();
+    return 0;
+  }
 
   switch (message) {
+    case WM_ENDSESSION:
+      // The session ends, or Restart Manager (an installer's "close the
+      // applications", ENDSESSION_CLOSEAPP) asks the app to exit. Returning
+      // without exiting would keep the app, and its files, alive while it
+      // sits in the tray.
+      if (wparam != FALSE) {
+        QuitApplication();
+      }
+      return 0;
+
     case WM_GETMINMAXINFO:
       ApplyMinimumSize(hwnd, lparam);
       return 0;
@@ -295,6 +318,20 @@ void Win32Window::SetMinimumSize(const Size& size) {
 
 void Win32Window::SetActivateMessage(UINT message) {
   activate_message_ = message;
+}
+
+void Win32Window::SetQuitMessage(UINT message) {
+  quit_message_ = message;
+}
+
+void Win32Window::QuitApplication() {
+  quit_on_close_ = true;
+  if (window_handle_ != nullptr) {
+    // WM_DESTROY releases Flutter and posts WM_QUIT.
+    DestroyWindow(window_handle_);
+  } else {
+    PostQuitMessage(0);
+  }
 }
 
 void Win32Window::BringToFront() {
