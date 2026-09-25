@@ -206,6 +206,15 @@ impl CaptureSource for ExternalSource {
             *slot = None;
         }
     }
+
+    fn error(&self) -> Option<String> {
+        (!self.shared.registered.load(Ordering::Acquire)).then(|| {
+            format!(
+                "the external audio feed {} was closed (the platform capture ended)",
+                self.shared.id
+            )
+        })
+    }
 }
 
 impl Drop for ExternalSource {
@@ -289,10 +298,13 @@ mod tests {
         let (sink, ring) = pcm_ring_with_channels(16, 2);
         running.start(sink).expect("start");
         assert_eq!(feed.push(&[0.0; 2]), 2);
+        assert_eq!(running.error(), None);
 
         unregister_external(1003);
         unregister_external(1003); // unknown ids are ignored
         assert_eq!(feed.push(&[0.0; 2]), 0, "unregistered: detached");
+        // The running source reports that it will deliver nothing any more.
+        assert!(running.error().is_some_and(|e| e.contains("1003")));
         assert_eq!(ring.available(), 2);
         assert!(matches!(
             ExternalSource::open(1003),

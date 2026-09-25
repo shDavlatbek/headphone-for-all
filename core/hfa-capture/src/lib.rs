@@ -66,6 +66,14 @@ pub trait CaptureSource: Send {
     fn start(&mut self, sink: PcmSink) -> Result<()>;
     /// Stops capturing and releases OS resources. Idempotent.
     fn stop(&mut self);
+    /// `Some(reason)` once a started capture failed for good and delivers nothing any more
+    /// (the backend gave up re-opening its device, lost its server connection, or the external
+    /// feed was unregistered). Without it the owner cannot tell a dead capture from silence.
+    /// The sender polls it about every 100 ms. Transient problems the backend recovers from
+    /// itself are not errors. Default `None` (never fails).
+    fn error(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A playback destination. It pulls interleaved `f32` in [`AudioOutput::format`] from the ring.

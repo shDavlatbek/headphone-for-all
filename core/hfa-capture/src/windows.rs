@@ -362,6 +362,19 @@ impl CaptureSource for WasapiCapture {
             tracing::info!(mode = %self.mode.describe(), "WASAPI capture stopped");
         }
     }
+
+    fn error(&self) -> Option<String> {
+        // A started worker only exits on its own when it gave up (see `run_worker`: repeated
+        // failures, or a re-opened endpoint with another format).
+        self.worker
+            .as_ref()
+            .filter(|w| w.start_tx.is_none() && w.thread.is_finished())
+            .map(|_| {
+                "the Windows audio capture stopped (the device kept failing or changed its \
+                 format); start the sender again"
+                    .to_owned()
+            })
+    }
 }
 
 impl Drop for WasapiCapture {

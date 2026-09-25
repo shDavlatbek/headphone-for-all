@@ -1713,6 +1713,12 @@ impl CaptureSource for PipeWireCapture {
         Ok(())
     }
 
+    fn error(&self) -> Option<String> {
+        // The capture thread only ends on its own when it lost the PipeWire connection.
+        (self.started && self.thread.as_ref().is_some_and(|t| t.is_finished()))
+            .then(|| "the PipeWire capture lost its connection; start the sender again".to_owned())
+    }
+
     fn stop(&mut self) {
         if let Some(thread) = self.thread.take() {
             // Fails only if the thread already exited (then there is nothing to stop).
