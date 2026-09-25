@@ -46,7 +46,7 @@ mod platform;
 
 pub use error::CaptureError;
 pub use external::{register_external, unregister_external, ExternalFeed};
-pub use ring::{pcm_ring, PcmSink, PcmSource};
+pub use ring::{pcm_ring, PcmSink, PcmSource, RingStats};
 
 /// Result type used throughout this crate.
 pub type Result<T> = std::result::Result<T, CaptureError>;

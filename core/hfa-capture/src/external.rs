@@ -47,6 +47,11 @@ impl ExternalFeed {
     /// Pushes interleaved samples in [`ExternalFeed::format`]. Returns the number of samples
     /// accepted (0 if no source is currently started; less than `interleaved.len()` if the
     /// ring is full).
+    ///
+    /// The feed does not convert: callers whose native format can differ from the registered
+    /// one (e.g. ReplayKit buffers, whose rate/channels are only known per buffer) register
+    /// the feed as [`AudioFormat::INTERNAL`] and convert each buffer first (see `hfa-ffi`'s
+    /// `hfa_ext_push_pcm`).
     pub fn push(&self, _interleaved: &[f32]) -> usize {
         let _ = &self.shared.sink;
         todo!("feat/capture")

@@ -70,9 +70,11 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
   - `MediaKey([u8; 32])` with `generate()`, `from_bytes`, `as_bytes`.
   - `MediaSealer::new(key, stream_id)` with `seal(&self, header: &MediaHeader, payload: &[u8], out: &mut Vec<u8>) -> Result<()>`.
     The output is `header ‖ ciphertext ‖ tag`.
-  - `MediaOpener::new(key, stream_id)` with `open(&self, datagram: &[u8]) -> Result<(MediaHeader, Vec<u8>)>`.
+  - `MediaOpener::new(key, stream_id)` with `open(&mut self, datagram: &[u8]) -> Result<(MediaHeader, Vec<u8>)>`
+    (stateful: anti-replay window, see §3.1).
   - AEAD: ChaCha20-Poly1305. Nonce = `stream_id BE ‖ seq BE ‖ 0u32`. AAD = the 16-byte header. Each stream has a
-    fresh key, and `seq` is never reused for a key.
+    fresh key, and `seq` is never reused for a key: it is strictly increasing for the key's lifetime, never resets
+    (not even with `FLAG_RESET`) and never wraps.
 - `control.rs`:
   - A prost `ControlMessage { oneof body }` using hand-written `#[derive(prost::Message)]` structs (no protoc needed).
   - Variants:
@@ -134,6 +136,21 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
   (constant time, `Pairing` error on mismatch). A wrong password is detected by `verify`, not by `finish`.
 - `uri.rs`: `PairingUri` implements `Display` (hence `to_string()`) and `FromStr<Err = ProtoError>`; `URI_SCHEME = "hfa"`.
 - The crate is `#![forbid(unsafe_code)]`.
+- **Sequence numbers and `FLAG_RESET` (review fix).** `seq` starts at 0 and is strictly increasing for the lifetime
+  of a `(MediaKey, stream_id)`: it never resets and never wraps past `u32::MAX`. `FLAG_RESET` only signals a
+  timestamp/codec-state discontinuity (the hub resets that stream's jitter buffer and decoder); it never resets
+  `seq` or the replay window. Restarting at `seq = 0` requires a new stream: new `StreamStart`, new `stream_id`,
+  new key.
+- **Anti-replay (review fix).** New module `replay.rs`: `REPLAY_WINDOW = 128` and `ReplayWindow { new(), check(seq)
+  -> bool, accept(seq) -> bool, highest() -> Option<u32> }` (implemented and tested; highest seq + 128-bit bitmap,
+  RFC 6479 / WireGuard style). `MediaOpener` owns one; **`open` takes `&mut self`**: decode header → stream id →
+  `check` → AEAD open → `accept` (only after authentication, so forged packets cannot move the window). Duplicates
+  and packets older than the window fail with the new **`ProtoError::Replay { seq }`**.
+- **Wire addition (review fix):** `Hello.pairing_required` (`bool`, tag **7**): set by the hub iff it does not trust
+  the sender's key; senders send `false`. See §6.1 for the pairing procedure.
+- **Secrets never reach `Debug` (review fix):** `StreamStart`, `PairSpake` and `PairConfirm` use `#[prost(skip_debug)]`
+  with manual `Debug` impls (`media_key`, SPAKE message and MAC print only their length). `PairingUri`'s `Debug`
+  redacts the token; its `Display` (the URI) contains the token and must not be logged.
 
 ## 4. `hfa-audio` (pure DSP + codec)
 
@@ -255,6 +272,9 @@ Modules:
   `output_cpal::list_devices()`.
 - Ring semantics: `PcmSink::overruns()` / `PcmSource::underruns()` count **samples** dropped / zero-filled.
   Extra `PcmSink::{free, capacity}`, `PcmSource::capacity`.
+- **`RingStats` (review fix):** `PcmSink::stats()` / `PcmSource::stats()` return a cloneable `RingStats`
+  (`count() -> u64`, implemented) sharing the overrun/underrun counter. Take it **before** moving the ring end into
+  `CaptureSource::start` / `AudioOutput::start`; it keeps counting afterwards (sender status, hub stats, selftest).
 - Concrete types: `tone::ToneSource::new(freq_hz, format)`, `wav_source::WavFileSource::open(&Path) -> Result`,
   `external::ExternalSource::open(id) -> Result`, `output_cpal::CpalOutput::open(Option<&str>, buffer_ms) -> Result`,
   `output_file::WavFileOutput::create(&Path, AudioFormat, buffer_ms) -> Result`, `output_file::NullOutput::new(format, buffer_ms)`.
@@ -267,7 +287,9 @@ Modules:
                       pub fn push(&self, interleaved: &[f32]) -> usize; }    // any thread; 0 if no source is started
   ```
   The format is fixed at registration (so `ExternalSource::format()` is known before `start`). `push` takes a short
-  `parking_lot` lock around the SPSC producer (native capture threads are not real-time callbacks).
+  `parking_lot` lock around the SPSC producer (native capture threads are not real-time callbacks). `push` does
+  **not** convert: a caller whose format can vary per buffer (iOS ReplayKit) registers `AudioFormat::INTERNAL` and
+  converts each buffer before pushing (see §8.1).
 - **Platform-module interface.** `lib.rs` compiles exactly one of `linux.rs` (`target_os = "linux"`), `windows.rs`,
   `macos.rs`, or `unsupported.rs` (every other target, including Android and iOS) as `mod platform`. Each exposes exactly:
   ```rust
@@ -293,22 +315,23 @@ Modules:
   - `TrustStore` (`trusted.json`) holding `TrustedPeer { device_id, name, public_key, paired_at }`, with `is_trusted`, `add` and `remove`.
 - `pairing.rs`:
   - `PairingManager` (hub side) with `start(ttl) -> PairingInfo { pin, token, uri, expires_at_unix }`, `cancel()` and
-    `verify_password(&str) -> bool`.
-  - After 5 failed attempts the current pairing window is invalidated.
+    `begin_attempt(method) -> Option<PairingAttempt>` (see §6.1; replaces the earlier `verify_password`).
+  - After 5 attempts without success the current pairing window is invalidated.
 - `control.rs`:
   - `ControlChannel` over tokio `TcpStream`. The Noise XX handshake uses u16-length-prefixed messages; after it,
     Noise transport frames carry `encode_frame` payloads.
-  - `connect(addr, &Identity, &TrustStore, pairing_secret: Option<String>) -> Result<(ControlChannel, PeerInfo)>`.
+  - `connect(addr, &Identity, &TrustStore, expected_hub_key: Option<[u8;32]>, pairing_secret: Option<String>) -> Result<(ControlChannel, PeerInfo)>`.
   - `accept(stream, &Identity, &TrustStore, &PairingManager) -> Result<(ControlChannel, PeerInfo)>`.
   - `send(&ControlMessage)` and `recv() -> ControlMessage`.
-  - If the peer is unknown, pairing (SPAKE2 bound to the handshake hash) is mandatory, then the peer is added to the TrustStore.
+  - If either side does not trust the other, pairing (SPAKE2 bound to the handshake hash) is mandatory, then both add
+    each other to their TrustStore. A sender never streams to a hub it does not trust.
 - `discovery.rs`:
   - `Advertiser::start(name, device_id, port, platform)` for `_hfa._tcp` (TXT: `v`, `id`, `name`, `platform`).
   - `browse() -> Browser` yields `DiscoveryEvent { Found(HubInfo), Lost(device_id) }`.
   - `HubInfo { device_id, name, addrs, port, platform }`.
 - `media.rs`: UDP media send/receive helpers built on `hfa-proto` sealing.
 - `sender.rs`:
-  - `SenderEngine::start(SenderConfig { hub: HubAddress, settings, capture: Box<dyn CaptureSource>, label, pairing_secret: Option<String> }) -> Result<SenderHandle>`.
+  - `SenderEngine::start(SenderConfig { hub: HubAddress, settings, capture: Box<dyn CaptureSource>, label, expected_hub_key: Option<[u8;32]>, pairing_secret: Option<String> }) -> Result<SenderHandle>`.
   - Handle: `status() -> SenderStatus`, `events() -> broadcast::Receiver<SenderEvent>`, `stop()`.
   - `SenderStatus { state: Connecting|Pairing|Streaming|Reconnecting|Stopped|Failed(String), bitrate, loss_pct, rtt_ms, level_db }`.
   - Sends DTX keep-alives during silence. Adapts bitrate and FEC from `Stats`. Reconnects with backoff.
@@ -335,27 +358,60 @@ Modules:
 - `config`: `SETTINGS_FILE = "settings.json"`; `Settings` is `#[serde(default)]`, `data_dir` is `#[serde(skip)]`.
   `Default` (implemented): port 47810, 128 kbit/s, 10 ms, FEC on, jitter 20..=150 ms, `OutputTarget::Default`,
   `default_device_name()`, `default_data_dir()` (`directories::ProjectDirs("io.github", "shdavlatbek", "headphone-for-all")`).
+  **`default_device_name()` (review fix, implemented):** the OS host name (`libc::gethostname` on unix — `libc` is a
+  `cfg(unix)` dependency of `hfa-core` — `COMPUTERNAME` on Windows), then the env vars `HOSTNAME`/`COMPUTERNAME`/`HOST`,
+  then `hfa-XXXX` (4 random hex digits). `.local`/`.localdomain` suffixes are stripped and `localhost` is ignored
+  (Android/iOS report it: the Flutter app sets `Settings.device_name` to the device model on mobile).
 - `identity`: `IDENTITY_FILE`, `TRUST_FILE`. `Identity::load_or_create(data_dir, name) -> Result<Identity>`,
   `public_key()`. **`TrustStore` is a cheap-to-clone shared handle** (`Arc<Mutex<..>>`) whose methods take `&self`
   (so `accept(&TrustStore)` can add a newly paired peer): `load(data_dir) -> Result`, `is_trusted(&[u8;32]) -> bool`
   (by public key), `get(device_id) -> Option<TrustedPeer>`, `add(TrustedPeer) -> Result<()>`,
   `remove(device_id) -> Result<bool>`, `peers() -> Vec<TrustedPeer>`. `TrustedPeer.paired_at` is unix seconds.
 - `pairing`: `PairingManager::new(hub_id: [u8;32], name: String, port: u16)`, `start(ttl) -> PairingInfo`, `cancel()`,
-  `current()`, **`secret_for(PairMethod) -> Option<String>`** (the hub runs SPAKE2 with it), `verify_password(&str) -> bool`,
-  `record_failure()` (window invalidated after `MAX_FAILED_ATTEMPTS = 5`), `record_success()` (one-time: closes the
-  window). `DEFAULT_PAIRING_TTL = 300 s`. `method_for_secret(&str) -> PairMethod`: exactly 6 ASCII digits = PIN, else token
-  (so `pairing_secret: Option<String>` stays untyped).
+  `current()`. `DEFAULT_PAIRING_TTL = 300 s`. `method_for_secret(&str) -> PairMethod`: exactly 6 ASCII digits = PIN, else
+  token (so `pairing_secret: Option<String>` stays untyped).
+  **Guess budget (review fix, implemented and tested):** each SPAKE2 run is one online guess, so the secret is only
+  handed out by **`begin_attempt(&self, PairMethod) -> Option<PairingAttempt<'_>>`**, which atomically (under the
+  window lock) requires an open, unexpired window, **no other attempt in flight** and fewer than
+  `MAX_FAILED_ATTEMPTS = 5` attempts so far, and **counts the attempt before SPAKE2 runs**. `PairingAttempt::secret()`
+  is the PIN/token; `PairingAttempt::succeed(self)` closes the window (one-time secrets); dropping the guard otherwise
+  (wrong MAC, error, disconnect, timeout) is a failure, and the window closes once 5 attempts were used. A second
+  concurrent `PairStart` gets `PairResult{ok:false}`. Attempts are tied to a window generation, so a stale attempt
+  never touches a newer window. The former `secret_for`, `verify_password`, `record_failure` and `record_success` are
+  removed (an uncounted password check would bypass the budget). `PairingInfo`, `PairingManager` and
+  `PairingAttempt` have redacting `Debug` impls.
 - `control`: `connect`/`accept`/`send`/`recv` are `async`. After the handshake, every Noise transport message is also
   `u16` BE length-prefixed and carries one `encode_frame` payload. `PeerInfo { device_id, name, platform, app_version,
-  public_key, addr: SocketAddr, newly_paired }`. `HANDSHAKE_TIMEOUT = 20 s`. A sender pins a trusted hub's key
-  (`KeyMismatch`).
+  public_key, addr: SocketAddr, newly_paired }`. `HANDSHAKE_TIMEOUT = 20 s`.
+  **Procedure (review fix; the module docs of `hfa-core/src/control.rs` are authoritative):**
+  1. Noise XX (sender = initiator). **`connect(addr, identity, trust, expected_hub_key: Option<[u8;32]>, pairing_secret)`**:
+     if `expected_hub_key` is `Some` and differs from the hub's remote static key → `KeyMismatch` before anything else.
+  2. The sender sends `Hello`; the hub answers with `Hello{pairing_required}` (= hub does not trust the sender).
+  3. Pairing is needed iff the **sender does not trust the hub's key** or `pairing_required`. The sender-side check is
+     mandatory whatever the hub signals, so a rogue hub cannot receive audio from an unpaired sender. Needed but no
+     secret → sender sends `Bye`, `PairingRequired`. Otherwise `PairStart{method}` → `PairSpake` both ways → sender
+     `PairConfirm` → hub verifies, answers `PairConfirm` + `PairResult`; both add each other to their `TrustStore`.
+     The hub gets the secret only from `PairingManager::begin_attempt`. An untrusted sender whose next message is not
+     `PairStart` gets `Bye` (`PairingRequired`).
+  **Cancel safety (review fix):** `recv` **is cancel-safe** (it fills a private `rx: Vec<u8>` with
+  `AsyncReadExt::read_buf` and only decrypts complete `u16`-prefixed records), so one task may run
+  `tokio::select! { m = ch.recv() => .., _ = tick => ch.send(..).await, cmd = rx.recv() => ch.send(..).await }`.
+  `send` is **not** cancel-safe: await it to completion inside a branch body, never as a branch future.
 - `discovery`: `TXT_VERSION/TXT_ID/TXT_NAME/TXT_PLATFORM`; `Advertiser::start(..) -> Result<Advertiser>`, `stop(self)`;
   `browse() -> Result<Browser>`; `Browser::recv().await -> Option<DiscoveryEvent>` and `try_recv()` (not `next`, to avoid
   clashing with `Iterator`/`Stream`). `DiscoveryEvent::Lost(device_id)`.
-- `media`: `MediaSender::new(Arc<UdpSocket>, dest, &MediaKey, stream_id)` with non-blocking `send(flags, timestamp, payload)
-  -> Result<bool /*sent*/>` (usable from the encoder thread) and `next_seq()`; `MediaDemux::{new, add_stream, remove_stream,
-  open}` for the hub's single UDP socket.
-- `sender`: `HubAddress { Direct { host, port }, Discover { name_or_id } }`. `SenderState` is a separate enum
+- `media` (**review fix: nonce/replay safety**): **`MediaSender::new(Arc<UdpSocket>, dest, stream_id)` generates its own
+  fresh `MediaKey`** (`key()` → put it in `StreamStart.media_key`; `stream_id()`), so a key is never reused with a
+  restarted `seq`. Non-blocking `send(flags, timestamp, payload) -> Result<bool /*sent*/>` (usable from the encoder
+  thread) fails with the new **`CoreError::SequenceExhausted(stream_id)`** after `seq = u32::MAX` (no wrap);
+  `next_seq() -> Option<u32>`. To restart a stream either keep the sender and set `FLAG_RESET`, or create a new
+  sender = new `stream_id` + key + `StreamStart`. `MediaDemux::{new, add_stream(..) -> bool, contains, remove_stream,
+  open(&mut self, ..)}`: `add_stream` refuses (returns `false`) an id that is already registered (no hijacking, no
+  replay-window reset); the hub answers that `StreamStart` with `StreamRejected`.
+- `sender`: `HubAddress { Direct { host, port }, Discover { name_or_id } }`. **`SenderConfig.expected_hub_key:
+  Option<[u8;32]>`** (review fix; from `PairingUri::hub_id` or a trusted peer) is passed to `connect`. `Discover` is
+  unauthenticated mDNS: prefer trusted hubs when several match a name, and when `name_or_id` is a device id, fail with
+  `KeyMismatch` unless `fingerprint(hub key) == name_or_id`. `SenderState` is a separate enum
   (`Connecting | Pairing | Streaming | Reconnecting | Stopped | Failed(String)`) used in `SenderStatus.state`.
   `SenderEvent { StateChanged(SenderState), Connected{device_id,name}, Paired{device_id,name}, HubControl{gain,muted,priority},
   Status(SenderStatus), Error(String) }`. **`SenderEngine::start(cfg).await`** (async; runs on the caller's tokio runtime,
@@ -379,6 +435,9 @@ Modules:
 
 - Global options: `--data-dir <DIR>` and `-v/--verbose` (count; `RUST_LOG` overrides).
 - `send`: `--to` / `--hub` are mutually exclusive and **optional when `--uri` is given** (the URI carries host and port);
+  `hfa send` with none of `--to`/`--hub`/`--uri` is rejected by clap (`required_unless_present_any` on `--to`,
+  review fix); `--to`/`--hub` given together with `--uri` override the URI's host/port (the URI still supplies the
+  hub key → `expected_hub_key`, and the token);
   `--pin` / `--uri` are mutually exclusive; `--pin` must be 6 digits; `--source` defaults to `system` and parses with
   `CaptureTarget::from_str`; `--bitrate` 6000..=510000; `--frame-ms` 10|20; extra `--label`.
   `--to` parses into `cli::HostPort { host, port }` (`host`, `host:port`, bare IPv6, `[ipv6]:port`; default port 47810).
@@ -407,6 +466,12 @@ Modules:
   `hfa_ext_push_pcm(handle, samples: *const f32, frames: u32, channels: u32, rate: u32) -> i32`,
   `hfa_ext_sender_stop(handle) -> i32`. Codes: `HFA_OK = 0`, `HFA_ERR_INVALID_ARGUMENT = -1`, `HFA_ERR_CONFIG = -2`,
   `HFA_ERR_ENGINE = -3`, `HFA_ERR_NOT_IMPLEMENTED = -100`. `HfaExtSender` is opaque; the JSON schema is defined by `feat/ffi`.
+- **PCM format of `hfa_ext_push_pcm` (review fix):** ReplayKit reveals the format per buffer, so the call carries it.
+  The extension's `ExternalFeed` is registered as `AudioFormat::INTERNAL`; `hfa_ext_push_pcm` converts every buffer
+  (`to_stereo`, plus a `StreamResampler` kept in `HfaExtSender` when `rate != 48000`) and re-creates the converter if
+  rate/channels change mid-stream. `channels` outside 1..=8 or `rate` outside 8000..=192000 →
+  `HFA_ERR_INVALID_ARGUMENT` (already checked in the stub). Android's `AudioRecord` format is fixed, so the JNI side
+  registers the real format.
 - `src/api/mod.rs` is a placeholder; `feat/ffi` adds `flutter_rust_bridge` to `hfa-ffi/Cargo.toml` itself.
 - `src/android.rs` is compiled only for `target_os = "android"`; `jni` (0.22) is already an Android-only dependency.
 

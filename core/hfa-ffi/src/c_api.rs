@@ -51,6 +51,14 @@ pub unsafe extern "C" fn hfa_ext_sender_start(config_json: *const c_char) -> *mu
 /// Pushes `frames` frames of interleaved `f32` PCM (`channels` channels at `rate` Hz).
 /// Returns [`HFA_OK`] or a negative error code.
 ///
+/// The format is given per call because ReplayKit only reveals it per buffer (44.1 or 48 kHz,
+/// mono or stereo). The sender's [`hfa_capture::ExternalFeed`] is registered as
+/// `AudioFormat::INTERNAL` (48 kHz stereo), and this function converts every buffer:
+/// `hfa_audio::convert::to_stereo`, plus a `hfa_audio::resample::StreamResampler` held in the
+/// [`HfaExtSender`] when `rate != 48000`. If `rate` or `channels` change mid-stream, the
+/// converter is re-created. `channels` must be 1..=8 and `rate` 8000..=192000, otherwise
+/// [`HFA_ERR_INVALID_ARGUMENT`].
+///
 /// # Safety
 /// `handle` must be null or a pointer returned by [`hfa_ext_sender_start`] that has not been
 /// passed to [`hfa_ext_sender_stop`]. `samples` must be null or point to at least
@@ -63,8 +71,12 @@ pub unsafe extern "C" fn hfa_ext_push_pcm(
     channels: u32,
     rate: u32,
 ) -> i32 {
-    let _ = (frames, channels, rate);
-    if handle.is_null() || samples.is_null() {
+    let _ = frames;
+    if handle.is_null()
+        || samples.is_null()
+        || !(1..=8).contains(&channels)
+        || !(8_000..=192_000).contains(&rate)
+    {
         return HFA_ERR_INVALID_ARGUMENT;
     }
     // Implemented by feat/ffi.
@@ -83,4 +95,26 @@ pub unsafe extern "C" fn hfa_ext_sender_stop(handle: *mut HfaExtSender) -> i32 {
     }
     // Implemented by feat/ffi.
     HFA_ERR_NOT_IMPLEMENTED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_arguments_are_rejected_without_panicking() {
+        let pcm = [0.0_f32; 4];
+        // SAFETY: null pointers are explicitly allowed by every function's contract.
+        unsafe {
+            assert!(hfa_ext_sender_start(std::ptr::null()).is_null());
+            assert_eq!(
+                hfa_ext_push_pcm(std::ptr::null_mut(), pcm.as_ptr(), 2, 2, 48_000),
+                HFA_ERR_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                hfa_ext_sender_stop(std::ptr::null_mut()),
+                HFA_ERR_INVALID_ARGUMENT
+            );
+        }
+    }
 }

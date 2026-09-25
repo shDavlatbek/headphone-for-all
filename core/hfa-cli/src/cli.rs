@@ -72,7 +72,9 @@ pub struct HubArgs {
 /// `hfa send`.
 #[derive(Debug, Args)]
 pub struct SendArgs {
-    /// Where the hub is. Required unless `--uri` provides the host.
+    /// Where the hub is. At least one of `--to`, `--hub` or `--uri` is required; `--to` /
+    /// `--hub` override the host and port of `--uri` (the URI still supplies the hub key and
+    /// token).
     #[command(flatten)]
     pub dest: SendDestination,
 
@@ -97,12 +99,17 @@ pub struct SendArgs {
     pub label: Option<String>,
 }
 
-/// Mutually exclusive hub selectors of `hfa send`.
+/// Mutually exclusive hub selectors of `hfa send`. One of them is required unless `--uri`
+/// is given.
 #[derive(Debug, Args)]
 #[group(required = false, multiple = false)]
 pub struct SendDestination {
     /// Hub address: `host`, `host:port`, `ip`, `ip:port` or `[ipv6]:port`.
-    #[arg(long, value_name = "HOST[:PORT]")]
+    #[arg(
+        long,
+        value_name = "HOST[:PORT]",
+        required_unless_present_any = ["hub", "uri"]
+    )]
     pub to: Option<HostPort>,
 
     /// Hub device id or name, resolved through mDNS.
@@ -387,7 +394,11 @@ mod tests {
 
     #[test]
     fn rejects_invalid_send_args() {
-        let bad: [&[&str]; 5] = [
+        let bad: [&[&str]; 8] = [
+            // No destination at all.
+            &["hfa", "send"],
+            &["hfa", "send", "--pin", "123456"],
+            &["hfa", "send", "--source", "tone:440"],
             &["hfa", "send", "--to", "a", "--hub", "b"],
             &["hfa", "send", "--to", "a", "--pin", "12345"],
             &["hfa", "send", "--to", "a", "--frame-ms", "15"],
@@ -399,6 +410,20 @@ mod tests {
                 Cli::try_parse_from(args).is_err(),
                 "{args:?} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn send_by_hub_name_needs_no_address() {
+        let cli = Cli::try_parse_from(["hfa", "send", "--hub", "Desk", "--pin", "000123"])
+            .expect("--hub alone is a destination");
+        match cli.command {
+            Command::Send(args) => {
+                assert_eq!(args.dest.hub.as_deref(), Some("Desk"));
+                assert_eq!(args.dest.to, None);
+                assert_eq!(args.source, CaptureTarget::SystemMix);
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 
