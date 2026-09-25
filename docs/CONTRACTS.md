@@ -1617,6 +1617,11 @@ it runs. A sender has no such native call yet: if a Mac test shows App Nap throt
 window hidden (Activity Monitor's "App Nap" column), add `beginStreaming` / `endStreaming` around `senderStart` /
 `senderStop` in Dart backed by the same kind of activity.
 
+**App icons.** The iOS and macOS `AppIcon.appiconset` PNGs are now `packaging/icon/generate.py`'s output
+(`packaging/icon/out/{ios,macos}`, byte for byte; `Contents.json` was already equivalent and keeps Xcode's
+formatting). `verify_xcodeproj.rb` and `configure_xcodeproj.rb` fail when a committed PNG differs from the
+generator output, so regenerate and copy both together.
+
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 
 **Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).

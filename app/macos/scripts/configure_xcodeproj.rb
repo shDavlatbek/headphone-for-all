@@ -99,6 +99,18 @@ ENTITLEMENTS.values.uniq.each do |path|
   errors << "missing #{path}" unless File.exist?(File.join(MACOS_DIR, path))
 end
 
+# App icon: the committed PNGs are packaging/icon/generate.py's output (packaging/icon/out/macos).
+icon_src = File.expand_path('../../packaging/icon/out/macos/AppIcon.appiconset', MACOS_DIR)
+icon_dst = File.join(MACOS_DIR, 'Runner', 'Assets.xcassets', 'AppIcon.appiconset')
+if Dir.exist?(icon_src)
+  Dir.glob(File.join(icon_src, '*.png')).each do |png|
+    target = File.join(icon_dst, File.basename(png))
+    next if File.exist?(target) && File.binread(target) == File.binread(png)
+
+    errors << "#{File.basename(png)} differs from packaging/icon/out/macos (copy the generated icons)"
+  end
+end
+
 if errors.empty?
   puts 'configure_xcodeproj: OK'
 else

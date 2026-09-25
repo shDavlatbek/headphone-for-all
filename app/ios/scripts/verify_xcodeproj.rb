@@ -166,6 +166,17 @@ end
   end
 end
 
+# App icon: the committed PNGs are packaging/icon/generate.py's output (packaging/icon/out/ios).
+icon_src = File.expand_path('../../packaging/icon/out/ios/AppIcon.appiconset', IOS_DIR)
+icon_dst = File.join(IOS_DIR, 'Runner', 'Assets.xcassets', 'AppIcon.appiconset')
+if Dir.exist?(icon_src)
+  Dir.glob(File.join(icon_src, '*.png')).each do |png|
+    target = File.join(icon_dst, File.basename(png))
+    check.call(File.exist?(target) && File.binread(target) == File.binread(png),
+               "#{File.basename(png)} differs from packaging/icon/out/ios (copy the generated icons)")
+  end
+end
+
 if errors.empty?
   puts 'verify_xcodeproj: OK'
 else
