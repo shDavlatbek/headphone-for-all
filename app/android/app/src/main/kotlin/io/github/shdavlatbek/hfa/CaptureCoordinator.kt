@@ -83,8 +83,15 @@ object CaptureCoordinator {
         }
     }
 
-    /** The service records for [session]. */
-    fun onServiceStarted(context: Context, session: Int) = execute(context, machine.onServiceStarted(session))
+    /**
+     * The service records for [session]. Returns whether that capture is still wanted; when
+     * `false` (stopped, timed out or replaced meanwhile) the service must end it without
+     * reporting.
+     */
+    fun onServiceStarted(context: Context, session: Int): Boolean {
+        execute(context, machine.onServiceStarted(session))
+        return machine.isCurrentCapture(session)
+    }
 
     /** The service of [session] failed with [message]. */
     fun onServiceFailed(context: Context, session: Int, message: String) =

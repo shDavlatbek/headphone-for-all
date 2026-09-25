@@ -64,11 +64,11 @@ class MainActivity : FlutterFragmentActivity(), CaptureCoordinator.Host {
         super.configureFlutterEngine(flutterEngine)
         val messenger = flutterEngine.dartExecutor.binaryMessenger
         MethodChannel(messenger, METHOD_CHANNEL).setMethodCallHandler(::onMethodCall)
-        EventChannel(messenger, EVENT_CHANNEL).setStreamHandler(PlatformEvents)
+        EventChannel(messenger, EVENT_CHANNEL).setStreamHandler(PlatformEvents.handlerFor(messenger))
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
-        PlatformEvents.detach()
+        PlatformEvents.detach(flutterEngine.dartExecutor.binaryMessenger)
         super.cleanUpFlutterEngine(flutterEngine)
     }
 

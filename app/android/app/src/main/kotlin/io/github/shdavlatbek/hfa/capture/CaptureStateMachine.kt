@@ -110,6 +110,13 @@ class CaptureStateMachine {
         return listOf(CaptureEffect.Reply(true))
     }
 
+    /**
+     * Whether the service of [session] is the capture the flow wants running. A service that
+     * reported [onServiceStarted] for a stale session (stopped, timed out or replaced while it
+     * started) must tear itself down, since its stop command may never arrive.
+     */
+    fun isCurrentCapture(session: Int): Boolean = phase == CapturePhase.RUNNING && session == this.session
+
     /** The service of [session] failed with [message] (it cleaned up and stopped itself). */
     fun onServiceFailed(session: Int, message: String): List<CaptureEffect> {
         if (session != this.session) return emptyList()

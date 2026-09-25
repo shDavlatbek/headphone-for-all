@@ -114,7 +114,13 @@ class CaptureService : Service() {
             finish()
             return
         }
-        CaptureCoordinator.onServiceStarted(this, session)
+        if (!CaptureCoordinator.onServiceStarted(this, session)) {
+            // Stale start (stopped, timed out or replaced while starting): its stop command may
+            // never be delivered, so the service ends the capture itself.
+            Log.i(TAG, "capture session $session is no longer wanted; stopping it")
+            teardown()
+            finish()
+        }
     }
 
     /** Opens the projection and the recorder and starts the capture thread. */

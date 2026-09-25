@@ -169,6 +169,41 @@ class CaptureStateMachineTest {
     }
 
     @Test
+    fun onlyTheRunningSessionIsCurrent() {
+        val session = startToService()
+        assertFalse(machine.isCurrentCapture(session)) // not recording yet
+        machine.onServiceStarted(session)
+        assertTrue(machine.isCurrentCapture(session))
+        assertFalse(machine.isCurrentCapture(session + 1))
+    }
+
+    @Test
+    fun aServiceThatStartsAfterStopWhileStartingIsNotCurrent() {
+        // stopSystemCapture during STARTING: if the queued stop command never reaches the
+        // service, its late start must still learn that it is stale and tear itself down.
+        val session = startToService()
+        machine.stop()
+        machine.onServiceStarted(session)
+        assertFalse(machine.isCurrentCapture(session))
+        assertEquals(CapturePhase.IDLE, machine.phase)
+    }
+
+    @Test
+    fun aServiceThatStartsAfterTheTimeoutIsNotCurrent() {
+        val session = startToService()
+        machine.onStartTimeout(session)
+        machine.onServiceStarted(session)
+        assertFalse(machine.isCurrentCapture(session))
+    }
+
+    @Test
+    fun aReplacedCaptureIsNotCurrent() {
+        val old = running()
+        machine.start(request)
+        assertFalse(machine.isCurrentCapture(old))
+    }
+
+    @Test
     fun sessionsNeverRepeat() {
         val seen = mutableSetOf<Int>()
         repeat(5) {
