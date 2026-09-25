@@ -842,6 +842,40 @@ void main() {
       expect(native.calls, contains('releaseMulticastLock'));
       expect(fake.discovering, isFalse);
     });
+
+    test('a new browse waits for the previous screen\'s stop', () async {
+      final fake = _SlowStopApi(discoverableHubs: [trustedHub]);
+      final c = containerFor(fake);
+      var sub = c.listen(discoveryControllerProvider, (_, _) {});
+      await settle();
+      sub.close();
+      await settle(); // autoDispose: the stop is now in flight
+      await settle();
+      expect(fake.calls, contains('stopDiscovery'));
+
+      // The sender screen is entered again before the stop finished.
+      sub = c.listen(discoveryControllerProvider, (_, _) {});
+      await settle();
+      expect(fake.calls.where((m) => m == 'discoverHubs'), hasLength(1));
+      fake.stopGate.complete();
+      await settle();
+      await settle();
+      expect(fake.calls.where((m) => m == 'discoverHubs'), hasLength(2));
+      expect(fake.discovering, isTrue);
+      expect(c.read(discoveryControllerProvider).hubs, hasLength(1));
+      expect(c.read(discoveryControllerProvider).error, isNull);
+      sub.close();
+    });
+
+    test('a browse the core ends is reported', () async {
+      final fake = FakeHfaApi(discoverableHubs: [trustedHub]);
+      final c = containerFor(fake);
+      c.listen(discoveryControllerProvider, (_, _) {});
+      await settle();
+      await fake.stopDiscovery(); // e.g. another caller stopped it
+      await settle();
+      expect(c.read(discoveryControllerProvider).error, contains('refresh'));
+    });
   });
 
   group('Settings', () {
@@ -966,6 +1000,21 @@ class _SlowPairingApi extends FakeHfaApi {
     // Like the core: the window exists now, whatever was cancelled before.
     pairing = info;
     return info;
+  }
+}
+
+/// A core whose `stopDiscovery` takes until [stopGate] completes.
+class _SlowStopApi extends FakeHfaApi {
+  _SlowStopApi({super.discoverableHubs});
+
+  final Completer<void> stopGate = Completer<void>();
+
+  @override
+  Future<void> stopDiscovery() async {
+    calls.add('stopDiscovery');
+    await stopGate.future;
+    await super.stopDiscovery();
+    calls.removeLast();
   }
 }
 
