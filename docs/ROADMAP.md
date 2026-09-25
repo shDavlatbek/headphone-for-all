@@ -9,7 +9,7 @@ platforms one at a time, and do the mobile hub last.
 ## M0: Core engine + CLI (Linux, Windows)
 
 - Rust workspace: `hfa-proto`, `hfa-core`, `hfa-cli`.
-- `hfa send --tone 440 --to <ip>` and `hfa hub`: one stream over UDP with Opus, a jitter buffer, and drift
+- `hfa send --source tone:440 --to <ip>` and `hfa hub`: one stream over UDP with Opus, a jitter buffer, and drift
   resampling, played through `cpal`.
 - System-audio capture: PipeWire monitor on Linux, WASAPI loopback on Windows.
 - Unit tests + a localhost integration test with simulated loss and jitter.
