@@ -3,7 +3,9 @@
 //! How a capture is built (a Rust translation of insidegui/AudioCap `ProcessTap.swift`):
 //!
 //! 1. A [`CATapDescription`] describes what to tap: a stereo global tap that excludes a list of
-//!    process objects (system mix; the list holds our own process when excluding self), or a
+//!    process objects (system mix; the list holds our own process: required when excluding
+//!    self, and whenever Core Audio knows it for the plain system mix too, because our own
+//!    playback is a hub's mix that must neither be sent back nor muted by the tap), or a
 //!    stereo mixdown of one process object (per-app capture). It gets a fresh UUID, is private
 //!    (only visible to this process) and uses [`MUTE_BEHAVIOR`].
 //! 2. `AudioHardwareCreateProcessTap` turns the description into a tap `AudioObjectID` (its
@@ -158,7 +160,8 @@ pub(crate) fn capabilities() -> Capabilities {
             notes: format!(
                 "Core Audio process taps (macOS {}.{}+). {permission} While capturing, the tapped \
                  audio is muted on this Mac's own speakers (CATapMutedWhenTapped) and plays only \
-                 in the hub's headphone.",
+                 in the hub's headphone. \"system\" also leaves out this app's own playback (a \
+                 hub's mix) once Core Audio knows this app, like \"system-excl\".",
                 MIN_MACOS.0, MIN_MACOS.1
             ),
         },
@@ -781,20 +784,25 @@ fn tap_description(target: TapTarget) -> Result<Retained<CATapDescription>, Capt
     let description = match target {
         TapTarget::System | TapTarget::SystemExcludingSelf => {
             let mut excluded = Vec::new();
-            if target == TapTarget::SystemExcludingSelf {
-                match own_process_object() {
-                    Ok(Some(object)) => excluded.push(NSNumber::numberWithUnsignedInt(object)),
-                    // Never fall back to a tap that includes us: once this device also plays
-                    // the hub mix, it would be captured again (a feedback loop).
-                    Ok(None) => {
-                        return Err(CaptureError::Backend(
-                            "this process is not registered with Core Audio yet, so it cannot \
-                             be excluded from the system tap"
-                                .to_owned(),
-                        ))
-                    }
-                    Err(status) => return Err(os_error("looking up this process", status)),
+            match (own_process_object(), target) {
+                // This app's own playback (a hub's mix) is never wanted in a system capture:
+                // it would be sent back to a hub, and `MUTE_BEHAVIOR` would silence it here.
+                // So the plain system tap leaves us out too whenever Core Audio knows us.
+                (Ok(Some(object)), _) => excluded.push(NSNumber::numberWithUnsignedInt(object)),
+                // Never fall back to a tap that includes us: once this device also plays the
+                // hub mix, it would be captured again (a feedback loop).
+                (Ok(None), TapTarget::SystemExcludingSelf) => {
+                    return Err(CaptureError::Backend(
+                        "this process is not registered with Core Audio yet, so it cannot be \
+                         excluded from the system tap"
+                            .to_owned(),
+                    ))
                 }
+                (Err(status), TapTarget::SystemExcludingSelf) => {
+                    return Err(os_error("looking up this process", status))
+                }
+                // Not registered yet means we play nothing yet: the plain tap is fine.
+                (Ok(None) | Err(_), _) => {}
             }
             let excluded = NSArray::from_retained_slice(&excluded);
             // SAFETY: `alloc` returns a fresh CATapDescription allocation (class availability
