@@ -525,14 +525,15 @@ impl EngineManager {
         };
         let result = self.start_sender_engine(&req, &capture_target, settings, target);
         match result {
-            Ok(handle) => {
+            Ok((handle, warning)) => {
                 // Subscribe before anything else so that an early `Connected` (the only
                 // source of the hub name) is not lost.
                 let events = handle.events();
+                // A capture fallback warning (macOS) is shown as the last non-fatal error.
                 let meta = Arc::new(Mutex::new(SenderMeta {
                     status: handle.status(),
                     hub_name: None,
-                    last_error: None,
+                    last_error: warning,
                 }));
                 let initial = meta.lock().dto();
                 self.sender_sinks.broadcast(&initial);
@@ -559,14 +560,16 @@ impl EngineManager {
         }
     }
 
+    /// Opens the capture (with `hfa_core`'s documented fallbacks) and starts the engine.
+    /// Returns the handle and the capture's fallback warning, if any.
     fn start_sender_engine(
         &self,
         req: &SenderStartDto,
         capture_target: &hfa_capture::CaptureTarget,
         settings: Settings,
         target: hub_target::HubTarget,
-    ) -> Result<SenderHandle> {
-        let capture = hfa_capture::open_capture(capture_target)?;
+    ) -> Result<(SenderHandle, Option<String>)> {
+        let (capture, warning) = hfa_core::sender::open_capture(capture_target)?;
         let label = match req.label.trim() {
             "" => convert::default_label(&req.source),
             l => l.to_owned(),
@@ -585,7 +588,8 @@ impl EngineManager {
             expected_hub_key: target.expected_key,
             pairing_secret,
         };
-        Ok(block_on(&self.runtime, SenderEngine::start(config))??)
+        let handle = block_on(&self.runtime, SenderEngine::start(config))??;
+        Ok((handle, warning))
     }
 
     /// See `api::sender::sender_stop`.

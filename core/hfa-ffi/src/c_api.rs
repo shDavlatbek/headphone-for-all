@@ -1,7 +1,7 @@
 //! C ABI for the iOS ReplayKit broadcast upload extension (header:
 //! `core/hfa-ffi/include/hfa_ext.h`, keep in sync).
 //!
-//! The extension (Swift, `app/ios/BroadcastExtension`) links the `hfa_ffi` static library and
+//! The extension (Swift, `app/ios/HfaBroadcast`) links the `hfa_ffi` static library and
 //! calls:
 //!
 //! ```c

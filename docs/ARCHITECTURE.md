@@ -50,7 +50,7 @@ SENDER                                                   HUB
 | macOS | Rust (`hfa-capture`) | `objc2-core-audio`: `AudioHardwareCreateProcessTap` → aggregate device → IOProc |
 | Linux | Rust (`hfa-capture`) | `pipewire` crate: capture stream linked to the default sink monitor |
 | Android | Kotlin (`app/android`) | Foreground service + MediaProjection + `AudioRecord` with `AudioPlaybackCaptureConfiguration`; pushes PCM to Rust through JNI (`hfa-ffi`) |
-| iOS | Swift (`app/ios/BroadcastExtension`) | ReplayKit `RPBroadcastSampleHandler` receives `.audioApp` buffers and calls the Rust **sender-only** static lib directly (no Flutter in the extension). It shares the paired-hub config with the app through an App Group. |
+| iOS | Swift (`app/ios/HfaBroadcast`) | ReplayKit `RPBroadcastSampleHandler` receives `.audioApp` buffers and calls the Rust **sender-only** static lib directly (no Flutter in the extension). It shares the paired-hub config with the app through an App Group. |
 
 **Rule: audio never goes through Dart.** Flutter only drives UI and settings. PCM flows
 native ↔ Rust through a C ABI, and every backend implements one trait:
@@ -131,7 +131,7 @@ headphone-for-all/
 ├── app/                          # Flutter app (one UI for 5 OSes)
 │   ├── lib/                      # Dart UI: device list, sources mixer, pairing (QR/PIN), settings
 │   ├── android/                  # + Kotlin CaptureService (MediaProjection)
-│   ├── ios/                      # + BroadcastExtension/ (Swift + Rust sender staticlib)
+│   ├── ios/                      # + HfaBroadcast/ (Swift + Rust sender staticlib)
 │   ├── macos/ windows/ linux/
 ├── docs/
 └── .github/workflows/            # CI: cargo test/clippy, flutter analyze, per-OS builds

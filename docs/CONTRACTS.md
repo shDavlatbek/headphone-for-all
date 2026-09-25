@@ -1193,6 +1193,8 @@ Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `
   (own key or device id) is refused (loop protection). `pairing_secret` is trimmed (empty = none); an empty `label`
   becomes "System audio" / "App <pid>" / "Tone <f> Hz" / "Device audio". `CaptureSourceDto::External` registers the
   feed (1..=8 channels, 8000..=192000 Hz) before opening the capture and unregisters it on `sender_stop` or failure.
+  The capture is opened with `hfa_core::sender::open_capture` (§6.3); its fallback warning (macOS: system-excl →
+  whole system mix) is the sender's initial `SenderStatusDto.error` (integration refinement).
 - `SenderStatusDto.error` is the failure reason when `state == "failed"`, else the last `SenderEvent::Error`;
   `hub_name` comes from `Connected` / `Paired` events.
 
@@ -1488,7 +1490,7 @@ unchanged.
 ### 8.9 Refinements made by `feat/apple` (the code in `app/ios` and `app/macos` is authoritative)
 
 **Layout.** The broadcast upload extension is the Xcode target **`HfaBroadcast`** with its sources in
-`app/ios/HfaBroadcast/` (ARCHITECTURE.md and the `c_api.rs` docs still say `app/ios/BroadcastExtension`).
+`app/ios/HfaBroadcast/` (ARCHITECTURE.md and the `c_api.rs` docs were updated to this path at integration).
 `app/ios/Shared/HfaShared.swift` is compiled into Runner and HfaBroadcast (App Group id, file names,
 notification names, JSON types). The Xcode projects are changed only by committed, idempotent Ruby
 scripts (xcodeproj gem): `app/ios/scripts/add_broadcast_extension.rb` (+ `verify_xcodeproj.rb`) and
