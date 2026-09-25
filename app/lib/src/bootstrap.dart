@@ -126,15 +126,20 @@ String hostPlatformName() {
 }
 
 /// Initializes the core: `RustLib.init()` (unless [loadRust] is false, as in
-/// the demo mode) → data directory → `initApp`.
-Future<AppInfo> initCore({
+/// the demo mode) → data directory → `initApp`. Returns the device info and
+/// the data directory.
+Future<({AppInfo info, String dataDir})> initCore({
   required HfaApi api,
   required NativeChannel native,
   bool loadRust = true,
 }) async {
   if (loadRust) await loadRustLibrary();
   final dataDir = await resolveDataDir(native);
-  return api.initApp(dataDir: dataDir, deviceName: firstRunDeviceName());
+  final info = await api.initApp(
+    dataDir: dataDir,
+    deviceName: firstRunDeviceName(),
+  );
+  return (info: info, dataDir: dataDir);
 }
 
 /// Shown while the core starts.

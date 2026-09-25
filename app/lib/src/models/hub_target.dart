@@ -47,13 +47,17 @@ class HubTarget {
   );
 
   /// A paired device that is not currently discovered: the core looks it up
-  /// over mDNS by id (empty host).
-  factory HubTarget.paired(TrustedPeerDto peer) => HubTarget(
-    name: peer.name,
-    origin: HubOrigin.paired,
-    deviceId: peer.deviceId,
-    trusted: true,
-  );
+  /// over mDNS by id (no [address]), or it is dialled at its last known
+  /// [address] (iOS, which cannot browse mDNS).
+  factory HubTarget.paired(TrustedPeerDto peer, {HubAddress? address}) =>
+      HubTarget(
+        name: peer.name,
+        origin: HubOrigin.paired,
+        host: address?.host ?? '',
+        port: address?.port ?? 0,
+        deviceId: peer.deviceId,
+        trusted: true,
+      );
 
   /// A hub from a scanned QR code or pasted link: key and one-time token
   /// included, so no PIN is needed.
@@ -185,6 +189,62 @@ class HubTarget {
     trusted,
     platform,
   );
+}
+
+/// Where a hub was reached.
+@immutable
+class HubAddress {
+  /// Creates an address.
+  const HubAddress(this.host, this.port);
+
+  /// Host or IP address.
+  final String host;
+
+  /// Port (0 = default).
+  final int port;
+
+  @override
+  bool operator ==(Object other) =>
+      other is HubAddress && other.host == host && other.port == port;
+
+  @override
+  int get hashCode => Object.hash(host, port);
+
+  @override
+  String toString() => port == 0 ? host : '$host:$port';
+}
+
+/// The selected [target] as it is known now: a discovered or paired hub is
+/// looked up again by device id in [discovered] (visible hubs by id) and
+/// [peers], so a new address, port or trust state is used; [addresses] are
+/// the last known addresses of paired hubs that are not discovered (iOS).
+/// A typed-in or scanned target, or one no longer known, is returned as is.
+/// A PIN or token the user entered is kept.
+HubTarget currentHubTarget(
+  HubTarget target, {
+  required Map<String, HubInfoDto> discovered,
+  required List<TrustedPeerDto> peers,
+  Map<String, HubAddress> addresses = const {},
+}) {
+  final id = target.deviceId;
+  if (id == null ||
+      (target.origin != HubOrigin.discovered &&
+          target.origin != HubOrigin.paired)) {
+    return target;
+  }
+  final hub = discovered[id];
+  final peer = peers.where((p) => p.deviceId == id).firstOrNull;
+  final HubTarget fresh;
+  if (hub != null) {
+    fresh = HubTarget.discovered(hub, trusted: hub.trusted || peer != null);
+  } else if (peer != null) {
+    fresh = HubTarget.paired(peer, address: addresses[id]);
+  } else {
+    return target;
+  }
+  return target.pairingSecret == null
+      ? fresh
+      : fresh.withPin(target.pairingSecret);
 }
 
 /// Whether [text] is a 6-digit pairing PIN.

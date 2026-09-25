@@ -8,10 +8,16 @@ import '../models/hub_target.dart';
 import '../models/source_choice.dart';
 import '../platform/native_channel.dart';
 import 'core_providers.dart';
+import 'hub_address_book.dart';
 import 'settings_controller.dart';
 
 /// Sender states in which a sender is live (`sender_start` would refuse).
 const liveSenderStates = {'connecting', 'pairing', 'streaming', 'reconnecting'};
+
+/// Why a hub without an address cannot be used on iOS.
+const iosNeedsHubAddress =
+    'This device cannot look for hubs on the network. Add the hub by '
+    "address or scan its QR code (on the hub: Pair a device).";
 
 /// iOS pre-pairing: how often the core's sender status is polled as a
 /// fallback for a status event the subscription may have missed.
@@ -170,6 +176,13 @@ class SenderController extends Notifier<SenderState> {
     state = state.copyWith(status: status, target: paired, error: state.error);
     // The core saved the hub as trusted: refresh the lists that show it.
     if (paired != null) ref.invalidate(trustedPeersProvider);
+    // Where the hub was reached: iOS cannot find it by id later (§8.9).
+    final hubId = target?.deviceId;
+    if (status.state == 'streaming' && target != null && hubId != null) {
+      ref
+          .read(hubAddressBookProvider.notifier)
+          .remember(hubId, target.host, target.port);
+    }
     final live = liveSenderStates.contains(status.state);
     if (first) {
       // The status from before this controller acted.
@@ -258,6 +271,12 @@ class SenderController extends Notifier<SenderState> {
     }
     final target = pin == null ? baseTarget : baseTarget.withPin(pin);
     if (pin != null) state = state.copyWith(target: target);
+    if (target.host.isEmpty && ref.read(appInfoProvider).isIos) {
+      // No mDNS on iOS (§8.9): neither the app's sender nor the broadcast
+      // extension could find the hub by its id.
+      state = state.copyWith(error: iosNeedsHubAddress);
+      return;
+    }
     state = state.copyWith(busy: true);
     _startedHere = true;
     // Found by id over mDNS (now and on every reconnect): Android filters
@@ -387,6 +406,11 @@ class SenderController extends Notifier<SenderState> {
       }
     }
     if (target.pairingSecret != null) ref.invalidate(trustedPeersProvider);
+    if (deviceId != null) {
+      ref
+          .read(hubAddressBookProvider.notifier)
+          .remember(deviceId, target.host, target.port);
+    }
     await _native.writeBroadcastConfig(
       BroadcastConfig(
         hubHost: target.host,

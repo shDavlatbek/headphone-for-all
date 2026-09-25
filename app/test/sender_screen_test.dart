@@ -334,4 +334,60 @@ void main() {
     expect(find.byKey(const Key('sender-error')), findsNothing);
     await unmount(tester);
   });
+
+  testWidgets('start dials the address discovery knows now', (tester) async {
+    final fake = senderFake();
+    await pumpApp(tester, fake, section: AppSection.sender);
+    await tester.tap(find.text('Desk PC'));
+    await tester.pumpAndSettle();
+
+    // The hub restarted on another port after it was selected.
+    fake.emitDiscovery(
+      const DiscoveryEventDto.found(
+        HubInfoDto(
+          deviceId: 'd35k-0000-0000-0001',
+          name: 'Desk PC',
+          addrs: ['192.168.1.21'],
+          port: 50000,
+          platform: 'windows',
+          trusted: true,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('sender-start')));
+    await tester.pumpAndSettle();
+    expect(fake.lastSenderStart?.hubHost, '192.168.1.21');
+    expect(fake.lastSenderStart?.hubPort, 50000);
+    expect(find.text('Streaming'), findsOneWidget);
+    await unmount(tester);
+  });
+
+  testWidgets('iOS explains that hubs must be scanned or typed in', (
+    tester,
+  ) async {
+    final fake = senderFake(platform: 'ios')..discoverableHubs.clear();
+    await pumpApp(tester, fake, section: AppSection.sender);
+    expect(find.text('Paired hubs'), findsOneWidget);
+    expect(
+      find.text('address unknown: add it by address · paired'),
+      findsNWidgets(2),
+    );
+    await tester.tap(find.text('Old laptop'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('sender-start')));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('cannot look for hubs'), findsOneWidget);
+
+    // No paired hub at all: guidance instead of "Looking for hubs…".
+    fake.trusted.clear();
+    await unmount(tester);
+    await pumpApp(tester, fake, section: AppSection.sender);
+    expect(find.textContaining('Looking for hubs'), findsNothing);
+    expect(
+      find.textContaining('scan its QR code (Pair a device) or add it by'),
+      findsOneWidget,
+    );
+    await unmount(tester);
+  });
 }

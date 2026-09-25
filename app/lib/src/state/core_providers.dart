@@ -21,6 +21,10 @@ final initialAppInfoProvider = Provider<AppInfo>(
       throw UnimplementedError('initialAppInfoProvider must be overridden'),
 );
 
+/// The data directory passed to `initApp`, for files the app keeps next to
+/// the core's (`null` in tests and the demo mode: nothing is written).
+final dataDirProvider = Provider<String?>((ref) => null);
+
 /// Whether the app runs against [FakeHfaApi] (`--dart-define=HFA_FAKE=true`).
 final demoModeProvider = Provider<bool>((ref) => false);
 

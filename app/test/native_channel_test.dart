@@ -145,12 +145,13 @@ void main() {
       return call.method == 'getDataDir' ? '/native/hfa' : null;
     });
     final fake = _DirRecordingFake();
-    final info = await initCore(
+    final (:info, :dataDir) = await initCore(
       api: fake,
       native: NativeChannel(eventsSupported: false),
       loadRust: false,
     );
     expect(fake.dataDir, '/native/hfa');
+    expect(dataDir, '/native/hfa');
     expect(info.deviceName, 'Test device');
   });
   test(
