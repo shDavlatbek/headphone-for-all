@@ -436,8 +436,8 @@ Modules:
     `AudioHardwareDestroyProcessTap`. `start` after `stop` rebuilds the tap (`Format` error if its format changed).
   - The aggregate device contains **only the tap** (no output sub-device, unlike AudioCap), so a headset
     microphone can never leak into the captured input buffers.
-  - `list_apps` returns processes with `kAudioProcessPropertyIsRunningOutput`, excluding our own pid; the name is
-    the last bundle-id component, else `proc_name`, sorted case-insensitively.
+  - `list_apps` returns processes with `kAudioProcessPropertyIsRunningOutput`, excluding our own pid, sorted
+    case-insensitively; the name rule is in §5.5 (outermost `.app` bundle, then bundle id, then `proc_name`).
   - Errors: `'!hog'` → `PermissionDenied` (and `'nope'` only from `AudioHardwareCreateProcessTap`; elsewhere
     `'nope'` → `Backend`), `'unop'` → `Unsupported`, unknown or impossible (> `i32::MAX`) pid → `NotFound`, other
     statuses → `Backend`. `open_system(true)` fails with `Backend` rather than creating a non-excluding tap when this
@@ -555,7 +555,8 @@ Modules:
   and only converts into a preallocated scratch buffer and pushes into the `PcmSink`.
 - `SystemMix`: `stream.capture.sink=true` + autoconnect → monitor of the default sink (follows default-sink changes).
 - `SystemMixExcludingSelf` is **implemented** (not a monitor fallback): the stream is left unconnected
-  (`node.autoconnect=false`, `node.always-process=true` so silence flows while nothing is linked) and the backend
+  (`node.autoconnect=false`, `node.always-process=true`: silence usually flows while nothing is linked, but only
+  when PipeWire gives the node a driver, so a consumer must treat "no frames" as silence) and the backend
   links the output ports of every `Stream/Output/Audio` node whose process id ≠ ours into the stream's input ports
   (`link-factory`, `object.linger=false`), tracking streams as they come and go. Channel routing: same name, else
   left/right/centre onto FL/FR, LFE dropped.
@@ -582,6 +583,48 @@ Modules:
   `application.name`, sorted by name; **this process is never listed**.
 - `capabilities()` probes the daemon (a connect, no round trip): `system_mix = per_app = true` when reachable,
   both `false` otherwise (the reason is in `notes`); `mutes_local_output = false`.
+
+### 5.5 Refinements made by `fix/capture` (the code and module docs in `core/hfa-capture` are authoritative)
+
+- **`CaptureSource::error()`** (the default method added by `fix/core-engine`, see §6) is implemented by every
+  backend that can fail for good: WASAPI and external feeds (as added there), PipeWire (the capture thread ended:
+  the daemon did not come back within the reconnect window below), the **macOS tap** and the **WAV file source**.
+  The tone source never fails.
+- **Linux, connection loss:** after the source opened, a broken PipeWire connection is reconnected by the capture
+  thread itself (250 ms, doubling to 2 s, for up to 30 s): a new connection with the same stream (mode, links,
+  reported format) and the same started sink, so the owner only sees a gap. A connection loss before the source
+  opened is still an `open_*` error. After 30 s without a daemon the thread ends and `error()` reports it.
+- **Linux, stall watchdog (linked modes):** the `process` callback counts its calls and the node info tracks which
+  application streams are `running`. When the callback has not run for 500 ms (and ≥ 3 checks of the 100 ms timer)
+  while a stream linked into the capture runs, the capture recreates its links; if that does not help within 1 s,
+  it ends the session and starts a new one (new node and links). Further attempts back off (1 s doubling to 30 s)
+  and reset once audio flows. It never fires on a healthy capture.
+- **Linux, "this process"** (excluded by `system-excl`, never listed) is `std::process::id()` plus, for Flatpak
+  builds, (a) the kernel-verified `pipewire.sec.pid` of the client owning our capture node (our host pid, carried by
+  our native-socket streams) and (b) a sandboxed stream reporting our namespace-local pid **and** our own Flatpak app
+  id (`/.flatpak-info`; our PulseAudio playback). A sandboxed stream without an app id is never taken for ours.
+- **Linux notes** say that the captured audio keeps playing on the local speakers, and that muting or turning down
+  the device's output is safe (the capture is taken before the device volume).
+- **macOS health:** each tap device has property listeners (aggregate `kAudioDevicePropertyDeviceIsAlive` and
+  `kAudioDevicePropertyNominalSampleRate`, input stream `kAudioStreamPropertyVirtualFormat`, system
+  `kAudioHardwarePropertyServiceRestarted`). A dead device, a server restart or a rate/format different from the
+  reported one sets `error()` (`"…; open the capture again"`) and the IOProc stops pushing (no wrong-pitch audio).
+  The listeners are removed before the aggregate is destroyed; their few bytes of shared state are leaked on
+  purpose (a listener call may still be running after removal).
+- **macOS `SystemMix`** also excludes this process's own process object whenever Core Audio knows it (our own
+  playback is a hub's mix, which the tap would send on and mute locally); when the process is not registered yet it
+  plays nothing, and the plain global tap is built as before. `SystemMixExcludingSelf` is unchanged (still a
+  `Backend` error when the process is unknown). Known gap: the sender's fallback from `system-excl` to `system`
+  (`hfa_core::sender::open_capture`, §6.3) still yields a tap without us excluded if a hub starts later in the
+  same process.
+- **macOS app names** (`list_apps`, per-process `describe`): the outermost `*.app` bundle in the executable path
+  (`proc_pidpath`: `Spotify`, `zoom.us`, `Google Chrome` also for its Helper), else the bundle id's last component
+  unless it is generic (`client`, `helper`, `xos`, `gpu`, `service`…, then the component before it:
+  `com.apple.WebKit.GPU` → `WebKit`), else `proc_name`, else `pid <n>`.
+- **WAV file source** reads the file while it plays (one block plus a 4096-sample decode buffer in memory, the file
+  reopened at the end of each pass) instead of loading it whole. `open` checks the header and decodes the first
+  block (a broken file still fails there); a read error while playing (file truncated or replaced) ends the playback
+  and sets `error()`. `start` after `stop` plays from the beginning (`Format` error if the file changed its format).
 
 ## 6. `hfa-core` (networking + engines; tokio)
 
