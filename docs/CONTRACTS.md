@@ -305,6 +305,24 @@ Modules:
   `AudioHardwareCreateProcessTap`/`AudioHardwareDestroyProcessTap`, `CATapDescription` (`initStereoGlobalTapButExcludeProcesses`,
   `initStereoMixdownOfProcesses`, `setPrivate`, `setMuteBehavior`, `UUID`), `CATapMuteBehavior`,
   `AudioHardwareCreateAggregateDevice` and `kAudioAggregateDeviceTapListKey`.
+- **macOS backend (implemented by `feat/capture-macos`, `macos.rs` is authoritative):**
+  - `AudioHardwareCreateProcessTap`/`AudioHardwareDestroyProcessTap` are resolved at run time with `dlsym`
+    (a direct call would be a strong import that stops the binary from launching on macOS < 14.2); availability
+    is gated by `objc2::available!(macos = 14.2)` + a `CATapDescription` class lookup. On older macOS every entry
+    point returns `CaptureError::Unsupported` and `capabilities()` reports `system_mix = per_app =
+    mutes_local_output = false` (all `true` on 14.2+).
+  - Taps are private, get a fresh UUID and use `pub(crate) const MUTE_BEHAVIOR = CATapMuteBehavior::MutedWhenTapped`
+    (the sender's own speakers go quiet while it streams). The tap and the private aggregate device are created by
+    `open_*` (so `format()` = `kAudioTapPropertyFormat`), the IOProc by `start`; `stop`/`Drop` tear down in the
+    order `AudioDeviceStop` → `AudioDeviceDestroyIOProcID` → `AudioHardwareDestroyAggregateDevice` →
+    `AudioHardwareDestroyProcessTap`. `start` after `stop` rebuilds the tap (`Format` error if its format changed).
+  - The aggregate device contains **only the tap** (no output sub-device, unlike AudioCap), so a headset
+    microphone can never leak into the captured input buffers.
+  - `list_apps` returns processes with `kAudioProcessPropertyIsRunningOutput`, excluding our own pid; the name is
+    the last bundle-id component, else `proc_name`, sorted case-insensitively.
+  - Errors: `'!hog'`/`'nope'` → `PermissionDenied`, `'unop'` → `Unsupported`, unknown pid → `NotFound`, other
+    statuses → `Backend`. A denied permission may also just yield silence on some macOS versions.
+  - **App requirement (`feat/apple`):** the macOS app's `Info.plist` must contain `NSAudioCaptureUsageDescription`.
 
 ## 6. `hfa-core` (networking + engines; tokio)
 
