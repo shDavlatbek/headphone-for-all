@@ -325,8 +325,22 @@ Modules:
 - `Process { pid }`: the same linking restricted to the streams of `pid` **and its descendants** (`/proc/<pid>/stat`
   parent walk). Errors: `pid == 0` → `InvalidArgument`, no `/proc/<pid>` → `NotFound`; a process that is not playing
   yet is fine (its streams are linked when they appear).
-- A stream's pid is the node's `application.process.id` (pipewire-pulse clients), else the owning client's
-  `application.process.id`, else the client's `pipewire.sec.pid`.
+- Relay streams are never linked or listed: `Stream/Output/Audio` nodes with `node.link-group` (loopback,
+  filter-chain, echo-cancel, combine-stream halves) or `node.virtual=true`, and output streams of a client that also
+  owns an `Audio/Sink` node (EasyEffects-style virtual sinks). The applications behind them are captured from their
+  own streams, so nothing is captured twice and our own playback cannot come back through a virtual default sink.
+  Sound reaching the sink only through a relay (e.g. a microphone loopback) is missed in the linked modes.
+- A stream's pid: native clients → the kernel-verified `pipewire.sec.pid` (host namespace), else
+  `application.process.id`; `pipewire-pulse` clients (`client.api`) → the node's, else the client's
+  `application.process.id`. For sandboxed clients (`pipewire.access=flatpak` / `pipewire.access.portal.app_id`) a
+  reported pid is namespace-local and is mapped to the host pid via `/proc/*/status` `NSpid` + the Flatpak app id
+  (`/.flatpak-info` or the `app-flatpak-<id>-N.scope` cgroup); unmappable or ambiguous ones are not listed and not
+  matched by `Process { pid }` (system-excl still links them). Nothing is decided before the node and client info
+  have arrived.
+- Links that fail (proxy error, link state `error`) or are removed by someone else are recreated, at most 3 times
+  per link until its ports or our node change. Unwanted links are removed by dropping their proxy (one `destroy`).
+  Only a broken connection (`-EPIPE`, `-ECONNRESET`, `-ENOTCONN`, `-ECONNREFUSED`, `-EPROTO` on the core) stops a
+  capture; other core errors are logged at debug.
 - `list_apps()` returns one `CaptureApp` per process with a playback stream (paused streams included), name =
   `application.name`, sorted by name; **this process is never listed**.
 - `capabilities()` probes the daemon (a connect, no round trip): `system_mix = per_app = true` when reachable,
