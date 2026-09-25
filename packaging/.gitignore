@@ -1,0 +1,4 @@
+# Local packaging outputs (build-*.sh).
+/dist/
+/linux/.flatpak-builder/
+/linux/_flatpak/
