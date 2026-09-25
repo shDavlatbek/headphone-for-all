@@ -14,6 +14,12 @@ pub struct HubStatusDto {
     pub device_name: String,
     /// Number of current streams.
     pub source_count: u32,
+    /// The hub is announced over mDNS, so senders on the network can find it. `false` while
+    /// stopped, or when advertising failed (see `advertise_error`): senders must then enter
+    /// the hub's address.
+    pub advertised: bool,
+    /// Why advertising failed (e.g. no multicast on iOS without the entitlement), if it did.
+    pub advertise_error: Option<String>,
 }
 
 /// One incoming stream.
@@ -94,7 +100,8 @@ pub enum HubEventDto {
 }
 
 /// Starts the hub (output from the settings, mDNS advertising on). Idempotent: returns the
-/// status of the running hub.
+/// status of the running hub. A failure to advertise does not fail the start: it shows in
+/// `HubStatusDto.advertised` / `advertise_error` and as a `HubEventDto::Error`.
 pub fn hub_start() -> anyhow::Result<HubStatusDto> {
     Ok(manager()?.hub_start()?)
 }
@@ -139,6 +146,13 @@ pub fn hub_set_master_gain(gain: f32) -> anyhow::Result<()> {
 /// Opens a pairing window (5 minutes, one-time PIN and token).
 pub fn hub_start_pairing() -> anyhow::Result<PairingInfoDto> {
     Ok(manager()?.hub_start_pairing()?)
+}
+
+/// The open pairing window, or `None`: none was opened, it was cancelled, it expired, a
+/// sender paired, or the hub closed it after 5 failed attempts (a `PairingFailed` event does
+/// not say which). `None` while the hub is stopped.
+pub fn hub_pairing_status() -> anyhow::Result<Option<PairingInfoDto>> {
+    Ok(manager()?.hub_pairing_status())
 }
 
 /// Closes the pairing window.

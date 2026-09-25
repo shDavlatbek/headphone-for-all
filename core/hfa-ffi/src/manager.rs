@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use hfa_core::config::SETTINGS_FILE;
 use hfa_core::{
-    HubConfig, HubEngine, HubEvent, HubHandle, Identity, SenderConfig, SenderEngine, SenderEvent,
-    SenderHandle, SenderState, Settings, TrustStore,
+    Advertiser, HubConfig, HubEngine, HubEvent, HubHandle, Identity, SenderConfig, SenderEngine,
+    SenderEvent, SenderHandle, SenderState, Settings, TrustStore,
 };
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
@@ -127,16 +127,16 @@ struct AppContext {
 
 /// The status to send for a sender's folded events.
 fn meta_dto(meta: &SenderMeta) -> SenderStatusDto {
-    convert::sender_status_dto(
-        &meta.status,
-        meta.hub_name.as_deref(),
-        meta.last_error.as_deref(),
-    )
+    convert::sender_status_dto(&meta.status, meta)
 }
 
 struct HubSlot {
     handle: HubHandle,
     forwarder: JoinHandle<()>,
+    /// The mDNS announcement, owned here (not by the engine) so that a failure is visible.
+    advertiser: Option<Advertiser>,
+    /// Why advertising failed, if it did.
+    advertise_error: Option<String>,
 }
 
 struct SenderSlot {
@@ -293,15 +293,16 @@ impl EngineManager {
     /// See `api::hub::hub_start`.
     pub(crate) fn hub_start(&self) -> Result<HubStatusDto> {
         let _ops = self.lifecycle.lock();
-        let settings = {
+        let (settings, device_id) = {
             let st = self.state.lock();
             let app = st.app.as_ref().ok_or(FfiError::NotInitialized)?;
             if st.hub.is_some() {
                 drop(st);
                 return Ok(self.hub_status());
             }
-            app.settings.clone()
+            (app.settings.clone(), app.identity.device_id.clone())
         };
+        let name = settings.device_name.clone();
         // cpal's AAudio output panics without the context set by `NativeBridge.init`.
         #[cfg(target_os = "android")]
         crate::android::ensure_audio_context()?;
@@ -311,7 +312,8 @@ impl EngineManager {
             HubEngine::start(HubConfig {
                 settings,
                 output,
-                advertise: true,
+                // Advertised below, so that a failure can be reported.
+                advertise: false,
             }),
         )??;
         // Subscribe before anything else so that no early event is lost.
@@ -319,8 +321,35 @@ impl EngineManager {
             handle.events(),
             Arc::clone(&self.hub_sinks),
         ));
+        let (advertiser, advertise_error) = {
+            let _rt = self.runtime.enter();
+            match Advertiser::start(
+                &name,
+                &device_id,
+                handle.local_port(),
+                hfa_core::platform_name(),
+            ) {
+                Ok(a) => (Some(a), None),
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot advertise the hub over mDNS");
+                    let message = e.to_string();
+                    self.hub_sinks.broadcast(&HubEventDto::Error {
+                        message: format!(
+                            "Other devices cannot find this hub automatically ({message}): \
+                             enter its address on the sending device."
+                        ),
+                    });
+                    (None, Some(message))
+                }
+            }
+        };
         tracing::info!(port = handle.local_port(), "hub started");
-        self.state.lock().hub = Some(HubSlot { handle, forwarder });
+        self.state.lock().hub = Some(HubSlot {
+            handle,
+            forwarder,
+            advertiser,
+            advertise_error,
+        });
         Ok(self.hub_status())
     }
 
@@ -329,6 +358,12 @@ impl EngineManager {
         let _ops = self.lifecycle.lock();
         let slot = self.state.lock().hub.take();
         if let Some(slot) = slot {
+            // Stop announcing a hub that is going away first.
+            if let Some(advertiser) = slot.advertiser {
+                if let Err(e) = advertiser.stop() {
+                    tracing::debug!(error = %e, "mDNS advertiser shutdown");
+                }
+            }
             let stopped = block_on(&self.runtime, slot.handle.stop());
             // Relays the last source updates, then ends (the engine's channel is closed).
             block_on(
@@ -355,6 +390,8 @@ impl EngineManager {
                 port: slot.handle.local_port(),
                 device_name,
                 source_count: u32::try_from(slot.handle.sources().len()).unwrap_or(u32::MAX),
+                advertised: slot.advertiser.is_some(),
+                advertise_error: slot.advertise_error.clone(),
             },
             None => convert::stopped_hub_status(device_name),
         }
@@ -410,6 +447,15 @@ impl EngineManager {
     /// See `api::hub::hub_start_pairing`.
     pub(crate) fn hub_start_pairing(&self) -> Result<PairingInfoDto> {
         self.with_hub(|h| Ok(convert::pairing_info_dto(&h.start_pairing())))
+    }
+
+    /// See `api::hub::hub_pairing_status`.
+    pub(crate) fn hub_pairing_status(&self) -> Option<PairingInfoDto> {
+        let st = self.state.lock();
+        let slot = st.hub.as_ref()?;
+        slot.handle
+            .current_pairing()
+            .map(|p| convert::pairing_info_dto(&p))
     }
 
     /// See `api::hub::hub_cancel_pairing`.
@@ -621,14 +667,7 @@ impl EngineManager {
     pub(crate) fn sender_status(&self) -> SenderStatusDto {
         let st = self.state.lock();
         match &st.sender {
-            Some(slot) => {
-                let meta = slot.meta.lock();
-                convert::sender_status_dto(
-                    &slot.handle.status(),
-                    meta.hub_name.as_deref(),
-                    meta.last_error.as_deref(),
-                )
-            }
+            Some(slot) => convert::sender_status_dto(&slot.handle.status(), &slot.meta.lock()),
             None => convert::idle_sender_status(),
         }
     }
@@ -842,6 +881,8 @@ mod tests {
             m.hub_cancel_pairing(),
             Err(FfiError::HubNotRunning)
         ));
+        assert_eq!(m.hub_pairing_status(), None);
+        assert!(!m.hub_status().advertised);
         // Gain validation happens before the hub lookup.
         for bad in [-0.1, 4.1, f32::NAN, f32::INFINITY] {
             assert!(matches!(

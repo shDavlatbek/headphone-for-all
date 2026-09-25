@@ -14,6 +14,7 @@ use crate::api::sender::{CaptureSourceDto, DiscoveryEventDto, HubInfoDto, Sender
 use crate::error::{FfiError, Result};
 use crate::hub_target::encode_key;
 use crate::pcm::format_is_valid;
+use crate::sender_meta::SenderMeta;
 
 /// Accepted bitrates (bit/s), as in `hfa send --bitrate`.
 pub const BITRATE_RANGE: std::ops::RangeInclusive<u32> = 6_000..=510_000;
@@ -216,22 +217,21 @@ pub(crate) fn sender_state_str(s: &SenderState) -> (&'static str, Option<&str>) 
     crate::sender_meta::state_str(s)
 }
 
-/// Builds a [`SenderStatusDto`]. The error is the failure reason when failed, else
-/// `last_error`.
-pub(crate) fn sender_status_dto(
-    s: &SenderStatus,
-    hub_name: Option<&str>,
-    last_error: Option<&str>,
-) -> SenderStatusDto {
-    let (state, failure) = sender_state_str(&s.state);
+/// Builds a [`SenderStatusDto`] from a status and the facts folded from the sender's
+/// events. The error is the failure reason when failed, else the last non-fatal error.
+pub(crate) fn sender_status_dto(s: &SenderStatus, meta: &SenderMeta) -> SenderStatusDto {
+    let (state, _) = sender_state_str(&s.state);
     SenderStatusDto {
         state: state.to_owned(),
-        error: failure.or(last_error).map(str::to_owned),
-        hub_name: hub_name.map(str::to_owned),
+        error: meta.error_for(&s.state).map(str::to_owned),
+        hub_name: meta.hub_name.clone(),
         bitrate: s.bitrate,
         loss_pct: s.loss_pct,
         rtt_ms: s.rtt_ms,
         level_db: s.level_db,
+        hub_gain: meta.hub.gain,
+        hub_muted: meta.hub.muted,
+        hub_priority: meta.hub.priority,
     }
 }
 
@@ -242,6 +242,8 @@ pub(crate) fn stopped_hub_status(device_name: String) -> HubStatusDto {
         port: 0,
         device_name,
         source_count: 0,
+        advertised: false,
+        advertise_error: None,
     }
 }
 
@@ -255,6 +257,9 @@ pub(crate) fn idle_sender_status() -> SenderStatusDto {
         loss_pct: 0.0,
         rtt_ms: 0.0,
         level_db: hfa_audio::meter::SILENCE_DB,
+        hub_gain: 1.0,
+        hub_muted: false,
+        hub_priority: false,
     }
 }
 
@@ -512,7 +517,9 @@ mod tests {
                 rtt_ms: 4.0,
                 level_db: -20.0,
             };
-            let dto = sender_status_dto(&s, Some("Hub"), Some("transient"));
+            let mut meta = SenderMeta::new(s.clone(), Some("transient".into()));
+            meta.hub_name = Some("Hub".into());
+            let dto = sender_status_dto(&s, &meta);
             assert_eq!(dto.state, text);
             assert_eq!(dto.error.as_deref(), Some("transient"));
             assert_eq!(dto.hub_name.as_deref(), Some("Hub"));
@@ -525,11 +532,25 @@ mod tests {
             state: SenderState::Failed("pairing failed".into()),
             ..SenderStatus::default()
         };
-        let dto = sender_status_dto(&failed, None, Some("older error"));
+        let mut meta = SenderMeta::new(failed.clone(), Some("older error".into()));
+        meta.apply(hfa_core::SenderEvent::HubControl {
+            gain: 0.5,
+            muted: true,
+            priority: true,
+        });
+        let dto = sender_status_dto(&failed, &meta);
         assert_eq!(dto.state, "failed");
         assert_eq!(dto.error.as_deref(), Some("pairing failed"));
+        assert_eq!(
+            (dto.hub_gain, dto.hub_muted, dto.hub_priority),
+            (0.5, true, true)
+        );
         let idle = idle_sender_status();
         assert_eq!(idle.state, "idle");
+        assert_eq!(
+            (idle.hub_gain, idle.hub_muted, idle.hub_priority),
+            (1.0, false, false)
+        );
         assert_eq!(idle.level_db, hfa_audio::meter::SILENCE_DB);
     }
 

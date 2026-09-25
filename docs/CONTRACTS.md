@@ -1634,6 +1634,22 @@ the version comes from `app/pubspec.yaml` without the `+build` part.
 
 These supersede the matching statements of §8.5 and the "Open" list of §8.9.
 
+**flutter_rust_bridge API (bindings regenerated).**
+- **`SenderStatusDto` gains `hub_gain: f32`, `hub_muted: bool`, `hub_priority: bool`**: what the hub applies to
+  this device's stream (`SenderEvent::HubControl`, folded by `sender_meta::SenderMeta`; defaults 1.0 / false / false,
+  also in the `idle` status). A sender muted on the hub no longer looks like a normal stream.
+- **New `hub_pairing_status() -> Option<PairingInfoDto>`** (`HubHandle::current_pairing`): the open window, or
+  `None` (never opened, cancelled, expired, used, or closed by the core after 5 failed attempts; `None` while the
+  hub is stopped). `PairingFailed` does not say whether the window closed, so the app's `PairingController.onFailed`
+  asks and switches to `failed` ("the hub closed this pairing window after too many failed attempts") when it is
+  gone. Dart: `HfaApi.hubPairingStatus()`; `FakeHfaApi.closePairingWindow()` simulates the core closing it.
+- **`HubStatusDto` gains `advertised: bool` and `advertise_error: Option<String>`.** The manager now owns the
+  mDNS `Advertiser` (it starts the engine with `HubConfig.advertise = false`, then `Advertiser::start` with the
+  device name, device id, bound port and platform, exactly what the engine did). A failure no longer disappears in a
+  log line: the status carries it, and a `HubEventDto::Error` ("Other devices cannot find this hub automatically
+  ...") is sent. `hub_stop` stops advertising before it stops the engine. (iOS discovery itself, i.e. `browse()` and
+  advertising without the multicast entitlement, is hfa-core's: a native Bonjour backend.)
+
 **`hfa send` (hfa-cli, §7).** Loads this device's identity and refuses, before anything starts, a target that is
 this device: `--uri` whose `hub_id` is the own key, `--hub <own device id>`, or a `--hub` name that discovery
 resolves to the own device id ("that is this device's own hub ..."). A typed `--to <own address>` is caught only by

@@ -253,6 +253,15 @@ class SenderStatusDto {
   /// Capture level, dBFS (-120 = silence).
   final double levelDb;
 
+  /// Linear gain the hub applies to this stream (1.0 = unchanged; set on the hub).
+  final double hubGain;
+
+  /// The hub muted this stream: it is not heard there although it is sent.
+  final bool hubMuted;
+
+  /// The hub made this stream a priority source (it ducks the others).
+  final bool hubPriority;
+
   const SenderStatusDto({
     required this.state,
     this.error,
@@ -261,6 +270,9 @@ class SenderStatusDto {
     required this.lossPct,
     required this.rttMs,
     required this.levelDb,
+    required this.hubGain,
+    required this.hubMuted,
+    required this.hubPriority,
   });
 
   @override
@@ -271,7 +283,10 @@ class SenderStatusDto {
       bitrate.hashCode ^
       lossPct.hashCode ^
       rttMs.hashCode ^
-      levelDb.hashCode;
+      levelDb.hashCode ^
+      hubGain.hashCode ^
+      hubMuted.hashCode ^
+      hubPriority.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -284,5 +299,8 @@ class SenderStatusDto {
           bitrate == other.bitrate &&
           lossPct == other.lossPct &&
           rttMs == other.rttMs &&
-          levelDb == other.levelDb;
+          levelDb == other.levelDb &&
+          hubGain == other.hubGain &&
+          hubMuted == other.hubMuted &&
+          hubPriority == other.hubPriority;
 }

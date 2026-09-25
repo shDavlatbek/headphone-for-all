@@ -35,6 +35,7 @@ class _MockRustLibApi implements RustLibApi {
     port: 1,
     deviceName: 'Mock',
     sourceCount: 0,
+    advertised: true,
   );
 
   @override
@@ -62,6 +63,7 @@ class _MockRustLibApi implements RustLibApi {
       'crateApiHubHubStartPairing' => Future.value(
         const PairingInfoDto(pin: '1', token: 't', uri: 'u', expiresAtUnix: 0),
       ),
+      'crateApiHubHubPairingStatus' => Future<PairingInfoDto?>.value(),
       'crateApiHubHubEvents' => Stream<HubEventDto>.value(
         const HubEventDto.error(message: 'e'),
       ),
@@ -155,6 +157,7 @@ void main() {
             {#gain: 2.0},
           ),
           (api.hubStartPairing, 'crateApiHubHubStartPairing', {}),
+          (api.hubPairingStatus, 'crateApiHubHubPairingStatus', {}),
           (api.hubCancelPairing, 'crateApiHubHubCancelPairing', {}),
         ];
     for (final (call, name, args) in expectations) {
