@@ -57,15 +57,28 @@ indigo and headphone shape.
 first page offers "install for all users"). It installs the whole Flutter release folder
 (`build\windows\x64\runner\Release`: `headphone_for_all.exe`, `flutter_windows.dll`, `hfa_ffi.dll`, the
 plugin DLLs and `data\`) plus the MSVC runtime DLLs, and creates a Start-menu shortcut (optional desktop
-shortcut and "start when I sign in"), all carrying the app's AppUserModelID. The sign-in shortcut passes
-`--autostart`, so the app starts hidden in the tray instead of opening its window at every sign-in. With an all-users install it
-can add an inbound Windows Firewall rule for the program on **private** networks, which a hub needs
-(without it Windows asks the first time the hub listens). A running app is quit before files are
+shortcut and "start in the notification area when I sign in"), all carrying the app's AppUserModelID. The
+sign-in shortcut passes `--autostart`, so the app starts hidden in the tray instead of opening its window
+at every sign-in. It only starts the app: the hub is not switched on by itself (there is no "start the hub
+at launch" setting yet), which is why the task says "switch the hub on from there". With an all-users
+install it can add an inbound Windows Firewall rule for the program on **private** networks, which a hub
+needs.
+
+Firewall notes (the rule is private-only on purpose; a Public-profile rule is not offered):
+- Windows 11 puts a newly joined Wi-Fi on the **Public** profile. The private-only rule does not apply
+  there, so the hub is not reachable from other devices until the network is set to Private (Settings →
+  Network & internet → the network → Network profile type → Private), or Windows' own prompt is answered.
+- Without a rule (the default per-user install) Windows asks the first time the hub listens. Allowing
+  needs administrator rights; when a **standard user** is prompted, Windows creates *block* rules, and
+  senders then cannot connect. An administrator can remove those rules (Windows Defender Firewall →
+  Allow an app…, or `wf.msc`) or reinstall for all users with the firewall option.
+- The hub listens on TCP and UDP port 47810; discovery uses mDNS (UDP 5353). A running app is quit before files are
 replaced or removed: Setup asks first (OK/Cancel; OK when silent or with `/SUPPRESSMSGBOXES`), Uninstall
 does it after the uninstall confirmation. Both post the registered `io.github.shdavlatbek.hfa.Quit` message
 to the main window (also when it is hidden in the tray), which quits at once, and wait up to 10 s for the
 single-instance mutex to go away. `AppMutex` stays as the fallback (for example an instance started as
-administrator, which a per-user Setup may not message); its message tells the user to use **Quit** in
+administrator, which a per-user Setup may not message; the runner gives the mutex a security descriptor
+that lets a non-elevated Setup open it for `SYNCHRONIZE`, so such an instance is still detected); its message tells the user to use **Quit** in
 the tray icon's menu, since closing the window only hides it there while the hub runs. The runner also
 exits on `WM_ENDSESSION`, so Restart Manager (`CloseApplications=yes`, sign-out) can close it. Uninstalling keeps the user data in
 `%APPDATA%\io.github.shdavlatbek\Headphone for All\` unless the user agrees to delete it. The minimum OS
