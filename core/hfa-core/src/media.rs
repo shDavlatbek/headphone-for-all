@@ -123,13 +123,18 @@ impl MediaSender {
     }
 
     /// Seals and sends one packet with the next sequence number. Returns `Ok(false)` if the
-    /// packet was dropped because the socket buffer is full (its `seq` is still consumed).
-    /// Never blocks and never allocates (the datagram buffer is reused).
+    /// packet was dropped because of a transient condition (its `seq` is still consumed; FEC
+    /// and the hub's jitter buffer cover the gap): the socket buffer is full (`EAGAIN`, or
+    /// `ENOBUFS`, which is how macOS/iOS and some Wi-Fi drivers report a full queue), or the
+    /// network is briefly unusable (host/network unreachable or down, host down, connection
+    /// refused, interrupted). Never blocks and never allocates (the datagram buffer is
+    /// reused).
     ///
     /// # Errors
     /// [`crate::CoreError::Proto`] (`FrameTooLarge`) if `payload` exceeds
-    /// [`MAX_MEDIA_PAYLOAD`] (nothing is consumed), sealing errors, non-`WouldBlock` socket
-    /// errors (the `seq` is consumed), or [`crate::CoreError::SequenceExhausted`] once
+    /// [`MAX_MEDIA_PAYLOAD`] (nothing is consumed), sealing errors, other socket errors (the
+    /// `seq` is consumed; e.g. a closed socket or an invalid destination — treat them as
+    /// fatal for the stream), or [`crate::CoreError::SequenceExhausted`] once
     /// `seq = u32::MAX` has been used (the sequence never wraps; start a new stream).
     pub fn send(&mut self, flags: u8, timestamp: u32, payload: &[u8]) -> Result<bool> {
         let stream_id = self.stream_id();
@@ -157,7 +162,7 @@ impl MediaSender {
         };
         match sent {
             Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) if is_transient_send_error(&e) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
@@ -166,6 +171,41 @@ impl MediaSender {
     pub fn next_seq(&self) -> Option<u32> {
         self.next_seq
     }
+}
+
+/// `true` for UDP send errors that only mean "this packet cannot go out right now" (see
+/// [`MediaSender::send`]).
+fn is_transient_send_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        e.kind(),
+        ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::NetworkDown
+            | ErrorKind::ConnectionRefused
+    ) {
+        return true;
+    }
+    // Codes the standard library does not categorize.
+    let Some(code) = e.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    let transient = code == libc::ENOBUFS || code == libc::EHOSTDOWN;
+    #[cfg(windows)]
+    let transient = {
+        const WSAENOBUFS: i32 = 10055;
+        const WSAEHOSTDOWN: i32 = 10064;
+        code == WSAENOBUFS || code == WSAEHOSTDOWN
+    };
+    #[cfg(not(any(unix, windows)))]
+    let transient = {
+        let _ = code;
+        false
+    };
+    transient
 }
 
 /// A standard-library handle to the same socket (a duplicated descriptor), non-blocking.
@@ -349,6 +389,58 @@ impl MediaDemux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_send_errors_drop_the_packet() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::NetworkDown,
+            ErrorKind::ConnectionRefused,
+        ] {
+            assert!(is_transient_send_error(&Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::InvalidInput,
+            ErrorKind::PermissionDenied,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(!is_transient_send_error(&Error::from(kind)), "{kind:?}");
+        }
+        #[cfg(unix)]
+        {
+            for code in [
+                libc::ENOBUFS,
+                libc::EHOSTDOWN,
+                libc::EAGAIN,
+                libc::EHOSTUNREACH,
+                libc::ENETUNREACH,
+                libc::ENETDOWN,
+            ] {
+                assert!(
+                    is_transient_send_error(&Error::from_raw_os_error(code)),
+                    "errno {code}"
+                );
+            }
+            for code in [libc::EBADF, libc::EINVAL, libc::EACCES] {
+                assert!(
+                    !is_transient_send_error(&Error::from_raw_os_error(code)),
+                    "errno {code}"
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            for code in [10035, 10055, 10064, 10065, 10051, 10050] {
+                assert!(
+                    is_transient_send_error(&Error::from_raw_os_error(code)),
+                    "WSA error {code}"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn sequence_never_wraps() {
