@@ -304,6 +304,9 @@ impl EngineManager {
             }
             app.settings.clone()
         };
+        // cpal's AAudio output panics without the context set by `NativeBridge.init`.
+        #[cfg(target_os = "android")]
+        crate::android::ensure_audio_context()?;
         let output = hfa_capture::open_output(&settings.output, OUTPUT_BUFFER_MS)?;
         let handle = block_on(
             &self.runtime,

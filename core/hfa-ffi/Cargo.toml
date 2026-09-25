@@ -39,6 +39,8 @@ flutter_rust_bridge = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { workspace = true }
+# cpal's AAudio output (the hub's headphone output) needs the Android context; see `android::init`.
+ndk-context = { workspace = true }
 
 # On Android and iOS there is no useful stderr: tracing events become `log` records (tracing's
 # `log` feature, used when no subscriber is installed), which flutter_rust_bridge's console

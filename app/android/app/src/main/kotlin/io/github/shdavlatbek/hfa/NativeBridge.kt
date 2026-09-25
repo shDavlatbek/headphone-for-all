@@ -1,12 +1,17 @@
 package io.github.shdavlatbek.hfa
 
+import android.content.Context
+
 /**
  * JNI entry points of the Rust core (`core/hfa-ffi/src/android.rs`, docs/CONTRACTS.md §8.1).
  *
  * `libhfa_ffi.so` is the same library flutter_rust_bridge loads through Dart FFI; loading it
  * again here only registers it with the JVM so these `external` functions resolve.
  *
- * Both functions return an `HFA_*` code ([io.github.shdavlatbek.hfa.capture.HfaCode]) and never
+ * [init] must run once per process before Dart opens an audio output (the hub, the output device
+ * list): [HfaApplication] calls it.
+ *
+ * The push functions return an `HFA_*` code ([io.github.shdavlatbek.hfa.capture.HfaCode]) and never
  * throw: `0` ok (also while the sender is still connecting), `-1` invalid argument (format
  * different from the feed registered by `sender_start`, array shorter than
  * `frames * channels`), `-4` unknown feed (no sender reads it: drop the audio), `-3` JNI
@@ -21,6 +26,14 @@ object NativeBridge {
         } catch (e: UnsatisfiedLinkError) {
             e.message ?: "UnsatisfiedLinkError"
         }
+
+    /**
+     * Gives the Rust core the `JavaVM` and [context] (pass the application context: it is kept
+     * for the life of the process), which cpal's AAudio output needs. Idempotent. Returns `0`
+     * ok, `-1` null context, `-3` JNI failure, `-5` caught panic.
+     */
+    @JvmStatic
+    external fun init(context: Context): Int
 
     /** Pushes [frames] frames of interleaved `f32` PCM in [-1, 1] from the start of [data]. */
     @JvmStatic

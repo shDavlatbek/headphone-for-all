@@ -119,6 +119,9 @@ pub fn update_settings(settings: SettingsDto) -> anyhow::Result<()> {
 
 /// Names of the available output devices (for `SettingsDto.output_device`).
 pub fn list_output_devices() -> anyhow::Result<Vec<String>> {
+    // cpal's AAudio device list panics without the context set by `NativeBridge.init`.
+    #[cfg(target_os = "android")]
+    crate::android::ensure_audio_context()?;
     Ok(hfa_capture::list_output_devices()?)
 }
 

@@ -109,6 +109,9 @@ objc2-core-foundation = "0.3.2"
 block2 = "0.6.2"
 # Android: JNI exports in hfa-ffi (same major as cpal's Android backend).
 jni = "0.22.4"
+# Android: the process-global JavaVM + Context that cpal's AAudio backend reads (hfa-ffi sets it
+# from `NativeBridge.init`). Same version as cpal's.
+ndk-context = "0.1.1"
 # Flutter <-> Rust bindings (hfa-ffi). Must equal the installed flutter_rust_bridge_codegen
 # version exactly (the generated code checks it at run time).
 flutter_rust_bridge = "=2.13.0"
