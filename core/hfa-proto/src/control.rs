@@ -461,8 +461,9 @@ pub fn decode_message(payload: &[u8]) -> Result<ControlMessage> {
 /// A length prefix above [`crate::MAX_CONTROL_FRAME`] means the stream is corrupt or hostile:
 /// it yields [`ProtoError::FrameTooLarge`] without ever allocating the announced length, and
 /// the decoder is then **poisoned** (framing is lost): buffered data is dropped, further input
-/// is ignored and every later `next()` returns the same error. The caller should close the
-/// connection.
+/// is ignored, and the error is returned exactly once; every later `next()` returns `None`, so
+/// a loop that logs and skips errors still terminates. After a drain, check
+/// [`FrameDecoder::is_poisoned`] (or [`FrameDecoder::poison_error`]) and close the connection.
 ///
 /// `Debug` prints only sizes, never buffered (possibly secret) bytes.
 #[derive(Default)]
@@ -502,6 +503,11 @@ impl FrameDecoder {
         self.poisoned.is_some()
     }
 
+    /// The fatal framing error that poisoned the decoder, if any.
+    pub fn poison_error(&self) -> Option<&ProtoError> {
+        self.poisoned.as_ref()
+    }
+
     fn poison(&mut self, err: ProtoError) -> ProtoError {
         self.buf = Vec::new();
         self.pos = 0;
@@ -522,10 +528,12 @@ impl fmt::Debug for FrameDecoder {
 impl Iterator for FrameDecoder {
     type Item = Result<ControlMessage>;
 
-    /// Returns the next complete message, or `None` if more bytes are needed.
+    /// Returns the next complete message, or `None` if more bytes are needed or the decoder
+    /// is poisoned.
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(err) = &self.poisoned {
-            return Some(Err(err.clone()));
+        if self.poisoned.is_some() {
+            // The fatal error was returned once; the stream is over.
+            return None;
         }
         let pending = &self.buf[self.pos..];
         let (prefix, rest) = pending.split_first_chunk::<FRAME_PREFIX_LEN>()?;
@@ -787,10 +795,12 @@ mod tests {
         assert!(dec.is_poisoned());
         assert_eq!(dec.buffered(), 0);
         assert!(dec.buf.capacity() < 1024, "announced length was allocated");
-        // Poisoned: later input is ignored, the error repeats.
+        // Poisoned: later input is ignored and the iterator has ended.
         dec.push(&encode_frame(&sample_messages()[0]).unwrap());
         assert_eq!(dec.buffered(), 0);
-        assert_eq!(dec.next(), Some(Err(err)));
+        assert_eq!(dec.next(), None);
+        assert_eq!(dec.next(), None);
+        assert!(dec.is_poisoned());
 
         let mut dec = FrameDecoder::new();
         dec.push(&u32::MAX.to_be_bytes());
@@ -798,6 +808,32 @@ mod tests {
             dec.next(),
             Some(Err(ProtoError::FrameTooLarge { len, .. })) if len == u32::MAX as usize
         ));
+    }
+
+    #[test]
+    fn poisoned_decoder_ends_error_skipping_loops() {
+        let good = encode_frame(&sample_messages()[0]).unwrap();
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.extend_from_slice(&good);
+        let mut dec = FrameDecoder::new();
+        dec.push(&bytes);
+        // A consumer that logs and skips errors must terminate.
+        let (mut oks, mut errs) = (0, 0);
+        for r in dec.by_ref() {
+            match r {
+                Ok(_) => oks += 1,
+                Err(_) => errs += 1,
+            }
+        }
+        assert_eq!((oks, errs), (1, 1));
+        assert!(dec.is_poisoned());
+        assert!(matches!(
+            dec.poison_error(),
+            Some(ProtoError::FrameTooLarge { .. })
+        ));
+        dec.push(&good);
+        assert_eq!(dec.by_ref().count(), 0);
     }
 
     #[test]
@@ -867,13 +903,10 @@ mod tests {
             let mut dec = FrameDecoder::new();
             for chunk in &chunks {
                 dec.push(chunk);
-                for _ in 0..(chunk.len() + 2) {
-                    match dec.next() {
-                        None => break,
-                        Some(Err(_)) if dec.is_poisoned() => break,
-                        Some(_) => {}
-                    }
-                }
+                // Every frame consumes at least its 4-byte prefix and a poisoned decoder
+                // ends, so a plain drain always terminates.
+                let n = dec.by_ref().count();
+                proptest::prop_assert!(n <= chunks.concat().len() / FRAME_PREFIX_LEN + 1);
             }
             let _ = decode_message(&chunks.concat());
         }
