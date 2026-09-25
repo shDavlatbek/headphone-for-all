@@ -277,7 +277,8 @@ impl EncoderThread {
                     timestamp: 0,
                     dtx: None,
                 });
-                // A capture that has been stalled for a while goes straight to DTX.
+                // `silent_for` and `last_input` carry over, so a capture that is already
+                // silent or stalled goes straight to DTX.
             }
             Err(error) => {
                 let _ = self.events.send(EncoderEvent::StreamFailed {

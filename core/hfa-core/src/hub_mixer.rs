@@ -26,9 +26,10 @@
 //! (`2 × MIX_FRAME_MS` + the output's latency) it produces one tick, otherwise it sleeps a
 //! quarter tick. The mix (48 kHz stereo) is converted to the output format (channel map,
 //! then resampling to the device rate if needed) and pushed. [`AudioOutput::has_error`] is
-//! polled every loop: a failed output is stopped and restarted every [`OUTPUT_RETRY`]
-//! (reported as [`HubEvent::Error`]); meanwhile the mixer keeps consuming the jitter buffers
-//! at wall-clock pace and discards the mix.
+//! polled every loop: a failed output is stopped (reported as [`HubEvent::Error`]) and
+//! restarted every [`OUTPUT_RETRY`] until that works (a failing restart is reported once per
+//! outage); meanwhile the mixer keeps consuming the jitter buffers at wall-clock pace and
+//! discards the mix.
 //!
 //! After warm-up a tick does not allocate (buffers are preallocated; the input list is a
 //! fixed array); packet payloads are freed here after decoding and a copy of the next packet
@@ -477,7 +478,7 @@ impl OutputStage {
                     self.sink = Some(sink);
                     self.retry_at = None;
                     self.configure();
-                    let _ = events.send(HubEvent::Error("the audio output was reopened".into()));
+                    tracing::info!(format = ?self.format, "audio output reopened");
                 }
                 Err(e) => {
                     self.retry_at = Some(now + OUTPUT_RETRY);
@@ -779,6 +780,152 @@ mod tests {
         drop(st);
         mix.fill();
         assert!(!shared.state.lock().reset_pending);
+    }
+
+    /// An output that records what it is given, for [`OutputStage`] tests.
+    struct FakeOutput {
+        format: AudioFormat,
+        source: Arc<Mutex<Option<hfa_capture::PcmSource>>>,
+        starts: Arc<AtomicU32>,
+        error: Arc<AtomicBool>,
+        fail_start: Arc<AtomicBool>,
+    }
+
+    impl AudioOutput for FakeOutput {
+        fn format(&self) -> AudioFormat {
+            self.format
+        }
+        fn start(&mut self, source: hfa_capture::PcmSource) -> hfa_capture::Result<()> {
+            if self.fail_start.load(Ordering::Relaxed) {
+                return Err(hfa_capture::CaptureError::Backend("unplugged".into()));
+            }
+            *self.source.lock() = Some(source);
+            self.starts.fetch_add(1, Ordering::Relaxed);
+            self.error.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+        fn stop(&mut self) {
+            *self.source.lock() = None;
+        }
+        fn latency_ms(&self) -> Option<f32> {
+            Some(5.0)
+        }
+        fn has_error(&self) -> bool {
+            self.error.load(Ordering::Relaxed)
+        }
+    }
+
+    struct Fake {
+        source: Arc<Mutex<Option<hfa_capture::PcmSource>>>,
+        starts: Arc<AtomicU32>,
+        error: Arc<AtomicBool>,
+        fail_start: Arc<AtomicBool>,
+    }
+
+    fn fake_stage(format: AudioFormat) -> (OutputStage, Fake) {
+        let fake = Fake {
+            source: Arc::new(Mutex::new(None)),
+            starts: Arc::new(AtomicU32::new(0)),
+            error: Arc::new(AtomicBool::new(false)),
+            fail_start: Arc::new(AtomicBool::new(false)),
+        };
+        let mut output = FakeOutput {
+            format,
+            source: Arc::clone(&fake.source),
+            starts: Arc::clone(&fake.starts),
+            error: Arc::clone(&fake.error),
+            fail_start: Arc::clone(&fake.fail_start),
+        };
+        let (sink, source) = output_ring(format);
+        output.start(source).expect("start");
+        let stage = OutputStage::new(Box::new(output), sink, Arc::new(AtomicU32::new(0)));
+        (stage, fake)
+    }
+
+    fn goertzel(x: &[f32], freq: f64, rate: f64) -> f64 {
+        let coeff = 2.0 * (2.0 * std::f64::consts::PI * freq / rate).cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &v in x {
+            let s0 = f64::from(v) + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        2.0 * (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt() / x.len() as f64
+    }
+
+    #[test]
+    fn output_stage_converts_to_the_device_format() {
+        let (mut stage, fake) = fake_stage(AudioFormat::new(44_100, 1));
+        // Fill target: 2 ticks + 5 ms of device latency = 25 ms at 44.1 kHz.
+        assert_eq!(stage.target_frames, 1102);
+        assert!(stage.needs_audio());
+        let mut tone = SineGenerator::new(441.0, 0.25, AudioFormat::INTERNAL);
+        let mut mix = vec![0.0; MIX_SAMPLES];
+        let mut out = Vec::new();
+        let mut buf = vec![0.0; 44_100];
+        for _ in 0..100 {
+            tone.fill(&mut mix);
+            stage.write(&mix);
+            let mut guard = fake.source.lock();
+            let src = guard.as_mut().expect("started");
+            let n = src.available();
+            src.pull(&mut buf[..n]);
+            out.extend_from_slice(&buf[..n]);
+        }
+        // 1 s of 48 kHz mix → about 1 s at 44.1 kHz (minus the resampler's delay).
+        assert!((43_500..=44_100).contains(&out.len()), "{}", out.len());
+        let tail = &out[out.len() - 4410..];
+        let amp = goertzel(tail, 441.0, 44_100.0);
+        assert!((amp - 0.25).abs() < 0.02, "amplitude {amp}");
+    }
+
+    #[test]
+    fn output_stage_maps_stereo_to_more_channels() {
+        let (mut stage, fake) = fake_stage(AudioFormat::new(48_000, 4));
+        let mix: Vec<f32> = (0..MIX_SAMPLES)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.25 })
+            .collect();
+        stage.write(&mix);
+        let mut guard = fake.source.lock();
+        let src = guard.as_mut().expect("started");
+        assert_eq!(src.available(), MIX_FRAMES * 4);
+        let mut buf = vec![0.0; MIX_FRAMES * 4];
+        src.pull(&mut buf);
+        assert!(buf.chunks_exact(4).all(|f| f == [0.5, -0.25, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn a_failed_output_is_restarted() {
+        let (mut stage, fake) = fake_stage(AudioFormat::INTERNAL);
+        let (events, mut rx) = broadcast::channel(8);
+        let t0 = Instant::now();
+        stage.check_health(t0, &events);
+        assert!(stage.is_up());
+        assert_eq!(fake.starts.load(Ordering::Relaxed), 1);
+
+        // The device goes away and cannot be reopened yet.
+        fake.error.store(true, Ordering::Relaxed);
+        fake.fail_start.store(true, Ordering::Relaxed);
+        stage.check_health(t0, &events);
+        assert!(!stage.is_up());
+        assert!(
+            fake.source.lock().is_none(),
+            "the failed output was stopped"
+        );
+        assert!(matches!(rx.try_recv(), Ok(HubEvent::Error(m)) if m.contains("failed")));
+        assert!(matches!(rx.try_recv(), Ok(HubEvent::Error(m)) if m.contains("cannot reopen")));
+        // Retries are spaced and reported once.
+        stage.check_health(t0 + Duration::from_millis(100), &events);
+        stage.check_health(t0 + OUTPUT_RETRY + Duration::from_millis(1), &events);
+        assert!(rx.try_recv().is_err());
+        assert!(!stage.is_up());
+
+        // It comes back.
+        fake.fail_start.store(false, Ordering::Relaxed);
+        stage.check_health(t0 + OUTPUT_RETRY * 3, &events);
+        assert!(stage.is_up());
+        assert_eq!(fake.starts.load(Ordering::Relaxed), 2);
+        assert!(rx.try_recv().is_err(), "recovery is not an error");
     }
 
     #[test]
