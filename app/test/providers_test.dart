@@ -298,7 +298,13 @@ void main() {
         state = c.read(senderControllerProvider);
         expect(state.status.state, 'streaming');
         expect(fake.lastSenderStart!.pairingSecret, '123456');
-        expect(state.target?.pairingSecret, '123456');
+        // Paired now: the one-time PIN is dropped and the hub is trusted.
+        expect(state.target?.pairingSecret, isNull);
+        expect(state.target?.trusted, isTrue);
+        expect(
+          fake.trusted.map((p) => p.deviceId),
+          contains(strangerHub.deviceId),
+        );
       },
     );
 
@@ -429,6 +435,29 @@ void main() {
         expect(c.read(senderControllerProvider).broadcasting, isFalse);
       },
     );
+
+    test('iOS: a hub typed by address must be paired first', () async {
+      final fake = FakeHfaApi(platform: 'ios');
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.manual(host: '10.0.0.9'));
+      await sender.start();
+      var state = c.read(senderControllerProvider);
+      expect(state.error, contains('Pair with this hub first'));
+      expect(state.needsPin, isTrue);
+      expect(native.lastBroadcastConfig, isNull);
+
+      // With the PIN it pairs and learns the hub's id from the trust store.
+      await sender.start(pin: '222333');
+      state = c.read(senderControllerProvider);
+      expect(state.error, isNull);
+      expect(native.lastBroadcastConfig?.hubHost, '10.0.0.9');
+      expect(native.lastBroadcastConfig?.hubDeviceId, 'hub-10.0.0.9');
+      expect(state.target?.deviceId, 'hub-10.0.0.9');
+      expect(state.target?.trusted, isTrue);
+    });
 
     test('iOS: a failed pairing does not write the config', () async {
       final fake = FakeHfaApi(platform: 'ios', connectAutomatically: false);

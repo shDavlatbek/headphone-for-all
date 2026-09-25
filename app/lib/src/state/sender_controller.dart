@@ -97,6 +97,9 @@ class SenderController extends Notifier<SenderState> {
   StreamSubscription<NativeEvent>? _nativeSub;
   bool _nativeCapture = false;
 
+  /// iOS pairing run in progress (its target is updated when it ends).
+  bool _pairingOnly = false;
+
   HfaApi get _api => ref.read(hfaApiProvider);
   NativeChannel get _native => ref.read(nativeChannelProvider);
 
@@ -122,7 +125,17 @@ class SenderController extends Notifier<SenderState> {
 
   void _onStatus(SenderStatusDto status) {
     if (!ref.mounted) return;
-    state = state.copyWith(status: status, error: state.error);
+    final target = state.target;
+    // Connected with a PIN or token: the hub is paired now and the one-time
+    // secret is spent, so a later start must not send it again.
+    final paired =
+        status.state == 'streaming' &&
+            target != null &&
+            target.pairingSecret != null &&
+            !_pairingOnly
+        ? target.asPaired()
+        : null;
+    state = state.copyWith(status: status, target: paired, error: state.error);
     if (_nativeCapture && !liveSenderStates.contains(status.state)) {
       // The engine ended by itself (failed / stopped): stop the capture too.
       _nativeCapture = false;
@@ -220,24 +233,53 @@ class SenderController extends Notifier<SenderState> {
 
   /// iOS: makes sure the hub trusts us (pairing through a short-lived
   /// sender when a secret is at hand), then hands the hub to the extension.
+  ///
+  /// The extension never pairs and needs the hub's key or a trusted device
+  /// id (CONTRACTS.md §8.5), so a hub typed in by address is identified
+  /// after pairing by the device the pairing added to the trust store.
   Future<void> _prepareBroadcast(HubTarget target, SourceChoice source) async {
+    var deviceId = target.deviceId;
+    final identified =
+        target.hubKey != null || (deviceId != null && target.trusted);
+    if (target.pairingSecret == null && !identified) {
+      throw const HfaApiException(
+        'Pair with this hub first: enter the PIN shown on it.',
+      );
+    }
     if (target.pairingSecret != null) {
+      final before = {for (final p in await _api.trustedPeers()) p.deviceId};
       final result = await _pairOnce(target, source);
       if (result.state != 'streaming') {
         throw HfaApiException(result.error ?? 'Pairing with the hub failed.');
+      }
+      if (deviceId == null && target.hubKey == null) {
+        final added = [
+          for (final p in await _api.trustedPeers())
+            if (!before.contains(p.deviceId)) p.deviceId,
+        ];
+        if (added.length != 1) {
+          throw const HfaApiException(
+            'Paired, but the hub could not be identified. Pick it from the '
+            'list of hubs and try again.',
+          );
+        }
+        deviceId = added.single;
       }
     }
     await _native.writeBroadcastConfig(
       BroadcastConfig(
         hubHost: target.host,
         hubPort: target.port,
-        hubDeviceId: target.deviceId,
+        hubDeviceId: deviceId,
         hubKey: target.hubKey,
         label: ref.read(appInfoProvider).deviceName,
       ),
     );
     if (!ref.mounted) return;
-    state = state.copyWith(target: target.withPin(null), broadcastReady: true);
+    state = state.copyWith(
+      target: target.asPaired(deviceId: deviceId),
+      broadcastReady: true,
+    );
   }
 
   /// Runs a sender on an empty external feed until it streams (paired and
@@ -248,6 +290,7 @@ class SenderController extends Notifier<SenderState> {
   ) async {
     final outcome = Completer<SenderStatusDto>();
     var first = true;
+    _pairingOnly = true;
     final sub = _api.senderEvents().listen((status) {
       // The first event is the status before this start.
       if (first) {
@@ -279,6 +322,7 @@ class SenderController extends Notifier<SenderState> {
     } finally {
       await sub.cancel();
       await _quietly(_api.senderStop);
+      _pairingOnly = false;
     }
   }
 

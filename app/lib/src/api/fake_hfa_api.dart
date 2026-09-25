@@ -639,6 +639,16 @@ class FakeHfaApi implements HfaApi {
       return;
     }
     if (!connectAutomatically) return;
+    if (!known) {
+      // Paired with the PIN/token: the core saves the hub as trusted.
+      trusted.add(
+        TrustedPeerDto(
+          deviceId: hubId ?? 'hub-${request.hubHost}',
+          name: hubName,
+          pairedAtUnix: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        ),
+      );
+    }
     emitSenderStatus(
       SenderStatusDto(
         state: 'streaming',

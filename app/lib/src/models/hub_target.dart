@@ -132,6 +132,19 @@ class HubTarget {
     platform: platform,
   );
 
+  /// A copy after a successful pairing: trusted, the one-time secret
+  /// dropped, and [deviceId] filled in when it was learnt.
+  HubTarget asPaired({String? deviceId}) => HubTarget(
+    name: name,
+    origin: origin,
+    host: host,
+    port: port,
+    deviceId: deviceId ?? this.deviceId,
+    hubKey: hubKey,
+    trusted: true,
+    platform: platform,
+  );
+
   /// The start request for [source] with [label].
   SenderStartDto toRequest(CaptureSourceDto source, {String label = ''}) {
     return SenderStartDto(
