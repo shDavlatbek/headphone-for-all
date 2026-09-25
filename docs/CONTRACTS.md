@@ -1032,6 +1032,88 @@ flutter build windows | macos | ios   # on the matching OS (CI)
 Clean up after local builds: `rm -rf app/build app/.dart_tool/flutter_build app/android/.gradle app/android/app/build`
 (cargokit puts its own Rust target directory under `app/build`).
 
+### 8.7 Refinements made by `feat/app` (the code in `app/lib` is authoritative)
+
+**Dart layout (extends §8.2).** `lib/main.dart`; `lib/src/app.dart` (`HfaApp`, `AppShell`: `NavigationRail` from
+640 px, else `NavigationBar`; Material 3 light/dark from one seed); `lib/src/bootstrap.dart` (startup, splash,
+`InitErrorApp`); `lib/src/api/` (`HfaApi`, `RustHfaApi`, `FakeHfaApi`); `lib/src/models/` (`HubTarget`,
+`SourceChoice`); `lib/src/state/` (Riverpod 3 providers); `lib/src/platform/` (`native_channel.dart`,
+`desktop_integration.dart`); `lib/src/screens/` (home, hub, pairing sheet, sender, QR scan, settings, about);
+`lib/src/widgets/`; `lib/src/util/format.dart`; `assets/tray_icon.png`.
+
+**Dependencies** (`app/pubspec.yaml`): `flutter_riverpod` ^3.4.3, `qr_flutter` ^4.1.0, `mobile_scanner` ^7.4.2
+(used on Android/iOS only), `tray_manager` ^0.7.0 + `window_manager` ^0.5.2 (used on desktop only).
+- `tray_manager` 0.7 is built on `nativeapi` / **`cnativeapi`, an FFI plugin that declares Android, iOS, Linux,
+  macOS and Windows**: every platform build compiles its C++ core (CMake), mobile included, although only desktop
+  code calls it. Linux needs GTK 3, X11 and Xi dev files (no `libayatana-appindicator` any more); the Linux tray is
+  a StatusNotifierItem over D-Bus (GNOME needs the AppIndicator extension; without a session bus the icon is
+  simply missing and the app keeps working).
+- `mobile_scanner` needs the camera permission: Android's comes from the plugin manifest; **iOS needs
+  `NSCameraUsageDescription` in `ios/Runner/Info.plist` (feat/apple)**. macOS links the plugin but never opens
+  the camera.
+- `flutter pub get` regenerates the desktop plugin registrants (`app/linux/flutter/*`, `app/windows/flutter/*`,
+  `app/macos/Flutter/GeneratedPluginRegistrant.swift`); those tool-generated files are committed on `feat/app`.
+
+**Startup** (`main.dart`): `WidgetsFlutterBinding` → desktop only: `windowManager.ensureInitialized()` +
+`setPreventClose(true)` → `SplashApp` → `RustLib.init()` (once; skipped in demo mode) → data dir =
+`NativeChannel.getDataDir()` or `<getApplicationSupportDirectory()>/hfa` → `initApp(dataDir, deviceName)` where
+`deviceName` is `null` on desktop and, on Android/iOS, the host name unless it is `localhost` (then
+"Android device" / "iOS device") → `runApp(ProviderScope(retry: never, overrides: api, native channel, AppInfo))`.
+Any failure (including a Rust panic) shows `InitErrorApp` with the message and "Try again".
+**Demo mode:** `flutter run --dart-define=HFA_FAKE=true` runs the whole UI on `FakeHfaApi.demo()` (no Rust).
+
+**`HfaApi`** mirrors the generated functions one to one (positional arguments for ids/values, e.g.
+`hubSetGain(streamId, gain)`), throws the core's errors unchanged; `describeError` shows `AnyhowException.message`
+(first line) and `PanicException` without the appended Rust backtrace. `idleSenderStatus` is the `idle` DTO.
+
+**Platform channel (Dart side of §8.3).** `NativeChannel` returns `null` / `false` / no-op on
+`MissingPluginException` (so macOS may also answer `notImplemented` for the methods it does not need);
+`PlatformException`s propagate. The **event channel is only listened to on Android and iOS, and only after a
+method call proved the native side exists** — listening to an unregistered `EventChannel` makes Flutter report a
+`MissingPluginException` as an error. Unknown event `type`s are ignored.
+
+**Behaviour the native work packages can rely on.**
+- Hub: `startHubService` is awaited **before** `hubStart` (a failed start calls `stopHubService`);
+  `stopHubService` after `hubStop`. Discovery: `acquireMulticastLock` when the sender screen starts browsing,
+  `releaseMulticastLock` (+ `stopDiscovery`) when it is left; the hub service's own lock is independent.
+- Android sender ("This device's audio"): `senderStart(External{feedId: 1, sampleRate: 48000, channels: 2})`,
+  then `startSystemCapture({feedId: 1, sampleRate: 48000, channels: 2})`; `false` → `senderStop` and an
+  explanation. Stop: `stopSystemCapture` then `senderStop`. A `captureStopped` / `captureError` event while
+  capturing → `senderStop` and the message is shown; a sender that fails or stops by itself also triggers
+  `stopSystemCapture`. The test tone is available on Android and iOS too (Rust generates it).
+- iOS sender ("Screen broadcast"): the app pairs **before** writing the config when a PIN/token is at hand — it
+  runs `senderStart(External{feedId: 2, 48000, 2})` with the secret (nothing is pushed), waits up to 20 s for
+  `streaming` (paired) or `failed`/`stopped`, then `senderStop`. A hub typed in by address gets its device id
+  from the peer that pairing added to `trustedPeers()`. Without a key or trusted id the app asks for the PIN.
+  Then `writeBroadcastConfig({hubHost, hubPort, hubDeviceId, hubKey, label: <device name>})` and the
+  `hfa/broadcast_picker` `UiKitView` (no creation params) is shown; `broadcastStarted` / `broadcastFinished`
+  events drive the "Broadcasting" state (`broadcastFinished.message`, if any, is shown as an error).
+- Desktop: tray icon (Show/Hide window, Hub on/off checkbox, Quit; left click toggles the window on
+  Windows/Linux); closing the window hides it to the tray while the hub runs or a sender is live, otherwise (or
+  without a tray) it stops sender and hub and quits. Quit always stops both (3 s timeout each).
+
+**UI semantics.**
+- Hub sources: `hubEvents` (subscribed once for the app's lifetime) + `hubSources` every second while running,
+  merged by `stream_id` keeping arrival order. Mixer controls are optimistic and reverted if the core refuses.
+  Sliders offer 0–200 % (the core accepts up to 400 %); the master gain is remembered while the hub is stopped and
+  applied after `hubStart`. After `forget_peer` or saving settings with the hub running, a snack bar offers
+  "Restart hub" (the §8.5 trust-store limitation).
+- Pairing sheet: `hubStartPairing` on open, `hubCancelPairing` when closed; `PairingFailed` keeps the PIN visible
+  with the reason (the window stays open for up to 5 attempts); `PairingCompleted` shows success; the countdown
+  uses `expires_at_unix` and offers "New PIN" at 0.
+- Sender targets: discovered hubs (first address + port + `hub_device_id`; this device's own id is hidden),
+  trusted peers not currently discovered (empty host = discover by id), "Add by address" (host, optional port and
+  PIN), QR scan on Android/iOS and a pasted pairing link on desktop (`parsePairingUri` → `hub_key` + `token` as
+  `pairing_secret`). An untrusted discovered hub asks for the PIN before starting; a `failed` status or error
+  mentioning pairing offers "Enter PIN" and retries. After a start that reached `streaming` with a PIN/token the
+  target is marked trusted and the one-time secret is dropped.
+- Sources from `CapabilitiesDto`: `external_only` → Android "This device's audio" / iOS "Screen broadcast";
+  `system_mix` → System and System except this app; `per_app` → "One app" (`listCaptureApps`, label = app
+  name); always "Test tone (440 Hz)". `mutes_local_output` adds a warning.
+- Settings: device name (1–64), bitrate (64–320 kbit/s presets plus the saved value), frame 10/20 ms, FEC, jitter
+  range slider (5–500 ms, widened to the saved values), port (empty = 0 = any), output device on desktop
+  (`null` = system default), trusted devices with "Forget" (confirmation).
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |
