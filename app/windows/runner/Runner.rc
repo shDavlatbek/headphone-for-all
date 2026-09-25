@@ -89,11 +89,17 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
+            // CompanyName and ProductName also name the data directory:
+            // path_provider's getApplicationSupportDirectory() is
+            // %APPDATA%\<CompanyName>\<ProductName>, and the app keeps its
+            // settings, identity and pairings in its "hfa" subfolder.
+            // Changing either value moves (and so loses) that data.
+            VALUE "Comments", "Hear every device in one headphone at the same time." "\0"
             VALUE "CompanyName", "io.github.shdavlatbek" "\0"
             VALUE "FileDescription", "Headphone for All" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "headphone_for_all" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 io.github.shdavlatbek. All rights reserved." "\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 headphone-for-all contributors. MIT OR Apache-2.0." "\0"
             VALUE "OriginalFilename", "headphone_for_all.exe" "\0"
             VALUE "ProductName", "Headphone for All" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
