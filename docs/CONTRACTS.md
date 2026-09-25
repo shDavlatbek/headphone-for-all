@@ -789,6 +789,116 @@ Modules:
   Verified in the container: advertise + browse + goodbye over real multicast (`tests/net_discovery.rs`, not ignored).
 - `hfa-core/Cargo.toml`: added `zeroize` (workspace dep) for wiping key material read from/written to disk.
 
+### 6.3 Refinements made by `feat/core-engine` (the code and module docs in `core/hfa-core/src/{sender,sender_encoder,sender_adapt,hub,hub_mixer,payload,netsim}.rs` are authoritative)
+
+- **Media payload container (wire contract, `payload.rs`).** A `FLAG_DTX` datagram carries an **empty** payload.
+  Every other media payload is `count: u8 (≥ 1)` then `count × (len: u16 BE ≥ 1, Opus packet)`. Entry 0 is the frame
+  of the datagram's `seq`; entry 1, present **only when `FLAG_FEC` is set**, is a redundant copy of the previous
+  frame (`seq − 1`); further entries are reserved (ignored, but the container must be well formed; trailing bytes →
+  malformed). A container must fit `MAX_MEDIA_PAYLOAD`; a sender that cannot fit the copy sends the packet without it
+  (and without `FLAG_FEC`). API: `payload::{write(primary, redundant, &mut Vec<u8>) -> bool, parse(&[u8]) ->
+  Option<MediaPayload{primary, redundant}>, fits, encoded_len}` (no allocation when the `Vec` has capacity).
+  **Hub recovery order** for `Pop::Missing{next: Some(n)}`: decode `n`'s redundant entry (full recovery) → Opus
+  in-band FEC from `n`'s primary if `packet_has_fec` → PLC. A malformed container or undecodable packet is concealed.
+- **Redundancy / adaptation (sender, `sender_adapt.rs`).** Driven by `Stats.loss_pct`: redundancy on as soon as
+  loss > 2 %, off after 10 s continuously below 0.5 %; Opus expected loss = the rounded loss, capped at 30 %;
+  bitrate −25 % per report once **two consecutive** reports exceed 10 % (one bad second is a burst, not congestion),
+  floor `min(48 kbit/s, configured bitrate)`; after 10 s below 1 % it climbs back by 10 % per 10 s up to the
+  configured bitrate. The adaptation state survives reconnects. `Stats.recommended_bitrate` is sent as 0 (none).
+- **`Stats.loss_pct` = network loss** (jitter-buffer `lost` frames, i.e. before redundancy/FEC recovery), so enabling
+  redundancy does not hide the loss and switch itself off again. **`StreamStats.loss_pct` = loss left after
+  recovery.** Both are measured over an interval of at least 40 frames (a shorter one is extended; an interval with
+  no frames at all, e.g. DTX, reports 0). `StreamStats.latency_ms = jitter target + stream frame + output ring
+  fill target + the output's whole latency` (re-read every second, see the mixer thread); `level_db` is post-gain
+  RMS (silence when muted or inactive).
+- **DTX (both sides).** Sender: a frame is silent when its peak is below −70 dBFS; after more than 200 ms of silence
+  **or of a capture delivering nothing** (e.g. WASAPI loopback while nothing plays — never a timing break) it stops
+  sending audio and sends a `FLAG_DTX` keep-alive immediately and then every 100 ms; the media timestamp follows the
+  wall clock during DTX. The first non-silent frame resumes at once with a **fresh encoder** and **`FLAG_RESET`**
+  (no redundancy on that packet). Hub: keep-alives are **not** pushed into the jitter buffer; they only refresh the
+  stream's activity (so a silent sender stays `active`). A `FLAG_RESET` packet — or the first audio packet after
+  keep-alives once the buffer has drained (in case the reset packet was lost) — calls `jb.reset_at(seq)`, so the
+  keep-alives' sequence numbers are not counted as loss; the mixer then resets the decoder, the resampler and the
+  stream FIFO before the next frame. **Deviation from the §4.2 recipe:** the `DriftController` is *not* reset (it
+  describes the two clocks, like the jitter estimate describes the network).
+- **Sender engine.** `SenderEngine::start` also starts the capture (into `pcm_ring_with_channels(500 ms,
+  format.channels)`) and the encoder thread, so it additionally fails with `Capture(..)` or `Config` (empty host,
+  port 0, zero capture format). The encoder thread (`hfa-encoder`) owns the capture for the sender's whole life
+  (reconnects never restart it) and sleeps `frame_ms / 4` when no input is available. Timing constants (pub):
+  `INITIAL_BACKOFF = 1 s`, `MAX_BACKOFF = 30 s` (doubling; back to 1 s after a session that streamed),
+  `STREAM_ACCEPT_TIMEOUT = 10 s`, `PING_INTERVAL = 1 s`, `HUB_TIMEOUT = 6 s` (nothing received → reconnect),
+  `DISCOVER_TIMEOUT = 5 s`. `PairingRequired`, `PairingFailed` and `KeyMismatch` are final (`Failed(reason)`,
+  capture stopped); everything else (I/O, timeouts, `Rejected`, hub `Bye`/`StreamStop`, fatal media send errors,
+  `HubNotFound`) reconnects with a **new `stream_id` (random, non-zero) and key**. After the first connection the
+  hub key is **pinned** for all reconnects (`Discover` then looks up that device id), and the pairing secret is
+  dropped after a successful pairing (one-time). `Discover` by name waits up to 1 s more for a trusted hub after an
+  untrusted match; a trusted match (or any match by id) is taken at once and its stored key is passed as
+  `expected_hub_key`. `Direct` hosts resolve with `lookup_host`, preferring IPv4. `SenderEvent::Status` once per
+  second while streaming (and once at the end); `SenderHandle::status()` has a live `level_db` (RMS of the last
+  captured frame; `SILENCE_DB` once stopped/failed, and while the capture has delivered nothing for more than the
+  200 ms DTX delay); `rtt_ms` from `Ping`/`Pong`; `loss_pct` = the hub's network loss. `SenderEvent::HubControl`
+  reflects the **current stream**: the controls the hub announces before `StreamAccepted` replace those of any
+  earlier stream (one event if that changes what was shown, e.g. after a hub restart forgot a mute). Extra: **`SenderHandle::packets_sent() -> (audio, keepalives)`**, `Debug` for `SenderHandle`; dropping the
+  handle stops the sender in the background.
+- **`sender::open_capture(&CaptureTarget) -> Result<(Box<dyn CaptureSource>, Option<String>)>`** (new): CLI and
+  FFI should open sender captures with it. On macOS a `Backend` error for `SystemMixExcludingSelf` falls back to
+  `SystemMix` and returns a warning the caller must show (the engine's events cannot be subscribed to before it
+  exists); every other target/error passes through.
+- **Hub engine.** TCP and UDP are bound on **IPv4 `0.0.0.0`** (IPv6 is not served). A taken port →
+  `Io("TCP|UDP port N is already in use (is another hub running?) …")`; port 0 retries until a number is free for
+  both. `MAX_STREAMS = 16`. **Connection limits** (pub consts): a new connection must send its first handshake
+  byte within `FIRST_MESSAGE_TIMEOUT = 5 s`; at most `MAX_PENDING_PER_IP = 4` handshakes per IP address run at once
+  (more are closed at once); when `MAX_PENDING_HANDSHAKES = 16` are running, the **oldest** pending one is dropped
+  for the newcomer; authenticated connections (at most `MAX_CONNECTIONS = 64`, more are closed) do not count against
+  the handshake budget; an authenticated connection that owns no stream for `NO_STREAM_TIMEOUT = 30 s` is closed
+  with `Bye("no stream started for 30 s")`. UDP is received into a 64 KiB buffer (datagrams over `MAX_DATAGRAM` are
+  dropped; per-datagram receive errors never pause the loop, only > 100 in a row pause it 10 ms). `StreamStart` is
+  rejected
+  (`StreamRejected{reason}`) unless 48000 Hz, 2 channels, `frame_ms` ∈ {10, 20}, a 32-byte key, fewer than 16
+  streams and an unused stream id; labels are sanitized (empty → "Audio"). A connection may only stop its own
+  streams. Jitter buffer per stream: `min/max_target_ms` from the settings, initial 40 ms (clamped), capacity
+  `max(64, max_target / frame + 16)`. Controls (`set_gain/muted/priority`) are remembered per device id for the
+  hub's lifetime and re-applied when a device reconnects. **Every accepted stream** is answered with
+  `SetVolume`, `SetMute`, `SetPriority` (the defaults or the remembered values) **followed by** `StreamAccepted`.
+  A control change updates the source list, the remembered value, the mixer and the sender under one lock, so
+  concurrent calls reach all of them in the same order. `set_gain` with a non-finite gain → `Config`; `set_master_gain` ignores
+  non-finite values. A stream without datagrams for `REMOVE_AFTER` is removed and its connection closed with
+  `Bye("no media received for 30 s")` (the sender reconnects). `SourceUpdated` for every source once per
+  `STATS_INTERVAL`, plus on every control change. `HubHandle::stop` closes connections with `Bye("hub stopping")`
+  (waits ≤ 5 s), then stops the mixer thread, which stops the output; dropping the handle stops everything in the
+  background. mDNS failures are logged, not fatal.
+- **Mixer thread (`hub_mixer.rs`).** Ticks are always **10 ms at 48 kHz stereo** (streams with 20 ms frames decode
+  every other tick); the drift controller is updated every tick with `dt = 10 ms`. Pacing: produce ticks while the
+  output ring holds less than `2 × 10 ms + min(output latency, 40 ms) + extra` (20 ms assumed if unknown), at most
+  50 per wake, else sleep 2.5 ms. Every second the output's latency (measured by the backend once it runs) and the
+  ring's underrun counter (`PcmSource::stats`) are re-read; an underrun since the last check adds 10 ms of `extra`
+  (up to 200 ms; it never shrinks). Only 40 ms of the output latency are buffered in the ring because the rest (e.g.
+  a Bluetooth link) happens after the device pulled the audio; large device periods are covered by `extra`. Output ring: 500 ms, `pcm_ring_with_channels(.., output.format().channels)`. Conversion to the output
+  format: stereo → mono `(L+R)/2`, stereo → n > 2 channels `L, R, 0, …`, then a `StreamResampler` 48 kHz → device
+  rate. **Output failure:** on `has_error()` the output is stopped (`HubEvent::Error("the audio output failed;
+  reopening it")`) and `start`ed again on a fresh ring every `OUTPUT_RETRY = 2 s` (one `HubEvent::Error` per outage
+  if that fails); meanwhile the streams are consumed at wall-clock pace and the mix is discarded. An output whose
+  `restartable()` is `false` (WAV: `start` truncates the file) is stopped (finalizing the file) and reported once
+  (`"the audio output failed and is not reopened …"`), never restarted.
+- **Cross-crate addition (`hfa-capture`, made by `feat/core-engine`):** `AudioOutput::restartable(&self) -> bool`,
+  default `true`; `WavFileOutput` returns `false`. Backward compatible (default method).
+- **New diagnostics API:** `HubHandle::stream_counters(stream_id) -> Option<StreamCounters>` with cumulative
+  `StreamCounters { datagrams, keepalives, resets, played, lost, late, duplicates, recovered_redundancy,
+  recovered_fec, concealed, stretched, underruns }` (serde; `underruns` counts ticks where a playing stream ran dry
+  outside DTX) — for `hfa selftest` and tests.
+- **`HubHandle::set_media_port_override(Option<u16>)`** (new): announce another UDP port in `StreamAccepted` (port
+  forwarding, or a relay such as `netsim`).
+- **`netsim` module (new, for tests and `hfa selftest --loss/--jitter`):** `UdpImpairProxy::start(target:
+  SocketAddr, ImpairConfig { loss_pct: f32, jitter_ms: u32, seed: u64 }).await -> Result<UdpImpairProxy>`,
+  `local_addr()`, `stats() -> ProxyStats { received, dropped, forwarded }`, `stop().await`. One-way relay: random
+  drops and a random `0..=jitter_ms` delay per datagram (which reorders them); deterministic per seed. Use it with
+  `set_media_port_override(Some(proxy.local_addr().port()))`.
+- Tests: `hfa-core/tests/engine_{stream,lifecycle,lossy,dtx,control}.rs` (lifecycle includes `Discover` by device id
+  over real mDNS; control covers every `StreamStart` rejection, controls remembered across a reconnect and the
+  handshake limits) + `tests/engine_common/mod.rs` (helpers: temp devices,
+  WAV analysis with a 50 ms-block Goertzel detector — a single long Goertzel sum is cancelled by the tiny frequency
+  shifts of drift correction).
+
 ## 7. `hfa-cli` (`hfa` binary, clap)
 
 - `hfa hub [--port N] [--out default|device:<name>|wav:<path>|null] [--no-mdns] [--pair]`: prints the PIN and URI and shows a live sources table.
@@ -954,7 +1064,7 @@ Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `
 | `feat/capture-common` | `core/hfa-capture/**` except the `linux.rs`, `windows.rs`, `macos.rs` bodies |
 | `feat/capture-linux` / `-windows` / `-macos` | the matching `core/hfa-capture/src/<os>.rs` (+ that OS's deps in `hfa-capture/Cargo.toml`) |
 | `feat/core-net` | `core/hfa-core/src/{config,identity,pairing,control,discovery,media}.rs`, `hfa-core/Cargo.toml`, `hfa-core/tests/net_*.rs` |
-| `feat/core-engine` | `core/hfa-core/src/{sender,hub,lib}.rs` (+ private helper modules it adds), `hfa-core/tests/engine_*.rs` |
+| `feat/core-engine` | `core/hfa-core/src/{sender,hub,lib}.rs` (+ the helper modules it adds: `sender_encoder.rs`, `sender_adapt.rs`, `hub_mixer.rs`, `payload.rs`, `netsim.rs`), `hfa-core/tests/engine_*.rs` + `tests/engine_common/` |
 | `feat/cli` | `core/hfa-cli/**`, the README "Try it" section |
 | `feat/ffi` | `core/hfa-ffi/**`, creation of `app/` (`flutter create`), `app/flutter_rust_bridge.yaml`, `app/rust_builder/**`, `app/lib/src/rust/**` (generated), the minimal first `app/lib/main.dart`, app identifiers |
 | `feat/app` | `app/lib/**` (except generated `lib/src/rust/**`), `app/pubspec.yaml`, `app/test/**`, `app/assets/**` |

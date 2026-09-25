@@ -93,6 +93,12 @@ pub trait AudioOutput: Send {
     fn xruns(&self) -> u64 {
         0
     }
+    /// `false` if calling `start` again after a failure would destroy what the output already
+    /// produced (a WAV file is truncated by `start`). The hub then does not reopen the output
+    /// after [`AudioOutput::has_error`] and only reports the error. Default `true` (devices).
+    fn restartable(&self) -> bool {
+        true
+    }
 }
 
 /// What to capture.
