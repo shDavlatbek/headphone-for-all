@@ -205,6 +205,8 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
       _showItem = show;
       _hubItem = hub;
       _syncHubItem(ref.read(hubControllerProvider).running);
+      // The runner may start hidden (`--autostart`), so ask instead of assuming.
+      unawaited(_syncShowItem());
     } catch (e) {
       // A missing tray host (e.g. GNOME without the AppIndicator extension)
       // must never break the app.
@@ -246,6 +248,16 @@ class _DesktopIntegrationState extends ConsumerState<DesktopIntegration>
       ..state = running
           ? tray.MenuItemState.checked
           : tray.MenuItemState.unchecked;
+  }
+
+  /// Labels the Show/Hide item after the window's current visibility.
+  Future<void> _syncShowItem() async {
+    try {
+      final visible = await windowManager.isVisible();
+      if (mounted) _setVisible(visible);
+    } catch (e) {
+      debugPrint('window manager: $e');
+    }
   }
 
   Future<void> _toggleWindow() async {
