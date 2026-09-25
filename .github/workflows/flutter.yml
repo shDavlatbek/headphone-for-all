@@ -1,6 +1,9 @@
 # Flutter app (app/): analysis and widget tests, a drift check of the flutter_rust_bridge bindings,
 # and release builds for every platform (cargokit compiles core/hfa-ffi inside each build).
 # The integration test runs the real Rust library in the Linux job. Build commands: docs/BUILDING.md.
+# release.yml calls this workflow with `release: true` for a tagged release: the Android job then
+# also builds the App Bundle, and the Android, Windows and macOS jobs sign with the keys in the
+# repository secrets when they are set (docs/BUILDING.md, "Releasing").
 name: Flutter
 
 on:
@@ -10,6 +13,12 @@ on:
   pull_request:
     paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        description: Release build (App Bundle, signing with the repository secrets when set).
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -210,6 +219,36 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The Flatpak bundle packages the release bundle of the `linux` job (built on ubuntu-latest; the
+  # Flatpak runtime brings its own, newer glibc and libpipewire). flatpak-builder needs bubblewrap
+  # and a current flatpak, hence Flathub's builder image, which must run privileged.
+  linux-flatpak:
+    name: Linux Flatpak
+    needs: linux
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+      options: --privileged
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: headphone_for_all-linux-x64
+          path: ${{ runner.temp }}/linux-bundle
+      - name: Unpack the release bundle
+        run: |
+          mkdir -p app/build/linux/x64/release
+          tar -xzf "$RUNNER_TEMP/linux-bundle/headphone_for_all-linux-x64.tar.gz" -C app/build/linux/x64/release
+      - name: Flatpak bundle
+        run: bash packaging/linux/build-flatpak.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-linux-flatpak
+          path: packaging/dist/*.flatpak
+          if-no-files-found: error
+          retention-days: 14
+
   android:
     name: Android APK
     runs-on: ubuntu-latest
@@ -217,6 +256,13 @@ jobs:
     defaults:
       run:
         working-directory: app
+    env:
+      # Release signing (app/android/app/build.gradle.kts) only for release.yml; other runs sign
+      # with the debug key.
+      ANDROID_KEYSTORE_BASE64: ${{ inputs.release && secrets.ANDROID_KEYSTORE_BASE64 || '' }}
+      HFA_ANDROID_KEYSTORE_PASSWORD: ${{ inputs.release && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+      HFA_ANDROID_KEY_ALIAS: ${{ inputs.release && secrets.ANDROID_KEY_ALIAS || '' }}
+      HFA_ANDROID_KEY_PASSWORD: ${{ inputs.release && secrets.ANDROID_KEY_PASSWORD || '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
@@ -238,14 +284,33 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           cache: true
       - run: flutter pub get
-      # Release APK for arm64-v8a, armeabi-v7a and x86_64, signed with the debug key (no release
-      # keystore in CI): installable for testing, not for a store.
+      - name: Release signing key
+        if: env.ANDROID_KEYSTORE_BASE64 != ''
+        run: |
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "HFA_ANDROID_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+      - name: No release signing key
+        if: inputs.release && env.ANDROID_KEYSTORE_BASE64 == ''
+        run: echo "::warning::ANDROID_KEYSTORE_BASE64 is not set; the release APK and App Bundle are signed with the debug key."
+      # Release APK for arm64-v8a, armeabi-v7a and x86_64. Signed with the debug key unless this is a
+      # release run with the signing secrets: installable for testing, not for a store.
       - name: Build APK (release)
         run: flutter build apk --release
       - uses: actions/upload-artifact@v7
         with:
           name: headphone_for_all-android-apk
           path: app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+      # The App Bundle for Google Play (release runs only).
+      - name: Build App Bundle (release)
+        if: inputs.release
+        run: flutter build appbundle --release
+      - uses: actions/upload-artifact@v7
+        if: inputs.release
+        with:
+          name: headphone_for_all-android-aab
+          path: app/build/app/outputs/bundle/release/app-release.aab
           if-no-files-found: error
           retention-days: 14
       # JVM unit tests and Android lint of the Kotlin platform code (feat/android) when present;
@@ -263,6 +328,11 @@ jobs:
       run:
         shell: pwsh
         working-directory: app
+    env:
+      # Authenticode signing, release.yml only: a code-signing certificate as base64 PFX.
+      WINDOWS_CERTIFICATE_PFX_BASE64: ${{ inputs.release && secrets.WINDOWS_CERTIFICATE_PFX_BASE64 || '' }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ inputs.release && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
+      TIMESTAMP_URL: http://timestamp.digicert.com
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -274,6 +344,20 @@ jobs:
       - run: flutter pub get
       - name: Build (release)
         run: flutter build windows --release
+      # Signs the app and the Rust library before they are zipped and packed into the installer.
+      - name: Sign the executables
+        if: env.WINDOWS_CERTIFICATE_PFX_BASE64 != ''
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+          "SIGNING_PFX=$pfx" >> $env:GITHUB_ENV
+          & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd sha256 /tr $env:TIMESTAMP_URL /td sha256 `
+            build\windows\x64\runner\Release\headphone_for_all.exe build\windows\x64\runner\Release\hfa_ffi.dll
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
       - name: Zip the release folder
         run: Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath "$env:RUNNER_TEMP\headphone_for_all-windows-x64.zip"
       - uses: actions/upload-artifact@v7
@@ -288,6 +372,13 @@ jobs:
         if: hashFiles('packaging/windows/build-installer.ps1') != ''
         working-directory: .
         run: ./packaging/windows/build-installer.ps1
+      - name: Sign the installer
+        if: steps.installer.outcome == 'success' && env.WINDOWS_CERTIFICATE_PFX_BASE64 != ''
+        working-directory: .
+        run: |
+          $setup = (Get-ChildItem packaging\dist\*.exe).FullName
+          & $env:SIGNTOOL sign /f $env:SIGNING_PFX /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd sha256 /tr $env:TIMESTAMP_URL /td sha256 $setup
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
       - uses: actions/upload-artifact@v7
         if: steps.installer.outcome == 'success'
         with:
@@ -299,10 +390,19 @@ jobs:
   macos:
     name: macOS build
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: app
+    env:
+      # Developer ID signing and notarization of the DMG, release.yml only (build-dmg.sh reads
+      # MACOS_SIGN_IDENTITY and the APPLE_API_* variables).
+      MACOS_CERTIFICATE_P12_BASE64: ${{ inputs.release && secrets.MACOS_CERTIFICATE_P12_BASE64 || '' }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ inputs.release && secrets.MACOS_CERTIFICATE_PASSWORD || '' }}
+      MACOS_SIGN_IDENTITY: ${{ inputs.release && secrets.MACOS_SIGN_IDENTITY || '' }}
+      APPLE_API_KEY_P8_BASE64: ${{ inputs.release && secrets.APPLE_API_KEY_P8_BASE64 || '' }}
+      APPLE_API_KEY_ID: ${{ inputs.release && secrets.APPLE_API_KEY_ID || '' }}
+      APPLE_API_ISSUER: ${{ inputs.release && secrets.APPLE_API_ISSUER || '' }}
     steps:
       - uses: actions/checkout@v7
       # Release builds are universal: cargokit builds hfa-ffi for both Mac architectures.
@@ -328,12 +428,37 @@ jobs:
           path: ${{ runner.temp }}/headphone_for_all-macos.zip
           if-no-files-found: error
           retention-days: 14
-      # Unsigned disk image (packaging/macos, feat/desktop) when it is present on this branch.
+      # A temporary keychain with the Developer ID certificate (release runs with the secrets).
+      - name: Signing keychain
+        if: env.MACOS_CERTIFICATE_P12_BASE64 != '' && env.MACOS_SIGN_IDENTITY != ''
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/codesign.p12"
+          security import "$RUNNER_TEMP/codesign.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$RUNNER_TEMP/codesign.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" > /dev/null
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          if [ -n "$APPLE_API_KEY_P8_BASE64" ]; then
+            printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+            echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+          fi
+      # Disk image (packaging/macos, feat/desktop) when it is present on this branch: unsigned, or
+      # signed (MACOS_SIGN_IDENTITY) and notarized (App Store Connect API key) in release runs.
       - name: DMG
         id: dmg
         if: hashFiles('packaging/macos/build-dmg.sh') != ''
         working-directory: .
-        run: bash packaging/macos/build-dmg.sh
+        run: |
+          args=()
+          if [ -n "$MACOS_SIGN_IDENTITY" ] && [ -n "$APPLE_API_KEY_ID" ]; then
+            args+=(--notarize)
+          fi
+          bash packaging/macos/build-dmg.sh ${args[@]+"${args[@]}"}
       - uses: actions/upload-artifact@v7
         if: steps.dmg.outcome == 'success'
         with:

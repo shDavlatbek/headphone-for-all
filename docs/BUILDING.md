@@ -360,8 +360,8 @@ newer.
 
 ## Continuous integration
 
-GitHub Actions runs on pushes to `main`, `claude/**` and `feat/**`, on pull requests and on demand
-(`workflow_dispatch`). Changes to Markdown files and `docs/` alone do not trigger it. A newer push to
+GitHub Actions runs `rust.yml` and `flutter.yml` on pushes to `main` and `claude/**`, on every pull
+request (so a `feat/**` branch gets CI through its pull request) and on demand (`workflow_dispatch`). Changes to Markdown files and `docs/` alone do not trigger it. A newer push to
 the same branch cancels the older run (except on `main`). Workflows have read-only repository access.
 
 **`rust.yml`**
@@ -383,14 +383,16 @@ the same branch cancels the older run (except on `main`). Workflows have read-on
 | flutter_rust_bridge drift check | ubuntu-latest | `flutter_rust_bridge_codegen generate`, then `git status` must be clean | — |
 | Linux build | ubuntu-latest | integration test under `xvfb-run`, `flutter build linux --release` | `headphone_for_all-linux-x64` (tar.gz) |
 | Linux AppImage | ubuntu-latest, `ubuntu:22.04` container | its own `flutter build linux --release` on the oldest supported glibc, then `packaging/linux/build-appimage.sh`; does nothing until that script is on the branch | `headphone_for_all-linux-appimage` |
-| Android APK | ubuntu-latest | JDK 17, SDK 36 + NDK 29.0.14206865, `flutter build apk --release`, Kotlin unit tests + lint if present | `headphone_for_all-android-apk` |
+| Linux Flatpak | ubuntu-latest, Flathub's `flatpak-github-actions:freedesktop-26.08` container (privileged) | `packaging/linux/build-flatpak.sh` on the Linux build's bundle (after its integration test) | `headphone_for_all-linux-flatpak` |
+| Android APK | ubuntu-latest | JDK 17, SDK 36 + NDK 29.0.14206865, `flutter build apk --release`, Kotlin unit tests + lint if present; release runs also `flutter build appbundle --release` | `headphone_for_all-android-apk`, release runs `…-android-aab` |
 | Windows build | windows-latest | `flutter build windows --release`, Inno Setup installer if `packaging/windows/build-installer.ps1` exists | `headphone_for_all-windows-x64` (zip), `…-windows-x64-setup` |
 | macOS build | macos-latest | `flutter build macos --release`, DMG if `packaging/macos/build-dmg.sh` exists | `headphone_for_all-macos` (zipped .app), `…-macos-dmg` |
 | iOS build | macos-latest | `flutter build ios --release --no-codesign` (Runner + broadcast extension) | — |
 | XCTest | macos-latest | `RunnerTests` on an iOS simulator and on macOS; the simulator is an iPhone of the newest iOS runtime the selected Xcode's SDK supports (`.github/scripts/pick_ios_simulator.py`, unit-tested in the same job) | — |
 
-Artifacts are kept for 14 days (Actions → the run → Artifacts). The builds are unsigned (the APK is
-debug-signed): for testing, not for distribution.
+Artifacts are kept for 14 days (Actions → the run → Artifacts). The builds of ordinary runs are unsigned
+(the APK is debug-signed): for testing, not for distribution. Tagged releases are published as GitHub
+releases, see [Releasing](#releasing).
 
 **Dependabot** (`.github/dependabot.yml`) opens weekly update PRs for Cargo (`core/`), pub (`app/`) and
 the workflow actions, grouping minor/patch updates; flutter_rust_bridge is excluded (see
@@ -403,6 +405,51 @@ the workflow actions, grouping minor/patch updates; flutter_rust_bridge is exclu
 actionlint
 python3 -c "import yaml,glob; [yaml.safe_load(open(f)) for f in glob.glob('.github/**/*.yml', recursive=True)]"
 ```
+
+## Releasing
+
+`.github/workflows/release.yml` runs on a pushed tag `v<version>` (and on demand, without publishing):
+
+1. **Version check:** the tag must be `v` + the `version:` of `app/pubspec.yaml` (without `+build`), and
+   that must equal `version` in `core/Cargo.toml` (`[workspace.package]`). Bump both (and the pubspec
+   build number) in one commit before tagging.
+2. **App packages:** calls `flutter.yml` with `release: true`, i.e. every job of an ordinary run (so the
+   analysis, tests and codegen drift check gate the release) plus the Android App Bundle and signing
+   where the secrets below are set.
+3. **CLI:** `hfa` for `linux-x86_64` (built in an `ubuntu:22.04` container; needs glibc ≥ 2.35 and the
+   host's libpipewire-0.3), `windows-x86_64` (MSVC) and `macos-universal` (lipo of both Mac
+   architectures), each archived with the licence files.
+4. **Publish** (tags only): a GitHub release with generated notes (a tag with a `-`, e.g. `v1.2.0-beta.1`,
+   becomes a pre-release), the files below and `SHA256SUMS`.
+
+| File | Signed when |
+|---|---|
+| `Headphone_for_All-<ver>-windows-x64-setup.exe`, `…-windows-x64-portable.zip` | `WINDOWS_CERTIFICATE_*` |
+| `Headphone_for_All-<ver>-x86_64.AppImage`, `…-x86_64.flatpak`, `…-linux-x64.tar.gz` | — (unsigned) |
+| `Headphone_for_All-<ver>-macos.dmg` | `MACOS_*` (+ notarized with `APPLE_API_*`) |
+| `Headphone_for_All-<ver>-android.apk`, `…-android.aab` | `ANDROID_*` (else debug-signed, with a warning) |
+| `hfa-<ver>-<platform>.tar.gz` / `.zip` | — (unsigned) |
+
+Repository secrets (Settings → Secrets and variables → Actions); each group is optional, and only
+release runs read them:
+
+| Secret | Use |
+|---|---|
+| `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` | the upload/release keystore (`base64 -w0 release.jks`); passed to Gradle as `HFA_ANDROID_KEYSTORE*` / `HFA_ANDROID_KEY_*` |
+| `WINDOWS_CERTIFICATE_PFX_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD` | Authenticode: `signtool` signs `headphone_for_all.exe` and `hfa_ffi.dll` before packaging, then the setup `.exe` (timestamp: DigiCert) |
+| `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY` | Developer ID Application certificate, imported into a temporary keychain; `build-dmg.sh` signs the app (hardened runtime) and the DMG |
+| `APPLE_API_KEY_P8_BASE64`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` | App Store Connect API key for `notarytool`; with a signing identity, the DMG is notarized and stapled |
+
+**Android signing locally:** `app/android/app/build.gradle.kts` signs release builds with the key from
+`app/android/key.properties` (`storeFile` relative to `app/android/app`, `storePassword`, `keyAlias`,
+`keyPassword`; git-ignored) or from the environment (`HFA_ANDROID_KEYSTORE` = path,
+`HFA_ANDROID_KEYSTORE_PASSWORD`, `HFA_ANDROID_KEY_ALIAS`, `HFA_ANDROID_KEY_PASSWORD`, which defaults to the
+store password). Without a key it falls back to the debug key and warns;
+`HFA_ANDROID_REQUIRE_RELEASE_KEY=true` makes that an error. A keystore without password or alias is
+always an error. Check with `./gradlew :app:signingReport` (from `app/android`).
+
+Not automated yet: store uploads (Google Play, App Store/TestFlight: iOS is only built unsigned),
+Flathub submission, and signing of the AppImage and of the CLI binaries.
 
 ## Troubleshooting
 
