@@ -9,7 +9,7 @@
  *   {
  *     "data_dir":      "<App Group container>/hfa",   required: identity, settings, paired hubs
  *     "hub_host":      "192.168.1.20",                 "" = find hub_device_id over mDNS
- *     "hub_port":      47810,                          0 or missing = port from the settings
+ *     "hub_port":      47810,                          0 or missing = settings port (47810 if that is 0)
  *     "hub_device_id": "ab12-cd34-ef56-7890" | null,
  *     "hub_key":       "<base64url static key>" | null,
  *     "label":         "iPhone"                        missing = "iOS audio"

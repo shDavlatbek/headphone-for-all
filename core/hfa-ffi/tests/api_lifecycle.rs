@@ -1,5 +1,5 @@
 //! End-to-end check of the flutter_rust_bridge API against the real engines: init, settings,
-//! hub start / pairing / stop, and a sender that cannot reach its hub.
+//! trust store sharing, hub start / pairing / stop, and a sender that cannot reach its hub.
 //!
 //! Ignored until the `hfa-core` engines are implemented (they are `todo!()` stubs on the
 //! integration branch while feat/ffi is built). Run with
@@ -7,7 +7,8 @@
 //! feat/core-engine are merged. Everything runs in one test because the API uses one global
 //! engine manager per process.
 
-use hfa_ffi::api::app::{get_settings, init_app, trusted_peers, update_settings};
+use hfa_core::{TrustStore, TrustedPeer};
+use hfa_ffi::api::app::{forget_peer, get_settings, init_app, trusted_peers, update_settings};
 use hfa_ffi::api::hub::{
     hub_cancel_pairing, hub_sources, hub_start, hub_start_pairing, hub_status, hub_stop,
 };
@@ -39,11 +40,31 @@ fn api_lifecycle_with_real_engines() {
         info.device_id
     );
 
-    let mut settings = get_settings().expect("settings");
-    settings.bitrate = 96_000;
-    update_settings(settings).expect("update");
-    assert_eq!(get_settings().expect("settings").bitrate, 96_000);
     assert!(trusted_peers().expect("peers").is_empty());
+
+    // Pairings saved by someone else (as the engines do) are seen, and forgetting another
+    // peer keeps them: trust is never cached by the API.
+    let store = TrustStore::load(dir.path()).expect("trust store");
+    for (key, name) in [([7u8; 32], "Laptop"), ([8u8; 32], "Phone")] {
+        store
+            .add(TrustedPeer {
+                device_id: hfa_proto::fingerprint(&key),
+                name: name.into(),
+                public_key: key,
+                paired_at: 1_700_000_000,
+            })
+            .expect("add peer");
+    }
+    assert_eq!(trusted_peers().expect("peers").len(), 2);
+    forget_peer(hfa_proto::fingerprint(&[7u8; 32])).expect("forget");
+    let peers = trusted_peers().expect("peers");
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].name, "Phone");
+    forget_peer(hfa_proto::fingerprint(&[8u8; 32])).expect("forget");
+    assert!(TrustStore::load(dir.path())
+        .expect("trust store")
+        .peers()
+        .is_empty());
 
     let status = hub_start().expect("hub starts");
     assert!(status.running);
@@ -69,6 +90,13 @@ fn api_lifecycle_with_real_engines() {
     assert!(sender_start(own).is_err());
     hub_stop().expect("hub stops");
     assert!(!hub_status().running);
+
+    // Only after the hub ran: the settings DTO has no form for the Null output, so a round
+    // trip turns it into the OS default output (absent on headless CI machines).
+    let mut settings = get_settings().expect("settings");
+    settings.bitrate = 96_000;
+    update_settings(settings).expect("update");
+    assert_eq!(get_settings().expect("settings").bitrate, 96_000);
 
     // A sender towards a closed port keeps trying (it never reaches `streaming`).
     let closed = SenderStartDto {

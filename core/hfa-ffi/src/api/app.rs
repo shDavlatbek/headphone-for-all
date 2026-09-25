@@ -127,7 +127,8 @@ pub fn trusted_peers() -> anyhow::Result<Vec<TrustedPeerDto>> {
     Ok(manager()?.trusted_peers()?)
 }
 
-/// Removes a paired device (no-op for an unknown id).
+/// Removes a paired device (no-op for an unknown id). A running hub or sender keeps its own
+/// copy of the trust store until it is restarted.
 pub fn forget_peer(device_id: String) -> anyhow::Result<()> {
     Ok(manager()?.forget_peer(&device_id)?)
 }

@@ -39,7 +39,8 @@ Future<List<String>> listOutputDevices() =>
 Future<List<TrustedPeerDto>> trustedPeers() =>
     RustLib.instance.api.crateApiAppTrustedPeers();
 
-/// Removes a paired device (no-op for an unknown id).
+/// Removes a paired device (no-op for an unknown id). A running hub or sender keeps its own
+/// copy of the trust store until it is restarted.
 Future<void> forgetPeer({required String deviceId}) =>
     RustLib.instance.api.crateApiAppForgetPeer(deviceId: deviceId);
 

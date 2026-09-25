@@ -75,7 +75,7 @@ pub enum CaptureSourceDto {
 pub struct SenderStartDto {
     /// Hub host name or IP; empty = find the hub by `hub_device_id` over mDNS.
     pub hub_host: String,
-    /// Hub port; 0 = the port from the settings.
+    /// Hub port; 0 = the port from the settings (the protocol default if that is 0 too).
     pub hub_port: u16,
     /// Hub device id (from discovery or a trusted peer). When `hub_key` is `None`, the key of
     /// this trusted peer is pinned.
@@ -135,6 +135,10 @@ pub fn list_capture_apps() -> anyhow::Result<Vec<CaptureAppDto>> {
 
 /// Starts streaming to a hub. Returns once the capture is open and the engine started; the
 /// connection progress arrives through `sender_status` / `sender_events`.
+///
+/// Fails with "a sender is already running" while a sender is live. A sender that ended by
+/// itself (`failed`, e.g. pairing required or a wrong PIN, or `stopped`) is stopped and
+/// replaced, so after a pairing failure just call this again with the PIN.
 pub fn sender_start(request: SenderStartDto) -> anyhow::Result<()> {
     Ok(manager()?.sender_start(request)?)
 }

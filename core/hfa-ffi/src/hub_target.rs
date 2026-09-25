@@ -2,7 +2,8 @@
 //! [`HubAddress`] and the expected hub key (shared by the Flutter API and the C ABI).
 //!
 //! Rules (see docs/CONTRACTS.md §8.1 and the feat/ffi refinements):
-//! - `hub_host` non-empty → [`HubAddress::Direct`] (`hub_port` 0 → the default port);
+//! - `hub_host` non-empty → [`HubAddress::Direct`] (`hub_port` 0 → the settings port, or
+//!   [`hfa_proto::DEFAULT_PORT`] when that is 0 too);
 //!   empty host with a `hub_device_id` → [`HubAddress::Discover`] by that id (mDNS; the
 //!   engine checks the fingerprint).
 //! - `hub_key` (base64url static key from a pairing URI, padded or not) becomes
@@ -57,9 +58,20 @@ pub(crate) fn encode_key(key: &[u8; 32]) -> String {
     URL_SAFE_NO_PAD.encode(key)
 }
 
+/// The port to dial: `requested`, else `default_port` (the settings port), else — when the
+/// settings port is 0 too ("hub binds any free port") — [`hfa_proto::DEFAULT_PORT`]. Port 0
+/// can never be dialled.
+fn effective_port(requested: u16, default_port: u16) -> u16 {
+    match (requested, default_port) {
+        (0, 0) => hfa_proto::DEFAULT_PORT,
+        (0, p) | (p, _) => p,
+    }
+}
+
 /// Resolves `req`.
 ///
-/// - `default_port`: used when `req.port == 0`.
+/// - `default_port`: used when `req.port == 0` (itself replaced by
+///   [`hfa_proto::DEFAULT_PORT`] when 0).
 /// - `trusted_key`: looks up the pinned key of a trusted peer by device id.
 /// - `own_key`: this device's static key (loop protection).
 ///
@@ -105,11 +117,7 @@ pub(crate) fn resolve(
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .to_owned(),
-            port: if req.port == 0 {
-                default_port
-            } else {
-                req.port
-            },
+            port: effective_port(req.port, default_port),
         }
     } else if let Some(id) = device_id {
         HubAddress::Discover {
@@ -176,6 +184,34 @@ mod tests {
                 host: "fe80::1".into(),
                 port: 5000
             }
+        );
+    }
+
+    #[test]
+    fn port_zero_never_reaches_the_dialer() {
+        let req = HubRequest {
+            host: "hub.local".into(),
+            port: 0,
+            device_id: None,
+            key: Some(encode_key(&HUB)),
+        };
+        let port_of = |t: HubTarget| match t.address {
+            HubAddress::Direct { port, .. } => port,
+            other => panic!("unexpected {other:?}"),
+        };
+        // Settings port 0 ("bind any free port") is not a dialable fallback.
+        assert_eq!(
+            port_of(resolve(&req, 0, none, &OWN).expect("resolve")),
+            hfa_proto::DEFAULT_PORT
+        );
+        assert_eq!(
+            port_of(resolve(&req, 5001, none, &OWN).expect("resolve")),
+            5001
+        );
+        let explicit = HubRequest { port: 6000, ..req };
+        assert_eq!(
+            port_of(resolve(&explicit, 0, none, &OWN).expect("resolve")),
+            6000
         );
     }
 

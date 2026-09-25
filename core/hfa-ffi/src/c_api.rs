@@ -23,7 +23,8 @@
 //! - `data_dir` (required): the App Group directory the app initialized, so the extension
 //!   uses the app's identity, settings and paired hubs. Pairing never happens here: the hub
 //!   must already be trusted (by `hub_key`, or by `hub_device_id` in the trust store).
-//! - `hub_host` (default `""`) / `hub_port` (default 0 = the port in the settings): an empty
+//! - `hub_host` (default `""`) / `hub_port` (default 0 = the port in the settings, or
+//!   `hfa_proto::DEFAULT_PORT` when that is 0 too): an empty
 //!   host means "find `hub_device_id` over mDNS".
 //! - `hub_device_id`, `hub_key` (optional, may be `null`): see `SenderStartDto`.
 //! - `label` (default `"iOS audio"`): the stream label shown on the hub.

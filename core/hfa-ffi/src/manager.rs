@@ -2,23 +2,35 @@
 //!
 //! One [`EngineManager`] per process ([`manager`], `OnceLock`) owns:
 //! - a tokio multi-thread runtime (engines, event forwarders, discovery),
-//! - the loaded [`Settings`], [`Identity`] and [`TrustStore`] (`init_app`),
+//! - the loaded [`Settings`] and [`Identity`] (`init_app`),
 //! - at most one [`HubHandle`] and one [`SenderHandle`], and one discovery task,
 //! - the Dart event subscriptions (hub events and sender status), which outlive engine
 //!   restarts: a forwarder task per running engine relays its `broadcast` channel to them.
+//!
+//! Trust is never cached: the engines load their own [`TrustStore`] from
+//! `settings.data_dir` and save the pairings they make, so every trust read or change here
+//! (`trusted_peers`, `forget_peer`, `sender_start` key pinning, the discovery `trusted` flag)
+//! loads `trusted.json` afresh. A cached copy would miss pairings made since `init_app`, and
+//! saving it (`forget_peer`) would erase them.
+//!
+//! Event order: a forwarder is subscribed to an engine's channel right after the engine
+//! starts, before anything else, and on stop it is drained (until the engine's channel
+//! closes, bounded by [`FORWARDER_DRAIN`]) before the final idle status is sent, so that
+//! status is always the last one a subscriber sees.
 //!
 //! Locking: `lifecycle` serializes the operations that may block (init, start, stop) so
 //! that `state` is only ever held for short, non-blocking sections; getters therefore never
 //! wait for a hub or capture that is starting. Engine futures are driven with
 //! `Runtime::block_on` from the calling flutter_rust_bridge worker thread.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use hfa_core::config::SETTINGS_FILE;
 use hfa_core::{
     HubConfig, HubEngine, HubEvent, HubHandle, Identity, SenderConfig, SenderEngine, SenderEvent,
-    SenderHandle, SenderStatus, Settings, TrustStore,
+    SenderHandle, SenderState, SenderStatus, Settings, TrustStore,
 };
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
@@ -36,6 +48,10 @@ use crate::runtime::{block_on, build_runtime};
 
 /// Device buffer size asked from the hub output (ms).
 pub const OUTPUT_BUFFER_MS: u32 = 20;
+
+/// How long a stopping engine's event forwarder may take to relay the events still queued
+/// (the engine's channel closes once its tasks have ended) before it is aborted.
+pub(crate) const FORWARDER_DRAIN: Duration = Duration::from_millis(500);
 
 /// A destination for events delivered to Dart (a flutter_rust_bridge `StreamSink`, or a
 /// test double).
@@ -83,11 +99,10 @@ impl<T: Clone> SinkSet<T> {
     }
 }
 
-/// What `init_app` loaded.
+/// What `init_app` loaded (trust is loaded per use; see the module docs).
 struct AppContext {
     settings: Settings,
     identity: Identity,
-    trust: TrustStore,
 }
 
 /// Sender facts learned from its events (the handle's status has no hub name or errors).
@@ -213,12 +228,9 @@ impl EngineManager {
             settings.save()?;
         }
         let identity = Identity::load_or_create(data_dir, &settings.device_name)?;
-        let trust = TrustStore::load(data_dir)?;
-        let app = AppContext {
-            settings,
-            identity,
-            trust,
-        };
+        // Not kept (see the module docs), but a corrupt trust store fails early here.
+        TrustStore::load(data_dir)?;
+        let app = AppContext { settings, identity };
         let info = app_info(&app);
         tracing::info!(
             device_id = %info.device_id,
@@ -267,10 +279,15 @@ impl EngineManager {
         Ok(())
     }
 
+    /// The trust store as currently saved (never a cached copy; see the module docs).
     fn trust(&self) -> Result<TrustStore> {
+        Ok(TrustStore::load(&self.data_dir()?)?)
+    }
+
+    fn data_dir(&self) -> Result<PathBuf> {
         let st = self.state.lock();
         let app = st.app.as_ref().ok_or(FfiError::NotInitialized)?;
-        Ok(app.trust.clone())
+        Ok(app.settings.data_dir.clone())
     }
 
     // ---------------------------------------------------------------- hub
@@ -296,6 +313,7 @@ impl EngineManager {
                 advertise: true,
             }),
         )??;
+        // Subscribe before anything else so that no early event is lost.
         let forwarder = self.runtime.spawn(forward_hub_events(
             handle.events(),
             Arc::clone(&self.hub_sinks),
@@ -311,9 +329,11 @@ impl EngineManager {
         let slot = self.state.lock().hub.take();
         if let Some(slot) = slot {
             let stopped = block_on(&self.runtime, slot.handle.stop());
-            // The forwarder ends by itself once the engine's channel closes; abort in case a
-            // task of the engine outlives `stop`.
-            slot.forwarder.abort();
+            // Relays the last source updates, then ends (the engine's channel is closed).
+            block_on(
+                &self.runtime,
+                finish_forwarder(slot.forwarder, FORWARDER_DRAIN),
+            )?;
             stopped?;
             tracing::info!("hub stopped");
         }
@@ -408,13 +428,21 @@ impl EngineManager {
 
     /// See `api::sender::discover_hubs`.
     pub(crate) fn discover_hubs(&self, sink: Box<dyn EventSink<DiscoveryEventDto>>) -> Result<()> {
-        let trust = self.state.lock().app.as_ref().map(|a| a.trust.clone());
+        let data_dir = self
+            .state
+            .lock()
+            .app
+            .as_ref()
+            .map(|a| a.settings.data_dir.clone());
         let mut browser = {
             let _rt = self.runtime.enter();
             hfa_core::browse()?
         };
         let task = self.runtime.spawn(async move {
             while let Some(event) = browser.recv().await {
+                // Loaded per event (a small file; events are rare) so that a hub paired
+                // while discovery runs shows as trusted.
+                let trust = data_dir.as_deref().and_then(|d| TrustStore::load(d).ok());
                 let dto = convert::discovery_event_dto(&event, |id| {
                     trust.as_ref().is_some_and(|t| t.get(id).is_some())
                 });
@@ -439,18 +467,40 @@ impl EngineManager {
     /// See `api::sender::sender_start`.
     pub(crate) fn sender_start(&self, req: SenderStartDto) -> Result<()> {
         let _ops = self.lifecycle.lock();
-        let (settings, own_key, trust) = {
-            let st = self.state.lock();
+        let (settings, own_key, finished) = {
+            let mut st = self.state.lock();
             let app = st.app.as_ref().ok_or(FfiError::NotInitialized)?;
-            if st.sender.is_some() {
-                return Err(FfiError::SenderRunning);
-            }
-            (
-                app.settings.clone(),
-                app.identity.public_key(),
-                app.trust.clone(),
-            )
+            let (settings, own_key) = (app.settings.clone(), app.identity.public_key());
+            let finished = match &st.sender {
+                None => None,
+                // A sender that gave up or stopped by itself is reaped, not "running".
+                Some(slot) if is_finished(&slot.handle.status().state) => st.sender.take(),
+                Some(_) => return Err(FfiError::SenderRunning),
+            };
+            (settings, own_key, finished)
         };
+        let reaped = finished.is_some();
+        if let Some(slot) = finished {
+            if let Err(e) = self.reap_sender(slot) {
+                tracing::warn!(error = %e, "stopping the finished sender failed");
+            }
+        }
+        let result = self.start_sender(req, settings, &own_key);
+        if result.is_err() && reaped {
+            // The reaped sender's final state was the last status sent; there is no sender now.
+            self.sender_sinks.broadcast(&convert::idle_sender_status());
+        }
+        result
+    }
+
+    /// `sender_start` once the slot is free (lifecycle lock held).
+    fn start_sender(
+        &self,
+        req: SenderStartDto,
+        settings: Settings,
+        own_key: &[u8; 32],
+    ) -> Result<()> {
+        let trust = TrustStore::load(&settings.data_dir)?;
         let target = hub_target::resolve(
             &HubRequest {
                 host: req.hub_host.clone(),
@@ -460,7 +510,7 @@ impl EngineManager {
             },
             settings.port,
             |id| trust.get(id).map(|p| p.public_key),
-            &own_key,
+            own_key,
         )?;
         let (capture_target, feed_format) = convert::capture_target(&req.source)?;
         let feed_id = match (&capture_target, feed_format) {
@@ -473,6 +523,9 @@ impl EngineManager {
         let result = self.start_sender_engine(&req, &capture_target, settings, target);
         match result {
             Ok(handle) => {
+                // Subscribe before anything else so that an early `Connected` (the only
+                // source of the hub name) is not lost.
+                let events = handle.events();
                 let meta = Arc::new(Mutex::new(SenderMeta {
                     status: handle.status(),
                     hub_name: None,
@@ -481,7 +534,7 @@ impl EngineManager {
                 let initial = meta.lock().dto();
                 self.sender_sinks.broadcast(&initial);
                 let forwarder = self.runtime.spawn(forward_sender_events(
-                    handle.events(),
+                    events,
                     Arc::clone(&meta),
                     Arc::clone(&self.sender_sinks),
                 ));
@@ -537,16 +590,27 @@ impl EngineManager {
         let _ops = self.lifecycle.lock();
         let slot = self.state.lock().sender.take();
         if let Some(slot) = slot {
-            let stopped = block_on(&self.runtime, slot.handle.stop());
-            slot.forwarder.abort();
-            if let Some(id) = slot.feed_id {
-                feeds::unregister(id);
-            }
+            let reaped = self.reap_sender(slot);
+            // Sent after the forwarder has finished, so it is the last status.
             self.sender_sinks.broadcast(&convert::idle_sender_status());
-            stopped?;
+            reaped?;
             tracing::info!("sender stopped");
         }
         Ok(())
+    }
+
+    /// Stops a sender taken out of its slot: stops the engine, lets the forwarder relay the
+    /// remaining events and end, and unregisters the external feed.
+    fn reap_sender(&self, slot: SenderSlot) -> Result<()> {
+        let stopped = block_on(&self.runtime, slot.handle.stop());
+        let drained = block_on(
+            &self.runtime,
+            finish_forwarder(slot.forwarder, FORWARDER_DRAIN),
+        );
+        if let Some(id) = slot.feed_id {
+            feeds::unregister(id);
+        }
+        stopped.and(drained)
     }
 
     /// See `api::sender::sender_status`.
@@ -591,6 +655,24 @@ fn app_info(app: &AppContext) -> AppInfo {
         platform: hfa_core::platform_name().to_owned(),
         version: hfa_core::APP_VERSION.to_owned(),
         capabilities: convert::capabilities_dto(hfa_capture::capabilities()),
+    }
+}
+
+/// `true` once a sender will not stream any more by itself: it gave up
+/// ([`SenderState::Failed`]) or was stopped. Such a sender no longer blocks `sender_start`.
+fn is_finished(state: &SenderState) -> bool {
+    matches!(state, SenderState::Failed(_) | SenderState::Stopped)
+}
+
+/// Waits up to `drain` for a forwarder to relay what is queued and end (its engine's
+/// channel closes when the engine's tasks end), then aborts it and waits for that. After
+/// this returns the forwarder sends nothing more.
+async fn finish_forwarder(mut forwarder: JoinHandle<()>, drain: Duration) {
+    if tokio::time::timeout(drain, &mut forwarder).await.is_err() {
+        tracing::debug!("event forwarder still busy after the engine stopped; aborting it");
+        forwarder.abort();
+        // A cancellation `JoinError` is the expected outcome.
+        let _ = forwarder.await;
     }
 }
 
@@ -650,7 +732,6 @@ async fn forward_sender_events(
 mod tests {
     use super::*;
     use crate::api::sender::CaptureSourceDto;
-    use hfa_core::SenderState;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test sink recording what it receives; closes after `capacity` deliveries.
@@ -826,6 +907,80 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn only_live_senders_block_a_new_start() {
+        assert!(is_finished(&SenderState::Failed("pairing required".into())));
+        assert!(is_finished(&SenderState::Stopped));
+        for live in [
+            SenderState::Connecting,
+            SenderState::Pairing,
+            SenderState::Streaming,
+            SenderState::Reconnecting,
+        ] {
+            assert!(!is_finished(&live), "{live:?}");
+        }
+    }
+
+    #[test]
+    fn finished_forwarder_has_relayed_everything_queued() {
+        let m = EngineManager::new().expect("manager");
+        let rec = Recorder::new(1000);
+        m.sender_sinks.add(Box::new(rec.clone()));
+        let meta = Arc::new(Mutex::new(SenderMeta {
+            status: SenderStatus::default(),
+            hub_name: None,
+            last_error: None,
+        }));
+        let (tx, rx) = broadcast::channel(512);
+        let task = m.runtime.spawn(forward_sender_events(
+            rx,
+            Arc::clone(&meta),
+            Arc::clone(&m.sender_sinks),
+        ));
+        for _ in 0..300 {
+            tx.send(SenderEvent::StateChanged(SenderState::Streaming))
+                .expect("send");
+        }
+        tx.send(SenderEvent::StateChanged(SenderState::Stopped))
+            .expect("send");
+        drop(tx);
+        block_on(&m.runtime, finish_forwarder(task, Duration::from_secs(5))).expect("join");
+        // What sender_stop sends next is therefore the last status a subscriber sees.
+        m.sender_sinks.broadcast(&convert::idle_sender_status());
+        let got = rec.got.lock();
+        assert_eq!(got.len(), 302);
+        assert_eq!(got[300].state, "stopped");
+        assert_eq!(got[301].state, "idle");
+    }
+
+    #[test]
+    fn stuck_forwarder_is_aborted_and_silenced() {
+        let m = EngineManager::new().expect("manager");
+        let rec = Recorder::new(1000);
+        m.hub_events(Box::new(rec.clone()));
+        let (tx, rx) = broadcast::channel(16);
+        let task = m
+            .runtime
+            .spawn(forward_hub_events(rx, Arc::clone(&m.hub_sinks)));
+        tx.send(HubEvent::SourceRemoved { stream_id: 1 })
+            .expect("send");
+        // The channel stays open (an engine task outlived `stop`): the drain times out.
+        let started = std::time::Instant::now();
+        block_on(
+            &m.runtime,
+            finish_forwarder(task, Duration::from_millis(50)),
+        )
+        .expect("join");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            *rec.got.lock(),
+            vec![HubEventDto::SourceRemoved { stream_id: 1 }]
+        );
+        // The aborted forwarder has dropped its receiver: nothing is relayed any more.
+        assert!(tx.send(HubEvent::SourceRemoved { stream_id: 2 }).is_err());
+        assert_eq!(rec.got.lock().len(), 1);
     }
 
     #[test]

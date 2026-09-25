@@ -26,6 +26,10 @@ Future<List<CaptureAppDto>> listCaptureApps() =>
 
 /// Starts streaming to a hub. Returns once the capture is open and the engine started; the
 /// connection progress arrives through `sender_status` / `sender_events`.
+///
+/// Fails with "a sender is already running" while a sender is live. A sender that ended by
+/// itself (`failed`, e.g. pairing required or a wrong PIN, or `stopped`) is stopped and
+/// replaced, so after a pairing failure just call this again with the PIN.
 Future<void> senderStart({required SenderStartDto request}) =>
     RustLib.instance.api.crateApiSenderSenderStart(request: request);
 
@@ -172,7 +176,7 @@ class SenderStartDto {
   /// Hub host name or IP; empty = find the hub by `hub_device_id` over mDNS.
   final String hubHost;
 
-  /// Hub port; 0 = the port from the settings.
+  /// Hub port; 0 = the port from the settings (the protocol default if that is 0 too).
   final int hubPort;
 
   /// Hub device id (from discovery or a trusted peer). When `hub_key` is `None`, the key of
