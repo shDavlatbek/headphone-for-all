@@ -250,23 +250,30 @@ struct TrustFile {
 /// A cheap-to-clone, thread-safe handle: clones share the same store, and every mutation is
 /// saved to disk immediately (atomically: temp file + rename). If saving fails, the in-memory
 /// store is left unchanged, so memory and disk never disagree.
+///
+/// Readers ([`TrustStore::is_trusted`], [`TrustStore::get`], [`TrustStore::peers`]) never
+/// wait for disk I/O, so they may be called from async tasks: writers are serialized by a
+/// separate lock held during the save, and the peer list lock is only taken briefly to copy
+/// the list and to swap in the saved one. [`TrustStore::add`] and [`TrustStore::remove`] do
+/// block (file write + fsync); call them from `spawn_blocking` or a non-async thread.
 #[derive(Clone)]
 pub struct TrustStore {
-    inner: Arc<parking_lot::Mutex<TrustInner>>,
+    inner: Arc<TrustInner>,
 }
 
-#[derive(Debug)]
 struct TrustInner {
     path: PathBuf,
-    peers: Vec<TrustedPeer>,
+    /// The current (saved) peer list. Held only for short, I/O-free sections.
+    peers: parking_lot::Mutex<Vec<TrustedPeer>>,
+    /// Serializes writers for the whole read-modify-save-swap sequence, so no update is lost.
+    save_lock: parking_lot::Mutex<()>,
 }
 
 impl fmt::Debug for TrustStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let inner = self.inner.lock();
         f.debug_struct("TrustStore")
-            .field("path", &inner.path)
-            .field("peers", &inner.peers.len())
+            .field("path", &self.inner.path)
+            .field("peers", &self.inner.peers.lock().len())
             .finish()
     }
 }
@@ -303,15 +310,19 @@ impl TrustStore {
             Err(e) => return Err(e.into()),
         };
         Ok(TrustStore {
-            inner: Arc::new(parking_lot::Mutex::new(TrustInner { path, peers })),
+            inner: Arc::new(TrustInner {
+                path,
+                peers: parking_lot::Mutex::new(peers),
+                save_lock: parking_lot::Mutex::new(()),
+            }),
         })
     }
 
     /// `true` if a peer with this public key is trusted.
     pub fn is_trusted(&self, public_key: &[u8; 32]) -> bool {
         self.inner
-            .lock()
             .peers
+            .lock()
             .iter()
             .any(|p| p.public_key == *public_key)
     }
@@ -319,8 +330,8 @@ impl TrustStore {
     /// Looks a peer up by device id.
     pub fn get(&self, device_id: &str) -> Option<TrustedPeer> {
         self.inner
-            .lock()
             .peers
+            .lock()
             .iter()
             .find(|p| p.device_id == device_id)
             .cloned()
@@ -339,14 +350,14 @@ impl TrustStore {
                 peer.device_id
             )));
         }
-        let mut inner = self.inner.lock();
-        let mut peers = inner.peers.clone();
+        let _writer = self.inner.save_lock.lock();
+        let mut peers = self.peers();
         match peers.iter_mut().find(|p| p.device_id == peer.device_id) {
             Some(existing) => *existing = peer,
             None => peers.push(peer),
         }
-        save_peers(&inner.path, &peers)?;
-        inner.peers = peers;
+        save_peers(&self.inner.path, &peers)?;
+        *self.inner.peers.lock() = peers;
         Ok(())
     }
 
@@ -355,20 +366,20 @@ impl TrustStore {
     /// # Errors
     /// [`crate::CoreError::Io`] / [`crate::CoreError::Json`] (the store is then unchanged).
     pub fn remove(&self, device_id: &str) -> Result<bool> {
-        let mut inner = self.inner.lock();
-        let Some(pos) = inner.peers.iter().position(|p| p.device_id == device_id) else {
+        let _writer = self.inner.save_lock.lock();
+        let mut peers = self.peers();
+        let Some(pos) = peers.iter().position(|p| p.device_id == device_id) else {
             return Ok(false);
         };
-        let mut peers = inner.peers.clone();
         peers.remove(pos);
-        save_peers(&inner.path, &peers)?;
-        inner.peers = peers;
+        save_peers(&self.inner.path, &peers)?;
+        *self.inner.peers.lock() = peers;
         Ok(true)
     }
 
     /// All trusted peers.
     pub fn peers(&self) -> Vec<TrustedPeer> {
-        self.inner.lock().peers.clone()
+        self.inner.peers.lock().clone()
     }
 }
 
@@ -423,6 +434,55 @@ mod tests {
             public_key: k,
         });
         assert!(matches!(bad_version, Err(CoreError::Config(_))));
+    }
+
+    #[test]
+    fn readers_never_wait_for_a_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TrustStore::load(dir.path()).expect("load");
+        store.add(TrustedPeer::new([1u8; 32], "A")).expect("add");
+        // Simulate a writer in the middle of its (slow) save.
+        let writer = store.inner.save_lock.lock();
+        let reader = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let seen = (
+                reader.is_trusted(&[1u8; 32]),
+                reader.get(&hfa_proto::fingerprint(&[1u8; 32])).is_some(),
+                reader.peers().len(),
+            );
+            let _ = tx.send(seen);
+        });
+        let seen = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("readers must not block on the save lock");
+        assert_eq!(seen, (true, true, 1));
+        drop(writer);
+        handle.join().expect("reader thread");
+    }
+
+    #[test]
+    fn concurrent_writers_lose_no_update() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TrustStore::load(dir.path()).expect("load");
+        let handles: Vec<_> = (0..8u8)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .add(TrustedPeer::new([i + 1; 32], format!("P{i}")))
+                        .expect("add")
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("writer");
+        }
+        assert_eq!(store.peers().len(), 8);
+        assert_eq!(
+            TrustStore::load(dir.path()).expect("reload").peers().len(),
+            8
+        );
     }
 
     #[test]
