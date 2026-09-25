@@ -95,7 +95,8 @@ async fn untrusted_senders_are_refused() {
 
 /// The hub restarts on the same port (same identity and trust store): the sender notices,
 /// backs off, reconnects without a new pairing and streams a new stream. The restarted hub
-/// forgot that it had muted the sender, and the sender's view follows.
+/// forgot that it had muted the sender (its saved controls were deleted), and the sender's
+/// view follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sender_reconnects_after_hub_restart() {
     let _serial = serial().await;
@@ -124,6 +125,9 @@ async fn sender_reconnects_after_hub_restart() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // Remembered controls survive a restart (see engine_control); forget them here.
+    std::fs::remove_file(hub_dev.path().join(hfa_core::hub::HUB_CONTROLS_FILE))
+        .expect("saved controls");
 
     let mut hub2 = start_hub(&hub_dev, port, Out::Null).await;
     assert_eq!(hub2.hub.local_port(), port);

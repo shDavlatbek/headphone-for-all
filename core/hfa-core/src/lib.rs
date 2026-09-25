@@ -21,6 +21,7 @@ pub mod discovery;
 pub mod error;
 pub mod hub;
 mod hub_mixer;
+mod hub_prefs;
 pub mod identity;
 pub mod media;
 pub mod netsim;

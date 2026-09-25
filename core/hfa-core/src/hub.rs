@@ -25,7 +25,10 @@
 //!     ([`HubEvent::SourceRemoved`]); `Ping` is answered with `Pong`.
 //!   - The hub's own controls ([`HubHandle::set_gain`], ...) are forwarded to the sender as
 //!     `SetVolume` / `SetMute` / `SetPriority` so its UI can show them. Controls are
-//!     remembered per device id and re-applied when the device reconnects.
+//!     remembered per device id and re-applied when the device reconnects, also after a hub
+//!     restart: they are saved in `<data_dir>/`[`HUB_CONTROLS_FILE`] (at most
+//!     [`PREFS_SAVE_DELAY`] after a change, and when the hub stops) and loaded on start;
+//!     devices that are no longer trusted are left out.
 //! - **Receive task** (tokio): UDP (a 64 KiB buffer, so an oversize datagram cannot make the
 //!   receive fail on Windows; per-datagram errors never pause the loop) →
 //!   [`MediaDemux::open`] (authentication, replay window) →
@@ -71,6 +74,7 @@ use crate::config::{Settings, FRAME_MS_CHOICES};
 use crate::control::{ControlChannel, PeerInfo};
 use crate::discovery::Advertiser;
 use crate::hub_mixer::{Controls, MixStream, MixerCommand, StreamShared};
+pub use crate::hub_prefs::HUB_CONTROLS_FILE;
 use crate::identity::{Identity, TrustStore};
 use crate::media::MediaDemux;
 use crate::pairing::{PairingInfo, PairingManager, DEFAULT_PAIRING_TTL};
@@ -103,6 +107,9 @@ pub const NO_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// An authenticated connection that sent nothing (senders `Ping` every second) for this long
 /// is closed: its peer is gone, e.g. it changed networks and left a half-open connection.
 pub const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long after a control change the remembered controls are saved (changes in between,
+/// e.g. a slider drag, are saved together).
+pub const PREFS_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Jitter-buffer target before the first jitter estimate (clamped to the settings' bounds).
 const INITIAL_JITTER_TARGET_MS: u32 = 40;
 /// Capacity of the event channel.
@@ -285,6 +292,12 @@ impl HubEngine {
             )));
         }
         let (identity, trust) = load_identity(&settings).await?;
+        let prefs = {
+            let (dir, trust) = (settings.data_dir.clone(), trust.clone());
+            tokio::task::spawn_blocking(move || crate::hub_prefs::load(&dir, &trust))
+                .await
+                .unwrap_or_default()
+        };
         let (listener, udp) = bind(settings.port).await?;
         let port = listener.local_addr()?.port();
 
@@ -341,7 +354,11 @@ impl HubEngine {
             settings,
             port,
             events: events.clone(),
-            state: Mutex::new(HubState::default()),
+            state: Mutex::new(HubState {
+                sources: Vec::new(),
+                prefs,
+            }),
+            prefs_changed: tokio::sync::Notify::new(),
             demux: Mutex::new(MediaDemux::new()),
             streams: Mutex::new(HashMap::new()),
             mixer: mixer_tx,
@@ -363,7 +380,8 @@ impl HubEngine {
                 Arc::new(udp),
                 shutdown_rx.clone(),
             )),
-            tokio::spawn(stats_loop(Arc::clone(&shared), shutdown_rx)),
+            tokio::spawn(stats_loop(Arc::clone(&shared), shutdown_rx.clone())),
+            tokio::spawn(prefs_loop(Arc::clone(&shared), shutdown_rx)),
         ];
         Ok(HubHandle {
             events,
@@ -424,6 +442,8 @@ struct Shared {
     port: u16,
     events: broadcast::Sender<HubEvent>,
     state: Mutex<HubState>,
+    /// Signalled when the remembered controls changed (see [`prefs_loop`]).
+    prefs_changed: tokio::sync::Notify,
     demux: Mutex<MediaDemux>,
     /// Receive-path lookup of the streams' shared state.
     streams: Mutex<HashMap<u32, Arc<StreamShared>>>,
@@ -440,10 +460,9 @@ struct Shared {
 }
 
 /// Lock order: `state` → `demux` → `streams` → a stream's `state`.
-#[derive(Default)]
 struct HubState {
     sources: Vec<SourceEntry>,
-    /// Controls remembered per device id.
+    /// Controls remembered per device id (persisted, see [`prefs_loop`]).
     prefs: HashMap<String, Controls>,
 }
 
@@ -653,6 +672,7 @@ impl Shared {
             entry.info.muted = c.muted;
             entry.info.priority = c.priority;
             prefs.insert(entry.info.device_id.clone(), c);
+            self.prefs_changed.notify_one();
             // Both sends are non-blocking; doing them under the lock keeps the mixer and the
             // sender in the order in which concurrent calls changed `state` (a slider drag
             // through the FFI runs `set_gain` on several threads).
@@ -1094,6 +1114,39 @@ async fn receive_loop(
                 .lock()
                 .on_datagram(&header, payload, arrival_us, Instant::now());
         }
+    }
+}
+
+/// Saves the remembered controls [`PREFS_SAVE_DELAY`] after a change, and once more at
+/// shutdown if a change is still pending.
+async fn prefs_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            // A change that is still pending at shutdown is saved (below).
+            biased;
+            _ = shared.prefs_changed.notified() => {}
+            _ = wait_stop(&mut shutdown) => return,
+        }
+        let stopping = tokio::select! {
+            _ = tokio::time::sleep(PREFS_SAVE_DELAY) => false,
+            _ = wait_stop(&mut shutdown) => true,
+        };
+        save_prefs(&shared).await;
+        if stopping {
+            return;
+        }
+    }
+}
+
+async fn save_prefs(shared: &Arc<Shared>) {
+    let prefs = shared.state.lock().prefs.clone();
+    let (dir, trust) = (shared.settings.data_dir.clone(), shared.trust.clone());
+    let saved =
+        tokio::task::spawn_blocking(move || crate::hub_prefs::save(&dir, &prefs, &trust)).await;
+    match saved {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "cannot save the remembered hub controls"),
+        Err(e) => tracing::warn!(error = %e, "hub controls save task failed"),
     }
 }
 

@@ -330,6 +330,73 @@ async fn controls_are_remembered_per_device() {
     );
 }
 
+/// The remembered controls survive a hub restart (they are saved in the hub's data dir), and
+/// a forgotten device's controls are not kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remembered_controls_survive_a_hub_restart() {
+    let _serial = serial().await;
+    let hub_dev = Device::new("Hub");
+    let hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let pin = hub.hub.start_pairing().pin;
+    let dev = Device::new("Work laptop");
+    let identity = Identity::load_or_create(dev.path(), "Work laptop").expect("identity");
+    let trust = TrustStore::load(dev.path()).expect("trust");
+    let addr: SocketAddr = ([127, 0, 0, 1], hub.hub.local_port()).into();
+    let (mut ch, _) = ControlChannel::connect(addr, &identity, &trust, None, Some(pin))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        request(&mut ch, stream_start(1)).await,
+        Answer::Accepted { .. }
+    ));
+    hub.hub.set_gain(1, 0.25).expect("gain");
+    hub.hub.set_priority(1, true).expect("priority");
+    let _ = ch.close("done").await;
+    // Stopping saves a change that is still pending.
+    hub.hub.stop().await;
+    assert!(hub_dev
+        .path()
+        .join(hfa_core::hub::HUB_CONTROLS_FILE)
+        .exists());
+
+    let hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let addr: SocketAddr = ([127, 0, 0, 1], hub.hub.local_port()).into();
+    let (mut ch, _) = ControlChannel::connect(addr, &identity, &trust, None, None)
+        .await
+        .expect("reconnect");
+    match request(&mut ch, stream_start(2)).await {
+        Answer::Accepted {
+            gain,
+            muted,
+            priority,
+        } => assert_eq!(
+            (gain, muted, priority),
+            (Some(0.25), Some(false), Some(true))
+        ),
+        other => panic!("{other:?}"),
+    }
+    let _ = ch.close("done").await;
+    hub.hub.stop().await;
+
+    // Forgetting the device drops its controls.
+    let hub_trust = TrustStore::load(hub_dev.path()).expect("hub trust");
+    assert!(hub_trust.remove(&identity.device_id).expect("remove"));
+    let hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let pin = hub.hub.start_pairing().pin;
+    let addr: SocketAddr = ([127, 0, 0, 1], hub.hub.local_port()).into();
+    let (mut ch, _) = ControlChannel::connect(addr, &identity, &trust, None, Some(pin))
+        .await
+        .expect("pair again");
+    match request(&mut ch, stream_start(3)).await {
+        Answer::Accepted { gain, priority, .. } => {
+            assert_eq!((gain, priority), (Some(1.0), Some(false)))
+        }
+        other => panic!("{other:?}"),
+    }
+    let _ = ch.close("done").await;
+    hub.hub.stop().await;
+}
+
 /// Connections that do not speak are refused beyond a few per address and closed after
 /// `FIRST_MESSAGE_TIMEOUT`; after that a real sender connects normally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

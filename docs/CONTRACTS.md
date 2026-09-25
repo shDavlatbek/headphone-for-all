@@ -939,6 +939,13 @@ Modules:
   inactive duplicates for `REMOVE_AFTER` or hold a `MAX_STREAMS` slot); such a connection is closed with
   `Bye("replaced by a new connection")` once it owns no stream. An authenticated connection that sent nothing for
   **`CONTROL_IDLE_TIMEOUT = 15 s`** (senders ping every second) is closed with `Bye("nothing received for 15 s")`.
+- **Remembered controls are persisted** (replaces "for the hub's lifetime" in §6.3): per-device gain/mute/priority
+  live in **`<data_dir>/hub_controls.json`** (`hub::HUB_CONTROLS_FILE`; `{"version":1,"devices":{"<device id>":
+  {"gain":f32,"muted":bool,"priority":bool}}}`, atomic rewrite, mode 0644), loaded by `HubEngine::start` and saved
+  `hub::PREFS_SAVE_DELAY = 500 ms` after a change (changes in between are batched) and at `HubHandle::stop` if a
+  change is pending. Devices that are not (or no longer) trusted are dropped on load and on save; a missing,
+  unreadable or corrupt file is logged and treated as empty (never fatal). The **master gain is not persisted by
+  the core** (the app shows and re-applies it; persisting it needs `HubStatusDto` support in `hfa-ffi`/Dart).
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 
