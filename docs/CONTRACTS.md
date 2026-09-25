@@ -873,13 +873,20 @@ Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `
   (`hfa-ffi` threads), a `lifecycle` mutex that serializes blocking operations (init, start, stop) and a `state`
   mutex held only briefly, so getters never wait for a hub or capture that is starting. Engine futures are driven with
   `Runtime::block_on` from the calling frb worker thread (refused with `FfiError::Internal` inside an async context).
+- **Trust is never cached by the manager.** `HubConfig` / `SenderConfig` carry no `TrustStore`: each engine loads its
+  own from `settings.data_dir` and saves the pairings it makes. So `trusted_peers`, `forget_peer`, the key pinning of
+  `sender_start` and the `trusted` flag of discovery events (per event) load `trusted.json` afresh; a snapshot from
+  `init_app` would miss those pairings, and `forget_peer` saving it would erase them. Known limit: a *running*
+  engine's own copy does not see a `forget_peer` until it restarts (and a later save by that engine could bring the
+  forgotten peer back). Fixing that needs a shared `TrustStore` field in `HubConfig` / `SenderConfig` (open contract
+  change for feat/core-engine); the UI should restart a running hub after forgetting a peer.
 
 **flutter_rust_bridge API** (Dart names: `initApp`, `hubStart`, ...; errors are `AnyhowException` with the
 `FfiError` message).
 - No function is `#[frb(sync)]`: all return `Future`s (also `hub_status`, `hub_sources`, `sender_status`), so the UI
   thread never blocks. `#[frb(init)] init_bridge()` runs inside `RustLib.init()` (panic backtraces; on Android/iOS it
   routes Rust logs to logcat / os_log).
-- `init_app(data_dir, device_name)`: creates `data_dir`, loads settings / identity / trust store and sets up logging
+- `init_app(data_dir, device_name)`: creates `data_dir`, loads settings / identity (and checks the trust store) and sets up logging
   (desktop: `tracing-subscriber` on stderr, `RUST_LOG`, default `info`). **`device_name` is only used on first run**
   (no `settings.json` yet; the settings are then saved), so a name the user changed later is kept. Calling it again
   with the same `data_dir` returns the current `AppInfo`; another `data_dir` is accepted only while no hub or sender
@@ -899,10 +906,17 @@ Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `
 - `hub_events(sink)` / `sender_events(sink)` register **subscriptions that survive engine restarts** (a forwarder task
   per running engine relays its `broadcast` channel; lagged events are skipped with a warning). `sender_events` sends
   the current status first; `sender_stop` sends the `idle` status. A subscription ends when the Dart stream is
-  cancelled (the next delivery fails and the sink is dropped).
+  cancelled (the next delivery fails and the sink is dropped). Ordering: the forwarder subscribes right after the
+  engine's `start` returns (before the initial status), and on stop it is drained until the engine's channel closes
+  (at most 500 ms, then aborted and joined), so **`idle` is always the last status** after `sender_stop` and no hub
+  event follows `hub_stop`.
 - `discover_hubs(sink)` does not need `init_app`; a second call replaces (and closes) the previous discovery stream.
-- `sender_start(request)`: one sender at a time (`a sender is already running`). Hub resolution (`hub_target.rs`):
-  non-empty `hub_host` → `HubAddress::Direct` (`hub_port` 0 → `settings.port`; IPv6 brackets stripped); empty host +
+- `sender_start(request)`: one **live** sender at a time (`a sender is already running` while it is `connecting`,
+  `pairing`, `streaming` or `reconnecting`). A sender that ended by itself (`failed`, e.g. pairing required / wrong
+  PIN / key mismatch, or `stopped`) is reaped by the next `sender_start` exactly like `sender_stop` does, so the UI
+  can simply call `sender_start` again with the PIN; if that start fails, an `idle` status is sent. Hub resolution
+  (`hub_target.rs`): non-empty `hub_host` → `HubAddress::Direct` (`hub_port` 0 → `settings.port`, and
+  `hfa_proto::DEFAULT_PORT` when that is 0 too — port 0 is never dialled; IPv6 brackets stripped); empty host +
   `hub_device_id` → `HubAddress::Discover` by id; `hub_key` (base64url, padded or not) must be the key of
   `hub_device_id` when both are given; without `hub_key` the trusted peer's key is pinned. A target that is this device
   (own key or device id) is refused (loop protection). `pairing_secret` is trimmed (empty = none); an empty `label`
@@ -915,7 +929,8 @@ Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `
 constants and prototypes).
 - New codes **`HFA_ERR_UNKNOWN_FEED = -4`** (JNI) and **`HFA_ERR_INTERNAL = -5`** (caught panic). Every entry point
   runs inside `catch_unwind`.
-- `config_json`: `{"data_dir": required, "hub_host": "" (= discover by id), "hub_port": 0 (= settings port),
+- `config_json`: `{"data_dir": required, "hub_host": "" (= discover by id), "hub_port": 0 (= settings port, or 47810
+  when that is 0),
   "hub_device_id": null, "hub_key": null, "label": "iOS audio"}`; unknown keys are ignored. The hub must already be
   trusted (`hub_key`, or `hub_device_id` in the trust store), otherwise `HFA_ERR_CONFIG`: pairing never happens in
   the extension. JSON / field errors → `HFA_ERR_CONFIG`, settings / identity / capture / engine errors →
@@ -951,8 +966,18 @@ Implemented with jni 0.22 (`EnvUnowned::with_env` + `Outcome`); works for a Kotl
   `../../../core/hfa-ffi` (Windows: 7 levels up, the plugin symlink is not resolved) with library `hfa_ffi`. Two
   cargokit patches (marked "headphone-for-all" in the code): `CrateInfo.libName` (`[lib] name` or the package name with
   `-` → `_`) names the artifacts, since cargokit assumed package name = library name (`hfa-ffi` vs `libhfa_ffi.so`);
-  and a debug Android build adds the extra `android-x64` ABI only when no `--target-platform` was given (and never the
-  unsupported `android-x86`). Pods: iOS 13.0, macOS 10.15.
+  a debug Android build adds the extra `android-x64` ABI only when no `--target-platform` was given (and never the
+  unsupported `android-x86`); and the Android build environment sets **`ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT`** to
+  the NDK Gradle chose (`android.ndkVersion`) and **`ANDROID_PLATFORM=android-<minSdk>`**, which opusic-sys' CMake
+  build of libopus needs (without it CMake fails with "Neither the NDK or a standalone toolchain was found"), so
+  IDE / `flutter run` builds need no manual export. Pods: iOS 13.0, macOS 10.15.
+- **Apple system frameworks.** A Rust staticlib does not carry its dependencies' `#[link(kind = "framework")]`
+  directives, and the pods `-force_load` `libhfa_ffi.a`, so the podspecs link them: macOS `CoreAudio`,
+  `AudioToolbox`, `CoreFoundation`, `Foundation`; iOS the same plus `AVFAudio`; both `libobjc` (from objc2-* crates
+  of hfa-capture and cpal; list derived from the `#[link]` attributes of the target's dependency tree, the same as
+  rustc's `--print native-static-libs`). **Any other target that links `libhfa_ffi.a` — the iOS broadcast upload
+  extension (feat/apple) — needs the same list** (`OTHER_LDFLAGS` or "Link Binary With Libraries"). Re-check the
+  list when Apple-side dependencies change.
 - `analysis_options.yaml` excludes `rust_builder/**` (cargokit's build tool is its own package).
 - Minimal `lib/main.dart`: `RustLib.init()` → `initApp(<getApplicationSupportDirectory()>/hfa)` → shows `AppInfo`
   (`HfaApp(appInfo: Future<AppInfo>)`, widget-tested with a fake future). `integration_test/bridge_test.dart` runs
@@ -965,7 +990,8 @@ Environment (dev container):
 ```sh
 export PATH=/opt/flutter/bin:/root/.cargo/bin:$PATH
 export ANDROID_HOME=/opt/android-sdk ANDROID_SDK_ROOT=/opt/android-sdk
-export ANDROID_NDK_HOME=/opt/android-sdk/ndk/29.0.14206865   # also used by opusic-sys' CMake build
+export ANDROID_NDK_HOME=/opt/android-sdk/ndk/29.0.14206865   # plain cargo Android builds only (opusic-sys'
+                                                             # CMake); cargokit sets it itself for flutter builds
 export CARGO_TARGET_DIR=/home/user/.cache/hfa-target CARGO_INCREMENTAL=0   # optional shared cache
 cargo install flutter_rust_bridge_codegen --version 2.13.0 --locked   # codegen (exactly 2.13.0)
 cargo install cargo-expand --locked   # codegen needs it (it installs it itself when missing)
