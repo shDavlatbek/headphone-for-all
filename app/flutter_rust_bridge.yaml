@@ -1,0 +1,6 @@
+# flutter_rust_bridge_codegen 2.13.0 configuration (run `flutter_rust_bridge_codegen generate`
+# from app/). Must match the `flutter_rust_bridge` versions in core/Cargo.toml and
+# pubspec.yaml exactly. See docs/CONTRACTS.md §8.
+rust_input: crate::api
+rust_root: ../core/hfa-ffi/
+dart_output: lib/src/rust
