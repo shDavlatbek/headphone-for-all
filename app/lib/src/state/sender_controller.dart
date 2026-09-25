@@ -381,6 +381,15 @@ class SenderController extends Notifier<SenderState> {
     }
   }
 
+  /// Stops a live sender and starts it again with the same hub and source
+  /// (e.g. so it picks up new settings). Android asks for consent again.
+  Future<void> restart() async {
+    if (!state.isLive) return;
+    await stop();
+    if (!ref.mounted || state.error != null) return;
+    await start();
+  }
+
   /// Stops streaming (and the Android capture service).
   Future<void> stop() async {
     if (state.busy) return;

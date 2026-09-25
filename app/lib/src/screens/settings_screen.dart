@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -5,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../api/hfa_api.dart';
 import '../state/core_providers.dart';
 import '../state/hub_controller.dart';
+import '../state/sender_controller.dart';
 import '../state/settings_controller.dart';
 import '../util/format.dart';
 import '../widgets/dialogs.dart';
@@ -17,6 +20,21 @@ const jitterSliderMin = 5.0;
 
 /// Upper bound of the jitter-buffer range slider (ms).
 const jitterSliderMax = 500.0;
+
+/// What saving tells the user: running engines keep their settings until
+/// restarted (§8.5), the hub for port, jitter and output, the sender for
+/// bitrate, frame length and FEC.
+String savedSettingsMessage({
+  required bool hubRunning,
+  required bool senderLive,
+}) => switch ((hubRunning, senderLive)) {
+  (true, true) =>
+    'Saved. Restart the hub, and stop and start sending, to apply the '
+        'changes.',
+  (true, false) => 'Saved. Restart the hub to apply the changes.',
+  (false, true) => 'Saved. Stop and start sending to apply the changes.',
+  (false, false) => 'Settings saved.',
+};
 
 /// Device name, audio quality, network, output device and trusted devices.
 class SettingsScreen extends ConsumerWidget {
@@ -132,20 +150,28 @@ class _SettingsFormState extends ConsumerState<SettingsForm> {
       _portError = null;
       _saving = true;
     });
+    // The notifiers outlive this form: a save that changes the settings
+    // replaces it (it is keyed by the saved value), so the snack bar's
+    // action must not use this widget's `ref`.
+    final hub = ref.read(hubControllerProvider.notifier);
+    final sender = ref.read(senderControllerProvider.notifier);
     try {
       await ref.read(settingsControllerProvider.notifier).save(_current());
       if (!mounted) return;
       final hubRunning = ref.read(hubControllerProvider).running;
+      final senderLive = ref.read(senderControllerProvider).isLive;
       showMessage(
         context,
-        hubRunning
-            ? 'Saved. Restart the hub to apply the changes.'
-            : 'Settings saved.',
+        savedSettingsMessage(hubRunning: hubRunning, senderLive: senderLive),
         action: hubRunning
             ? SnackBarAction(
                 label: 'Restart hub',
-                onPressed: () =>
-                    ref.read(hubControllerProvider.notifier).restart(),
+                onPressed: () => unawaited(hub.restart()),
+              )
+            : senderLive
+            ? SnackBarAction(
+                label: 'Restart sending',
+                onPressed: () => unawaited(sender.restart()),
               )
             : null,
       );
