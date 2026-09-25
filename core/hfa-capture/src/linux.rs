@@ -43,6 +43,13 @@
 //!   sandbox's Flatpak app id; streams that cannot be mapped unambiguously are not listed and
 //!   not matched by pid (system-excl still links them: they are never this process).
 //!
+//! **Connection loss:** when the connection to the daemon breaks after the source opened
+//! (PipeWire restarted or crashed), the capture thread reconnects by itself: every 250 ms at
+//! first, backing off to every 2 s, for up to 30 s. Each new connection creates the same
+//! stream again (same mode and links, same reported format, the started sink kept), so the
+//! owner sees a short gap in the audio. If the daemon is not back within 30 s the thread
+//! ends and [`CaptureSource::error`] reports it.
+//!
 //! Real-time rules: stream callbacks run on the capture thread's main loop (no
 //! `RT_PROCESS`). The `process` callback only dequeues a buffer, converts little-endian `f32`
 //! bytes through a preallocated scratch buffer and pushes them into the lock-free
@@ -1379,17 +1386,208 @@ enum Command {
     Stop,
 }
 
-type ReadySlot = Rc<RefCell<Option<SyncSender<Result<AudioFormat>>>>>;
+/// Where the open outcome goes, and what it was.
+enum Ready {
+    /// `open_*` is still waiting for the outcome.
+    Pending(SyncSender<Result<AudioFormat>>),
+    /// The source opened: a later connection loss is reconnected.
+    Opened,
+    /// Opening failed (reported to `open_*`).
+    Failed,
+}
 
-/// Reports the open outcome once (later calls are ignored).
+type ReadySlot = Rc<RefCell<Ready>>;
+
+/// Reports the open outcome once (later calls are ignored). Returns whether it was reported.
 fn signal_ready(slot: &ReadySlot, outcome: Result<AudioFormat>) -> bool {
-    let sender = slot.try_borrow_mut().ok().and_then(|mut s| s.take());
-    match sender {
-        Some(tx) => {
+    let Ok(mut state) = slot.try_borrow_mut() else {
+        return false;
+    };
+    let next = if outcome.is_ok() {
+        Ready::Opened
+    } else {
+        Ready::Failed
+    };
+    match std::mem::replace(&mut *state, next) {
+        Ready::Pending(tx) => {
             let _ = tx.try_send(outcome);
             true
         }
-        None => false,
+        previous => {
+            *state = previous;
+            false
+        }
+    }
+}
+
+/// Whether `open_*` is still waiting for the outcome.
+fn ready_pending(slot: &ReadySlot) -> bool {
+    slot.try_borrow()
+        .map(|s| matches!(*s, Ready::Pending(_)))
+        .unwrap_or(false)
+}
+
+/// Whether the source opened successfully.
+fn ready_opened(slot: &ReadySlot) -> bool {
+    slot.try_borrow()
+        .map(|s| matches!(*s, Ready::Opened))
+        .unwrap_or(false)
+}
+
+/// State of a capture thread that outlives one connection (session).
+struct CaptureState {
+    ready: ReadySlot,
+    /// Where captured audio goes; `None` until `start`.
+    sink: Rc<RefCell<Option<PcmSink>>>,
+    /// The format reported to `CaptureSource::format` (fixed once the source opened).
+    reported: Rc<std::cell::Cell<AudioFormat>>,
+    /// The command receiver, attached to the loop of whichever session runs.
+    commands: Option<pw::channel::Receiver<Command>>,
+}
+
+/// How a capture session (one connection to the daemon) ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    /// `stop` was called.
+    Stopped,
+    /// The connection to the daemon broke.
+    ConnectionLost,
+}
+
+/// Reconnect delays after a lost connection: `first`, doubling up to `max`, and whether to
+/// keep trying `elapsed` after the loss (given up after `window`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectPolicy {
+    first: Duration,
+    max: Duration,
+    window: Duration,
+}
+
+impl ReconnectPolicy {
+    /// The delay before the attempt that follows one that waited `previous` (`None`: first).
+    fn next_delay(self, previous: Option<Duration>) -> Duration {
+        previous.map_or(self.first, |d| (d * 2).min(self.max))
+    }
+
+    /// Whether another attempt is still worth it `elapsed` after the connection was lost.
+    fn keep_trying(self, elapsed: Duration) -> bool {
+        elapsed < self.window
+    }
+}
+
+/// The default policy: a restarted daemon (`systemctl --user restart pipewire`, a crash
+/// that systemd restarts) is back within a second or two.
+const RECONNECT: ReconnectPolicy = ReconnectPolicy {
+    first: Duration::from_millis(250),
+    max: Duration::from_secs(2),
+    window: Duration::from_secs(30),
+};
+
+/// Body of the capture thread: runs sessions until stopped. A lost connection of an opened
+/// source is reconnected (same stream properties, same links, the sink kept) for up to
+/// `policy.window`; after that the thread ends, which [`CaptureSource::error`] reports.
+fn capture_thread(
+    mode: Mode,
+    remote: Option<String>,
+    commands: pw::channel::Receiver<Command>,
+    ready: ReadySlot,
+    policy: ReconnectPolicy,
+) {
+    let mut state = CaptureState {
+        ready,
+        sink: Rc::new(RefCell::new(None)),
+        reported: Rc::new(std::cell::Cell::new(REQUESTED_FORMAT)),
+        commands: Some(commands),
+    };
+    let mut lost_at: Option<std::time::Instant> = None;
+    let mut delay = None;
+    loop {
+        let reconnecting = lost_at.is_some();
+        match run_capture(mode, remote.as_deref(), &mut state) {
+            Ok(SessionEnd::Stopped) => return,
+            Ok(SessionEnd::ConnectionLost) => {
+                if !ready_opened(&state.ready) {
+                    return; // `open_*` got the error
+                }
+                if reconnecting {
+                    tracing::debug!("PipeWire connection lost again while reconnecting");
+                } else {
+                    tracing::warn!("PipeWire connection lost; reconnecting the capture");
+                }
+                // A session that ran counts as a successful reconnect: a new window.
+                lost_at = Some(std::time::Instant::now());
+                delay = None;
+            }
+            Err(e) => {
+                if !ready_opened(&state.ready) {
+                    if !signal_ready(&state.ready, Err(e.clone())) {
+                        tracing::warn!(error = %e, "PipeWire capture thread failed");
+                    }
+                    return;
+                }
+                tracing::debug!(error = %e, "PipeWire reconnect attempt failed");
+                lost_at.get_or_insert_with(std::time::Instant::now);
+            }
+        }
+        let elapsed = lost_at.map_or(Duration::ZERO, |t| t.elapsed());
+        if !policy.keep_trying(elapsed) {
+            tracing::warn!(
+                secs = elapsed.as_secs(),
+                "PipeWire did not come back; the capture stops"
+            );
+            return;
+        }
+        let wait = policy.next_delay(delay);
+        delay = Some(wait);
+        if wait_for_retry(&mut state, wait) == SessionEnd::Stopped {
+            return;
+        }
+    }
+}
+
+/// Waits `delay` between two reconnect attempts while still obeying commands. Returns
+/// [`SessionEnd::Stopped`] if `stop` was called meanwhile.
+fn wait_for_retry(state: &mut CaptureState, delay: Duration) -> SessionEnd {
+    let Some(commands) = state.commands.take() else {
+        return SessionEnd::Stopped;
+    };
+    // A loop without a context: it needs no daemon.
+    let mainloop = match pw::main_loop::MainLoopRc::new(None) {
+        Ok(mainloop) => mainloop,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot create a PipeWire main loop; the capture stops");
+            return SessionEnd::Stopped;
+        }
+    };
+    let stopped = Rc::new(std::cell::Cell::new(false));
+    let attached = commands.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        let sink = Rc::clone(&state.sink);
+        let stopped = Rc::clone(&stopped);
+        move |command| match command {
+            Command::Start(new_sink) => {
+                if let Ok(mut slot) = sink.try_borrow_mut() {
+                    *slot = Some(new_sink);
+                }
+            }
+            Command::Stop => {
+                stopped.set(true);
+                mainloop.quit();
+            }
+        }
+    });
+    let timer = mainloop.loop_().add_timer({
+        let mainloop = mainloop.clone();
+        move |_| mainloop.quit()
+    });
+    let _ = timer.update_timer(Some(delay), None);
+    mainloop.run();
+    drop(timer);
+    state.commands = Some(attached.deattach());
+    if stopped.get() {
+        SessionEnd::Stopped
+    } else {
+        SessionEnd::ConnectionLost
     }
 }
 
@@ -1403,6 +1601,8 @@ struct StreamData {
     out_channels: usize,
     /// The format reported to `CaptureSource::format`.
     reported: AudioFormat,
+    /// Where `reported` is kept for the next session after a reconnect.
+    reported_shared: Rc<std::cell::Cell<AudioFormat>>,
     /// Preallocated conversion buffer (the process callback never allocates).
     scratch: Box<[f32]>,
     ready: ReadySlot,
@@ -1465,14 +1665,11 @@ fn stream_props(mode: Mode) -> pw::properties::PropertiesBox {
     props
 }
 
-/// Body of the capture thread. Returns when stopped or on a fatal error.
-fn run_capture(
-    mode: Mode,
-    remote: Option<String>,
-    commands: pw::channel::Receiver<Command>,
-    ready: ReadySlot,
-) -> Result<()> {
-    let conn = Connection::open(remote.as_deref())?;
+/// One capture session: connects, runs the loop until stopped or the connection breaks.
+/// Errors are setup failures (no daemon, stream creation...).
+fn run_capture(mode: Mode, remote: Option<&str>, state: &mut CaptureState) -> Result<SessionEnd> {
+    let conn = Connection::open(remote)?;
+    let ready = Rc::clone(&state.ready);
 
     let (lost_tx, lost_rx) = pw::channel::channel::<LinkLost>();
     let tracker = match mode {
@@ -1501,15 +1698,17 @@ fn run_capture(
         }
     });
 
-    let sink_slot: Rc<RefCell<Option<PcmSink>>> = Rc::new(RefCell::new(None));
+    let sink_slot = Rc::clone(&state.sink);
     let stream = pw::stream::StreamRc::new(conn.core.clone(), APP_NAME, stream_props(mode))
         .map_err(|e| backend("create stream", e))?;
-    let channels = usize::from(REQUESTED_FORMAT.channels);
+    let reported = state.reported.get();
+    let channels = usize::from(reported.channels);
     let data = StreamData {
         sink: Rc::clone(&sink_slot),
         in_channels: channels,
         out_channels: channels,
-        reported: REQUESTED_FORMAT,
+        reported,
+        reported_shared: Rc::clone(&state.reported),
         scratch: vec![0.0; SCRATCH_SAMPLES].into_boxed_slice(),
         ready: Rc::clone(&ready),
         tracker: tracker.as_ref().map(Rc::downgrade),
@@ -1544,13 +1743,9 @@ fn run_capture(
             match parse_format_pod(param) {
                 Ok(format) => {
                     data.in_channels = usize::from(format.channels);
-                    let pending = data
-                        .ready
-                        .try_borrow()
-                        .map(|s| s.is_some())
-                        .unwrap_or(false);
-                    if pending {
+                    if ready_pending(&data.ready) {
                         data.reported = format;
+                        data.reported_shared.set(format);
                         data.out_channels = usize::from(format.channels);
                         signal_ready(&data.ready, Ok(format));
                         tracing::debug!(?format, "PipeWire capture format negotiated");
@@ -1585,16 +1780,24 @@ fn run_capture(
         .connect(spa::utils::Direction::Input, None, flags, &mut params)
         .map_err(|e| backend("connect stream", e))?;
 
-    let _commands = commands.attach(conn.mainloop.loop_(), {
+    let Some(commands) = state.commands.take() else {
+        return Ok(SessionEnd::Stopped);
+    };
+    let stopped = Rc::new(std::cell::Cell::new(false));
+    let commands = commands.attach(conn.mainloop.loop_(), {
         let mainloop = conn.mainloop.clone();
         let sink_slot = Rc::clone(&sink_slot);
+        let stopped = Rc::clone(&stopped);
         move |command| match command {
             Command::Start(sink) => {
                 if let Ok(mut slot) = sink_slot.try_borrow_mut() {
                     *slot = Some(sink);
                 }
             }
-            Command::Stop => mainloop.quit(),
+            Command::Stop => {
+                stopped.set(true);
+                mainloop.quit();
+            }
         }
     });
     let _core_listener = conn
@@ -1605,7 +1808,7 @@ fn run_capture(
             let ready = Rc::clone(&ready);
             move |id, _seq, res, message| {
                 if id == pw::core::PW_ID_CORE && is_connection_error(res) {
-                    tracing::warn!(res, message, "PipeWire connection lost; capture stops");
+                    tracing::debug!(res, message, "PipeWire connection lost");
                     signal_ready(
                         &ready,
                         Err(CaptureError::Backend(format!(
@@ -1631,10 +1834,15 @@ fn run_capture(
 
     conn.mainloop.run();
 
+    state.commands = Some(commands.deattach());
     if let Err(e) = stream.disconnect() {
         tracing::debug!(error = %e, "PipeWire stream disconnect failed");
     }
-    Ok(())
+    Ok(if stopped.get() {
+        SessionEnd::Stopped
+    } else {
+        SessionEnd::ConnectionLost
+    })
 }
 
 /// A running PipeWire capture (see the module docs).
@@ -1649,17 +1857,23 @@ struct PipeWireCapture {
 impl PipeWireCapture {
     /// Spawns the capture thread, connects the stream and waits for the negotiated format.
     fn open(mode: Mode, description: String, remote: Option<String>) -> Result<Self> {
+        Self::open_with(mode, description, remote, RECONNECT)
+    }
+
+    /// [`PipeWireCapture::open`] with a reconnect policy (tests use short ones).
+    fn open_with(
+        mode: Mode,
+        description: String,
+        remote: Option<String>,
+        policy: ReconnectPolicy,
+    ) -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<AudioFormat>>(1);
         let (commands, command_rx) = pw::channel::channel::<Command>();
         let thread = std::thread::Builder::new()
             .name("hfa-pw-capture".to_owned())
             .spawn(move || {
-                let ready: ReadySlot = Rc::new(RefCell::new(Some(ready_tx)));
-                if let Err(e) = run_capture(mode, remote, command_rx, Rc::clone(&ready)) {
-                    if !signal_ready(&ready, Err(e.clone())) {
-                        tracing::warn!(error = %e, "PipeWire capture thread failed");
-                    }
-                }
+                let ready: ReadySlot = Rc::new(RefCell::new(Ready::Pending(ready_tx)));
+                capture_thread(mode, remote, command_rx, ready, policy);
             })
             .map_err(|e| backend("spawn capture thread", e))?;
 
@@ -1851,6 +2065,52 @@ mod tests {
         assert!(!is_connection_error(-libc::EINVAL));
         assert!(!is_connection_error(0));
         assert!(!is_connection_error(i32::MIN));
+    }
+
+    #[test]
+    fn reconnect_delays_double_up_to_a_cap_within_a_window() {
+        let policy = ReconnectPolicy {
+            first: Duration::from_millis(250),
+            max: Duration::from_secs(2),
+            window: Duration::from_secs(30),
+        };
+        let mut delay = None;
+        let delays: Vec<u64> = (0..6)
+            .map(|_| {
+                let d = policy.next_delay(delay);
+                delay = Some(d);
+                d.as_millis() as u64
+            })
+            .collect();
+        assert_eq!(delays, [250, 500, 1000, 2000, 2000, 2000]);
+        assert!(policy.keep_trying(Duration::ZERO));
+        assert!(policy.keep_trying(Duration::from_secs(29)));
+        assert!(!policy.keep_trying(Duration::from_secs(30)));
+        // The production policy gives a restarted daemon time to come back.
+        assert!(RECONNECT.window >= Duration::from_secs(10));
+        assert!(RECONNECT.first < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_open_outcome_is_reported_once_and_remembered() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let slot: ReadySlot = Rc::new(RefCell::new(Ready::Pending(tx)));
+        assert!(ready_pending(&slot) && !ready_opened(&slot));
+        assert!(signal_ready(&slot, Ok(REQUESTED_FORMAT)));
+        assert_eq!(rx.try_recv().expect("outcome"), Ok(REQUESTED_FORMAT));
+        assert!(ready_opened(&slot) && !ready_pending(&slot));
+        // A later connection loss does not turn an opened source into a failed open.
+        let lost = CaptureError::Backend("lost".into());
+        assert!(!signal_ready(&slot, Err(lost.clone())));
+        assert!(ready_opened(&slot));
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let slot: ReadySlot = Rc::new(RefCell::new(Ready::Pending(tx)));
+        assert!(signal_ready(&slot, Err(lost.clone())));
+        assert_eq!(rx.try_recv().expect("outcome"), Err(lost));
+        assert!(!ready_opened(&slot) && !ready_pending(&slot));
+        assert!(!signal_ready(&slot, Ok(REQUESTED_FORMAT)));
+        assert!(!ready_opened(&slot));
     }
 
     #[test]
@@ -3004,6 +3264,115 @@ mod tests {
                 "late stream not linked ({} frames captured)",
                 left.len()
             );
+        }
+
+        /// A private PipeWire daemon (`PIPEWIRE_CORE=<name>`, no session manager) that the
+        /// test can kill and restart without touching the shared test daemon.
+        struct PrivateDaemon {
+            name: &'static str,
+            child: Option<Child>,
+        }
+
+        impl PrivateDaemon {
+            fn start(name: &'static str) -> Self {
+                let mut daemon = Self { name, child: None };
+                daemon.restart();
+                daemon
+            }
+
+            fn restart(&mut self) {
+                self.kill();
+                let child = Process::new("pipewire")
+                    .env("PIPEWIRE_CORE", self.name)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn pipewire");
+                self.child = Some(child);
+                let t0 = Instant::now();
+                while Connection::open(Some(self.name)).is_err() {
+                    assert!(
+                        t0.elapsed() < Duration::from_secs(5),
+                        "daemon did not start"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            fn kill(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+
+            /// Whether our capture stream is a node of this daemon.
+            fn has_capture_node(&self) -> bool {
+                Process::new("pw-dump")
+                    .args(["-r", self.name])
+                    .output()
+                    .is_ok_and(|out| {
+                        String::from_utf8_lossy(&out.stdout)
+                            .contains(&format!("\"node.name\": \"{APP_NAME}\""))
+                    })
+            }
+        }
+
+        impl Drop for PrivateDaemon {
+            fn drop(&mut self) {
+                self.kill();
+            }
+        }
+
+        fn wait_until(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
+            let t0 = Instant::now();
+            while !done() {
+                assert!(t0.elapsed() < timeout, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        #[test]
+        #[ignore = "needs a running PipeWire daemon (see module docs)"]
+        fn live_capture_reconnects_after_a_daemon_restart_and_reports_a_lost_daemon() {
+            let _serial = serial();
+            let mut daemon = PrivateDaemon::start("hfa-test-reconnect");
+            let policy = ReconnectPolicy {
+                first: Duration::from_millis(50),
+                max: Duration::from_millis(200),
+                window: Duration::from_secs(2),
+            };
+            let mut source = PipeWireCapture::open_with(
+                Mode::Linked(NodeFilter::AllExcept(std::process::id())),
+                "reconnect test".into(),
+                Some(daemon.name.into()),
+                policy,
+            )
+            .expect("open");
+            source.start(pcm_ring(1024).0).expect("start");
+            wait_until("the capture node", Duration::from_secs(3), || {
+                daemon.has_capture_node()
+            });
+
+            // The daemon restarts: the capture comes back by itself and reports no error.
+            daemon.kill();
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(source.error(), None, "reconnecting is not an error");
+            daemon.restart();
+            wait_until(
+                "the reconnected capture node",
+                Duration::from_secs(3),
+                || daemon.has_capture_node(),
+            );
+            assert_eq!(source.error(), None);
+
+            // The daemon stays away: after the reconnect window the capture reports it.
+            daemon.kill();
+            wait_until("the capture error", Duration::from_secs(5), || {
+                source.error().is_some()
+            });
+            assert!(source.error().is_some_and(|e| e.contains("PipeWire")));
+            source.stop();
         }
     }
 }
