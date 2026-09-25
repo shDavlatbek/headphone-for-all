@@ -17,7 +17,7 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     pub data_dir: Option<PathBuf>,
 
-    /// More logging (-v: debug, -vv: trace). `RUST_LOG` overrides it.
+    /// More logging (-v: info, -vv: debug, -vvv: trace). `RUST_LOG` overrides it.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
@@ -153,17 +153,30 @@ pub enum TrustCommand {
 /// `hfa selftest`.
 #[derive(Debug, Args)]
 pub struct SelftestArgs {
-    /// Test duration in seconds.
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=3600))]
+    /// Seconds of audio to analyse (at most 600: the hub's WAV takes 23 MB per minute).
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=600))]
     pub seconds: u32,
 
     /// Simulated packet loss in percent (0-100).
     #[arg(long, default_value_t = 0.0, value_parser = parse_percent)]
     pub loss: f32,
 
-    /// Simulated network jitter in ms (uniform 0..=N extra delay per packet).
-    #[arg(long, default_value_t = 0)]
+    /// Simulated network jitter in ms (uniform 0..=N extra delay per packet, which also
+    /// reorders packets).
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=1000))]
     pub jitter: u32,
+
+    /// Number of tone senders (440, 1000, 2500, 4000, 6000, 1500, 3200, 5000 Hz).
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=8))]
+    pub senders: u8,
+
+    /// Seed of the network impairment (default: random, printed).
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Keep the hub's output in this WAV file (default: a temporary file, deleted).
+    #[arg(long, value_name = "PATH")]
+    pub wav: Option<PathBuf>,
 }
 
 /// A `host[:port]` pair; the port defaults to [`hfa_proto::DEFAULT_PORT`].
@@ -356,6 +369,13 @@ mod tests {
     }
 
     #[test]
+    fn help_matches_the_log_levels() {
+        // main.rs::default_filter: -v info, -vv debug, -vvv trace.
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("-v: info, -vv: debug, -vvv: trace"), "{help}");
+    }
+
+    #[test]
     fn parses_send_command() {
         let cli = Cli::try_parse_from([
             "hfa",
@@ -448,10 +468,31 @@ mod tests {
         match cli.command {
             Command::Selftest(a) => {
                 assert_eq!((a.seconds, a.loss, a.jitter), (3, 5.0, 20));
+                assert_eq!((a.senders, a.seed, a.wav), (2, None, None));
             }
             other => panic!("unexpected {other:?}"),
         }
         assert!(Cli::try_parse_from(["hfa", "selftest", "--loss", "101"]).is_err());
+        assert!(Cli::try_parse_from(["hfa", "selftest", "--senders", "0"]).is_err());
+        assert!(Cli::try_parse_from(["hfa", "selftest", "--senders", "9"]).is_err());
+        let cli = Cli::try_parse_from([
+            "hfa",
+            "selftest",
+            "--senders",
+            "4",
+            "--seed",
+            "7",
+            "--wav",
+            "/tmp/o.wav",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Selftest(a) => {
+                assert_eq!((a.senders, a.seed), (4, Some(7)));
+                assert_eq!(a.wav, Some(PathBuf::from("/tmp/o.wav")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
         assert!(matches!(
             Cli::try_parse_from(["hfa", "devices"]).unwrap().command,
             Command::Devices
