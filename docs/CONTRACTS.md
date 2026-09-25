@@ -854,6 +854,158 @@ Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `
 - `src/api/mod.rs` is a placeholder; `feat/ffi` adds `flutter_rust_bridge` to `hfa-ffi/Cargo.toml` itself.
 - `src/android.rs` is compiled only for `target_os = "android"`; `jni` (0.22) is already an Android-only dependency.
 
+### 8.5 Refinements made by `feat/ffi` (the code in `core/hfa-ffi` and `app/` is authoritative)
+
+**Crate layout and features.**
+- Modules: `api/{app,hub,sender}.rs` (the only frb input), `frb_generated.rs` (generated, committed),
+  `manager.rs` (`EngineManager`), `convert.rs` (engine type ↔ DTO conversions, unit-tested), `hub_target.rs`
+  (hub address / expected key resolution shared by the API and the C ABI), `feeds.rs` (external feeds registered by
+  the app, looked up by the JNI side), `pcm.rs` (`PcmConverter`: any rate/channels → 48 kHz stereo), `runtime.rs`,
+  `logging.rs`, `error.rs` (`FfiError`, thiserror), `c_api.rs`, `android.rs`.
+- `flutter_rust_bridge = "=2.13.0"` (exactly the codegen version) is a workspace dependency; `log = "0.4.34"` too
+  (tiny edit of the scaffold-owned `core/Cargo.toml`). Features of `hfa-ffi`: `default = ["bundled-opus", "flutter"]`.
+  **`flutter`** compiles `api`, `manager`, `convert` and `frb_generated`. flutter_rust_bridge builds C shims on Apple
+  targets (`dart-sys`, `oslog`, they need Xcode), so `cargo check --target aarch64-apple-ios --no-default-features`
+  on Linux checks the C ABI and all engine code without the frb API (same idea as `bundled-opus`, §11). Every app
+  build uses the defaults. `tests/api_lifecycle.rs` (`required-features = ["flutter"]`) exercises the API against
+  the real engines and is `#[ignore]`d until `hfa-core` is implemented (run it with `-- --ignored`).
+- `EngineManager`: `OnceLock` global created on first use; owns a 2-worker multi-thread tokio runtime
+  (`hfa-ffi` threads), a `lifecycle` mutex that serializes blocking operations (init, start, stop) and a `state`
+  mutex held only briefly, so getters never wait for a hub or capture that is starting. Engine futures are driven with
+  `Runtime::block_on` from the calling frb worker thread (refused with `FfiError::Internal` inside an async context).
+
+**flutter_rust_bridge API** (Dart names: `initApp`, `hubStart`, ...; errors are `AnyhowException` with the
+`FfiError` message).
+- No function is `#[frb(sync)]`: all return `Future`s (also `hub_status`, `hub_sources`, `sender_status`), so the UI
+  thread never blocks. `#[frb(init)] init_bridge()` runs inside `RustLib.init()` (panic backtraces; on Android/iOS it
+  routes Rust logs to logcat / os_log).
+- `init_app(data_dir, device_name)`: creates `data_dir`, loads settings / identity / trust store and sets up logging
+  (desktop: `tracing-subscriber` on stderr, `RUST_LOG`, default `info`). **`device_name` is only used on first run**
+  (no `settings.json` yet; the settings are then saved), so a name the user changed later is kept. Calling it again
+  with the same `data_dir` returns the current `AppInfo`; another `data_dir` is accepted only while no hub or sender
+  runs. `AppInfo.capabilities.external_only` is `true` on Android and iOS.
+- `SettingsDto` validation (`FfiError::InvalidArgument` naming the field): `device_name` trimmed, 1..=64 chars, no
+  control characters; `bitrate` 6000..=510000; `frame_ms` 10 | 20; `1 <= jitter_min_ms <= jitter_max_ms <= 2000`;
+  any `port` (0 = any free port). `output_device: None` = OS default output (WAV / null outputs set by the CLI read
+  as `None` and become `Default` when the app saves). Changes apply to engines started afterwards.
+- Unix times are **`i64`** (Dart `int`; `u64` would be `BigInt`): `TrustedPeerDto.paired_at_unix`,
+  `PairingInfoDto.expires_at_unix` (saturating).
+- `PairingUriDto` gains **`hub_device_id`** (fingerprint); `hub_id` is the unpadded base64url static key (pass it as
+  `SenderStartDto.hub_key`, and `token` as `pairing_secret`). `HubInfoDto` gains **`trusted: bool`** (hub is paired;
+  `false` before `init_app`).
+- `hub_start()` is idempotent (returns the running hub's status); it opens `settings.output` with a 20 ms device
+  buffer and advertises over mDNS. `hub_stop` / `sender_stop` / `stop_discovery` are idempotent. Hub controls and
+  pairing fail with "the hub is not running" while stopped; gains must be finite and within 0..=4.
+- `hub_events(sink)` / `sender_events(sink)` register **subscriptions that survive engine restarts** (a forwarder task
+  per running engine relays its `broadcast` channel; lagged events are skipped with a warning). `sender_events` sends
+  the current status first; `sender_stop` sends the `idle` status. A subscription ends when the Dart stream is
+  cancelled (the next delivery fails and the sink is dropped).
+- `discover_hubs(sink)` does not need `init_app`; a second call replaces (and closes) the previous discovery stream.
+- `sender_start(request)`: one sender at a time (`a sender is already running`). Hub resolution (`hub_target.rs`):
+  non-empty `hub_host` → `HubAddress::Direct` (`hub_port` 0 → `settings.port`; IPv6 brackets stripped); empty host +
+  `hub_device_id` → `HubAddress::Discover` by id; `hub_key` (base64url, padded or not) must be the key of
+  `hub_device_id` when both are given; without `hub_key` the trusted peer's key is pinned. A target that is this device
+  (own key or device id) is refused (loop protection). `pairing_secret` is trimmed (empty = none); an empty `label`
+  becomes "System audio" / "App <pid>" / "Tone <f> Hz" / "Device audio". `CaptureSourceDto::External` registers the
+  feed (1..=8 channels, 8000..=192000 Hz) before opening the capture and unregisters it on `sender_stop` or failure.
+- `SenderStatusDto.error` is the failure reason when `state == "failed"`, else the last `SenderEvent::Error`;
+  `hub_name` comes from `Connected` / `Paired` events.
+
+**C ABI** (`c_api.rs`, header `core/hfa-ffi/include/hfa_ext.h`, hand-written; a unit test checks it against the Rust
+constants and prototypes).
+- New codes **`HFA_ERR_UNKNOWN_FEED = -4`** (JNI) and **`HFA_ERR_INTERNAL = -5`** (caught panic). Every entry point
+  runs inside `catch_unwind`.
+- `config_json`: `{"data_dir": required, "hub_host": "" (= discover by id), "hub_port": 0 (= settings port),
+  "hub_device_id": null, "hub_key": null, "label": "iOS audio"}`; unknown keys are ignored. The hub must already be
+  trusted (`hub_key`, or `hub_device_id` in the trust store), otherwise `HFA_ERR_CONFIG`: pairing never happens in
+  the extension. JSON / field errors → `HFA_ERR_CONFIG`, settings / identity / capture / engine errors →
+  `HFA_ERR_ENGINE`. Each handle owns its own tokio runtime and an external feed (ids from `0xE7E7_0000`) registered
+  as `AudioFormat::INTERNAL`.
+- `hfa_ext_last_error()`: thread-local; **every `hfa_ext_*` call clears it first**, so it is NULL after a successful
+  call; the pointer is valid until the next `hfa_ext_*` call on that thread.
+- `hfa_ext_push_pcm`: at most 1 536 000 samples per call; audio pushed while the sender is still connecting is
+  dropped (`HFA_OK`); a handle must not be used from two threads at once. `hfa_ext_sender_stop` frees the handle
+  in every case (it returns `HFA_ERR_ENGINE` if stopping failed).
+
+**JNI** (`android.rs`): `pushPcm` / `pushPcm16` return `0` (also while no source is attached), `-1` (negative
+sizes, array shorter than `frames * channels`, more than 1 536 000 samples, format different from the one given to
+`sender_start`), `-4` (unknown feed id: before `sender_start` / after `sender_stop`), `-3` (JNI error), `-5` (panic).
+They never throw. Each calling thread reuses its own sample buffers (no per-call allocation once warm).
+Implemented with jni 0.22 (`EnvUnowned::with_env` + `Outcome`); works for a Kotlin `object` or a class
+(the second JNI argument is ignored).
+
+**Flutter project** (`app/`).
+- Created with `flutter create --org io.github.shdavlatbek --project-name headphone_for_all --platforms
+  android,ios,macos,windows,linux app`. Identifiers: Android `namespace`/`applicationId` `io.github.shdavlatbek.hfa`
+  (`MainActivity` in `io.github.shdavlatbek.hfa`), `minSdk = 29`, `ndkVersion = "29.0.14206865"`; iOS / macOS
+  `PRODUCT_BUNDLE_IDENTIFIER = io.github.shdavlatbek.hfa` (tests: `….RunnerTests`); display name "Headphone for All"
+  (Android label, iOS `CFBundleDisplayName`, macOS `CFBundleName`/`CFBundleDisplayName`, Linux/Windows window titles,
+  Windows version resource); Linux `APPLICATION_ID = io.github.shdavlatbek.hfa`. Binary / `PRODUCT_NAME` stay
+  `headphone_for_all`.
+- `pubspec.yaml` (as `flutter_rust_bridge_codegen integrate` wires it): `rust_lib_headphone_for_all` (path
+  `rust_builder`), `flutter_rust_bridge: 2.13.0`, dev `integration_test`; plus `path_provider`, `freezed_annotation`
+  and dev `freezed` + `build_runner` (**enums with data become `freezed` sealed classes**: `HubEventDto`,
+  `DiscoveryEventDto`, `CaptureSourceDto`, e.g. `HubEventDto_SourceAdded`; codegen runs `build_runner` and the
+  `*.freezed.dart` files are committed with the rest of `lib/src/rust/`).
+- `app/rust_builder/` is the integrate template for package `rust_lib_headphone_for_all`, pointing at
+  `../../../core/hfa-ffi` (Windows: 7 levels up, the plugin symlink is not resolved) with library `hfa_ffi`. Two
+  cargokit patches (marked "headphone-for-all" in the code): `CrateInfo.libName` (`[lib] name` or the package name with
+  `-` → `_`) names the artifacts, since cargokit assumed package name = library name (`hfa-ffi` vs `libhfa_ffi.so`);
+  and a debug Android build adds the extra `android-x64` ABI only when no `--target-platform` was given (and never the
+  unsupported `android-x86`). Pods: iOS 13.0, macOS 10.15.
+- `analysis_options.yaml` excludes `rust_builder/**` (cargokit's build tool is its own package).
+- Minimal `lib/main.dart`: `RustLib.init()` → `initApp(<getApplicationSupportDirectory()>/hfa)` → shows `AppInfo`
+  (`HfaApp(appInfo: Future<AppInfo>)`, widget-tested with a fake future). `integration_test/bridge_test.dart` runs
+  against the real library (`flutter test integration_test -d linux`, passes under `xvfb-run`).
+
+### 8.6 Build commands (used and verified by `feat/ffi`; seed for `docs/BUILDING.md`)
+
+Environment (dev container):
+
+```sh
+export PATH=/opt/flutter/bin:/root/.cargo/bin:$PATH
+export ANDROID_HOME=/opt/android-sdk ANDROID_SDK_ROOT=/opt/android-sdk
+export ANDROID_NDK_HOME=/opt/android-sdk/ndk/29.0.14206865   # also used by opusic-sys' CMake build
+export CARGO_TARGET_DIR=/home/user/.cache/hfa-target CARGO_INCREMENTAL=0   # optional shared cache
+cargo install flutter_rust_bridge_codegen --version 2.13.0 --locked   # codegen (exactly 2.13.0)
+cargo install cargo-expand --locked   # codegen needs it (it installs it itself when missing)
+```
+
+Rust (from the repository root):
+
+```sh
+cargo fmt --manifest-path core/Cargo.toml --all -- --check
+cargo clippy --manifest-path core/Cargo.toml --workspace --all-targets -- -D warnings
+cargo test --manifest-path core/Cargo.toml --workspace
+cargo clippy --manifest-path core/Cargo.toml --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+cargo check --manifest-path core/Cargo.toml -p hfa-ffi --target aarch64-apple-ios --no-default-features
+cargo check --manifest-path core/Cargo.toml --workspace --all-targets --target aarch64-apple-darwin --no-default-features
+# Android (JNI code): NDK clang as C compiler and linker
+TC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+ANDROID_PLATFORM=android-29 CC_aarch64_linux_android=$TC/aarch64-linux-android29-clang \
+  AR_aarch64_linux_android=$TC/llvm-ar CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TC/aarch64-linux-android29-clang \
+  cargo clippy --manifest-path core/Cargo.toml -p hfa-ffi --all-targets --target aarch64-linux-android -- -D warnings
+cargo test --manifest-path core/Cargo.toml -p hfa-ffi --test api_lifecycle -- --ignored   # once hfa-core is implemented
+```
+
+Bindings and Flutter (from `app/`):
+
+```sh
+flutter_rust_bridge_codegen generate   # rewrites lib/src/rust/** and core/hfa-ffi/src/frb_generated.rs;
+                                        # must leave `git status` clean when the API did not change
+flutter pub get
+flutter analyze
+flutter test
+xvfb-run -a flutter test integration_test -d linux   # real Rust library (needs a display)
+flutter build linux --debug      # cargokit builds core/hfa-ffi for the host (GTK3 dev, ninja, clang, cmake)
+flutter build apk --debug --target-platform android-arm64   # cargokit + NDK 29.0.14206865 (arm64-v8a)
+flutter build apk --release      # arm64-v8a, armeabi-v7a, x86_64
+flutter build windows | macos | ios   # on the matching OS (CI)
+```
+
+Clean up after local builds: `rm -rf app/build app/.dart_tool/flutter_build app/android/.gradle app/android/app/build`
+(cargokit puts its own Rust target directory under `app/build`).
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |
@@ -890,6 +1042,7 @@ Latest stable releases as of 2026-09. Members use `dep = { workspace = true }`.
 | Linux | `pipewire` 0.10 (+ `libc`) | Same major as cpal's optional PipeWire backend; SPA types via `pipewire::spa`. Needs `libpipewire-0.3-dev`, `libspa-0.2-dev`, `clang`. |
 | macOS | `objc2` 0.6, `objc2-foundation` 0.3, `objc2-core-audio` 0.3, `objc2-core-audio-types` 0.3, `objc2-core-foundation` 0.3, `block2` 0.6 (+ `libc`) | One mutually compatible family (the same one cpal 0.18 uses). Default features (all framework bindings). |
 | Android | `jni` 0.22 (hfa-ffi, Android only) | Same major as cpal's Android backend. |
+| Flutter bridge | `flutter_rust_bridge` =2.13.0 (hfa-ffi, feature `flutter`), `log` 0.4 (hfa-ffi, Android/iOS) | Pinned to the installed `flutter_rust_bridge_codegen` 2.13.0 (Dart package `flutter_rust_bridge: 2.13.0`). `log` + tracing's `log` feature route Rust logs to logcat / os_log on mobile. |
 | Dev | `proptest` 1.11, `tempfile` 3 | |
 
 ## 11. Cargo features and cross-target checks
@@ -898,6 +1051,8 @@ Latest stable releases as of 2026-09. Members use `dep = { workspace = true }`.
   forwards to `opusic-sys/bundled`. The workspace declares `hfa-audio`, `hfa-capture` and `hfa-core` with
   `default-features = false`, and each member re-enables them through its own `bundled-opus`, so normal builds always
   bundle libopus while `--no-default-features` links the system libopus instead and **skips the C build**.
+- `hfa-ffi` also has a default `flutter` feature (the flutter_rust_bridge API, whose dependencies build C shims on
+  Apple targets); `--no-default-features` drops it as well (§8.5).
 - Apple targets cannot build libopus on the Linux dev container (no macOS SDK), so check Apple code with:
   `cargo check --workspace --all-targets --target aarch64-apple-darwin --no-default-features` (also `x86_64-apple-darwin`,
   `aarch64-apple-ios`). Real Apple builds (with bundled libopus) run in CI on macOS.
