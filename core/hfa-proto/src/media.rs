@@ -68,12 +68,12 @@ impl MediaHeader {
     /// [`crate::ProtoError::Truncated`], [`crate::ProtoError::BadMagic`] or
     /// [`crate::ProtoError::UnsupportedVersion`].
     pub fn decode(buf: &[u8]) -> Result<(MediaHeader, &[u8])> {
-        let (head, payload) = buf
-            .split_first_chunk::<MEDIA_HEADER_LEN>()
-            .ok_or(ProtoError::Truncated {
-                needed: MEDIA_HEADER_LEN,
-                got: buf.len(),
-            })?;
+        let (head, payload) =
+            buf.split_first_chunk::<MEDIA_HEADER_LEN>()
+                .ok_or(ProtoError::Truncated {
+                    needed: MEDIA_HEADER_LEN,
+                    got: buf.len(),
+                })?;
         if head[0..2] != MAGIC {
             return Err(ProtoError::BadMagic);
         }

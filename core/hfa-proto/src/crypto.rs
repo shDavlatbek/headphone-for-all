@@ -321,7 +321,11 @@ mod tests {
         let cap = out.capacity();
         let ptr = out.as_ptr();
         sealer.seal(&header(1, 1), b"xyz", &mut out).unwrap();
-        assert_eq!((out.capacity(), out.as_ptr()), (cap, ptr), "no reallocation");
+        assert_eq!(
+            (out.capacity(), out.as_ptr()),
+            (cap, ptr),
+            "no reallocation"
+        );
     }
 
     #[test]
@@ -357,7 +361,11 @@ mod tests {
         let dg = sealed(&MediaKey::generate(), &header(3, 10), b"secret");
         let mut opener = MediaOpener::new(&MediaKey::generate(), 3);
         assert_eq!(opener.open(&dg), Err(ProtoError::Crypto));
-        assert_eq!(opener.highest_seq(), None, "forgery must not advance the window");
+        assert_eq!(
+            opener.highest_seq(),
+            None,
+            "forgery must not advance the window"
+        );
     }
 
     #[test]
@@ -418,7 +426,10 @@ mod tests {
         for len in 0..dg.len() {
             let err = MediaOpener::new(&key, 1).open(&dg[..len]).unwrap_err();
             if len < MEDIA_HEADER_LEN {
-                assert!(matches!(err, ProtoError::Truncated { .. }), "{len}: {err:?}");
+                assert!(
+                    matches!(err, ProtoError::Truncated { .. }),
+                    "{len}: {err:?}"
+                );
             } else if len < MIN_SEALED_LEN {
                 assert_eq!(
                     err,

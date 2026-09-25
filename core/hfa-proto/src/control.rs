@@ -43,10 +43,17 @@
 //! ```
 //!
 //! Framing: every encoded `ControlMessage` is prefixed with its length as `u32` big-endian
-//! ([`encode_frame`] / [`FrameDecoder`]). Frames larger than [`crate::MAX_CONTROL_FRAME`] are
-//! rejected.
+//! ([`encode_frame`] / [`FrameDecoder`]). Frames whose protobuf payload is larger than
+//! [`crate::MAX_CONTROL_FRAME`] are rejected on both sides.
 
-use crate::Result;
+use std::fmt;
+
+use prost::Message;
+
+use crate::{ProtoError, Result, MAX_CONTROL_FRAME};
+
+/// Length of the frame length prefix (`u32` BE).
+pub const FRAME_PREFIX_LEN: usize = 4;
 
 /// Role a peer announces in [`Hello`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
@@ -400,18 +407,71 @@ impl From<Body> for ControlMessage {
 }
 
 /// Encodes `msg` as a frame: `u32` BE length prefix followed by the protobuf bytes.
-pub fn encode_frame(_msg: &ControlMessage) -> Vec<u8> {
-    todo!("feat/proto")
+///
+/// # Errors
+/// [`ProtoError::InvalidMessage`] if `msg.body` is `None` (the peer would reject it), or
+/// [`ProtoError::FrameTooLarge`] if the protobuf encoding exceeds
+/// [`crate::MAX_CONTROL_FRAME`] bytes.
+pub fn encode_frame(msg: &ControlMessage) -> Result<Vec<u8>> {
+    if msg.body.is_none() {
+        return Err(ProtoError::InvalidMessage("empty control message".into()));
+    }
+    let len = msg.encoded_len();
+    if len > MAX_CONTROL_FRAME {
+        return Err(ProtoError::FrameTooLarge {
+            len,
+            max: MAX_CONTROL_FRAME,
+        });
+    }
+    let mut out = Vec::with_capacity(FRAME_PREFIX_LEN + len);
+    // `len <= MAX_CONTROL_FRAME < u32::MAX`, so the cast is lossless.
+    out.extend_from_slice(&(len as u32).to_be_bytes());
+    msg.encode_raw(&mut out);
+    Ok(out)
+}
+
+/// Decodes one protobuf payload (without the length prefix) into a [`ControlMessage`].
+///
+/// # Errors
+/// [`ProtoError::FrameTooLarge`], [`ProtoError::Decode`] for malformed protobuf, or
+/// [`ProtoError::InvalidMessage`] for a message without a body (e.g. an unknown variant from a
+/// newer peer, which prost skips).
+pub fn decode_message(payload: &[u8]) -> Result<ControlMessage> {
+    if payload.len() > MAX_CONTROL_FRAME {
+        return Err(ProtoError::FrameTooLarge {
+            len: payload.len(),
+            max: MAX_CONTROL_FRAME,
+        });
+    }
+    let msg = ControlMessage::decode(payload).map_err(|e| ProtoError::Decode(e.to_string()))?;
+    if msg.body.is_none() {
+        return Err(ProtoError::InvalidMessage(
+            "control message without a known body".into(),
+        ));
+    }
+    Ok(msg)
 }
 
 /// Incremental decoder for a byte stream of frames produced by [`encode_frame`].
 ///
 /// Feed bytes with [`FrameDecoder::push`], then call [`Iterator::next`] until it returns
-/// `None` (more bytes needed). A frame longer than [`crate::MAX_CONTROL_FRAME`] or an
-/// undecodable/empty message yields `Some(Err(..))`.
-#[derive(Debug, Default)]
+/// `None` (more bytes needed). An undecodable/empty message yields `Some(Err(..))` for that
+/// frame only; decoding continues with the next frame.
+///
+/// A length prefix above [`crate::MAX_CONTROL_FRAME`] means the stream is corrupt or hostile:
+/// it yields [`ProtoError::FrameTooLarge`] without ever allocating the announced length, and
+/// the decoder is then **poisoned** (framing is lost): buffered data is dropped, further input
+/// is ignored and every later `next()` returns the same error. The caller should close the
+/// connection.
+///
+/// `Debug` prints only sizes, never buffered (possibly secret) bytes.
+#[derive(Default)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
+    /// Start of the unconsumed bytes in `buf`.
+    pos: usize,
+    /// Set after a fatal framing error.
+    poisoned: Option<ProtoError>,
 }
 
 impl FrameDecoder {
@@ -420,15 +480,42 @@ impl FrameDecoder {
         Self::default()
     }
 
-    /// Appends received bytes.
-    pub fn push(&mut self, _data: &[u8]) {
-        let _ = &self.buf;
-        todo!("feat/proto")
+    /// Appends received bytes (ignored once the decoder is poisoned).
+    pub fn push(&mut self, data: &[u8]) {
+        if self.poisoned.is_some() || data.is_empty() {
+            return;
+        }
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        self.buf.extend_from_slice(data);
     }
 
     /// Number of buffered bytes not yet consumed by a complete frame.
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.pos
+    }
+
+    /// `true` after a fatal framing error (see the type docs).
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
+    fn poison(&mut self, err: ProtoError) -> ProtoError {
+        self.buf = Vec::new();
+        self.pos = 0;
+        self.poisoned = Some(err.clone());
+        err
+    }
+}
+
+impl fmt::Debug for FrameDecoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrameDecoder")
+            .field("buffered", &self.buffered())
+            .field("poisoned", &self.poisoned)
+            .finish()
     }
 }
 
@@ -437,7 +524,26 @@ impl Iterator for FrameDecoder {
 
     /// Returns the next complete message, or `None` if more bytes are needed.
     fn next(&mut self) -> Option<Self::Item> {
-        todo!("feat/proto")
+        if let Some(err) = &self.poisoned {
+            return Some(Err(err.clone()));
+        }
+        let pending = &self.buf[self.pos..];
+        let (prefix, rest) = pending.split_first_chunk::<FRAME_PREFIX_LEN>()?;
+        let len = u32::from_be_bytes(*prefix) as usize;
+        if len > MAX_CONTROL_FRAME {
+            return Some(Err(self.poison(ProtoError::FrameTooLarge {
+                len,
+                max: MAX_CONTROL_FRAME,
+            })));
+        }
+        let payload = rest.get(..len)?;
+        let result = decode_message(payload);
+        self.pos += FRAME_PREFIX_LEN + len;
+        if self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+        }
+        Some(result)
     }
 }
 
@@ -475,9 +581,306 @@ mod tests {
         );
     }
 
+    fn sample_messages() -> Vec<ControlMessage> {
+        vec![
+            Body::Hello(Hello {
+                protocol_version: 0,
+                device_id: "ab12-cd34-ef56-7890".into(),
+                device_name: "Küche 🎧".into(),
+                platform: "linux".into(),
+                app_version: "0.1.0".into(),
+                role: Role::Sender as i32,
+                pairing_required: true,
+            }),
+            Body::PairStart(PairStart {
+                method: PairMethod::Token as i32,
+            }),
+            Body::PairSpake(PairSpake {
+                msg: vec![0x53; 33],
+            }),
+            Body::PairConfirm(PairConfirm { mac: vec![9; 32] }),
+            Body::PairResult(PairResult {
+                ok: false,
+                reason: "wrong PIN".into(),
+            }),
+            Body::StreamStart(StreamStart {
+                stream_id: 0xDEAD_BEEF,
+                sample_rate: 48_000,
+                channels: 2,
+                frame_ms: 10,
+                bitrate: 128_000,
+                label: "System audio".into(),
+                media_key: vec![1; 32],
+            }),
+            Body::StreamAccepted(StreamAccepted {
+                stream_id: 1,
+                udp_port: 47810,
+            }),
+            Body::StreamRejected(StreamRejected {
+                stream_id: 2,
+                reason: "duplicate".into(),
+            }),
+            Body::StreamStop(StreamStop { stream_id: 3 }),
+            Body::SetVolume(SetVolume {
+                stream_id: 4,
+                gain: 0.5,
+            }),
+            Body::SetMute(SetMute {
+                stream_id: 5,
+                muted: true,
+            }),
+            Body::SetPriority(SetPriority {
+                stream_id: 6,
+                priority: true,
+            }),
+            Body::Ping(Ping {
+                nonce: u64::MAX,
+                t_us: 123_456_789,
+            }),
+            Body::Pong(Pong { nonce: 7, t_us: 8 }),
+            Body::Stats(Stats {
+                stream_id: 9,
+                loss_pct: 1.5,
+                jitter_ms: 3.25,
+                buffer_ms: 40.0,
+                latency_ms: 62.5,
+                recommended_bitrate: 96_000,
+            }),
+            Body::Bye(Bye {
+                reason: "shutdown".into(),
+            }),
+            // All-default bodies still encode the oneof tag and must roundtrip.
+            Body::StreamStop(StreamStop::default()),
+            Body::Bye(Bye::default()),
+        ]
+        .into_iter()
+        .map(ControlMessage::new)
+        .collect()
+    }
+
+    fn stream_of(msgs: &[ControlMessage]) -> Vec<u8> {
+        msgs.iter().flat_map(|m| encode_frame(m).unwrap()).collect()
+    }
+
+    #[test]
+    fn every_variant_roundtrips() {
+        for msg in sample_messages() {
+            let frame = encode_frame(&msg).unwrap();
+            let len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+            assert_eq!(len, frame.len() - FRAME_PREFIX_LEN);
+            assert_eq!(decode_message(&frame[4..]).unwrap(), msg);
+            let mut dec = FrameDecoder::new();
+            dec.push(&frame);
+            assert_eq!(dec.next(), Some(Ok(msg)));
+            assert_eq!(dec.next(), None);
+            assert_eq!(dec.buffered(), 0);
+        }
+    }
+
+    /// Golden bytes: the oneof and field tags are the wire contract.
+    #[test]
+    fn wire_tags_are_stable() {
+        let ping = ControlMessage::new(Body::Ping(Ping { nonce: 1, t_us: 2 }));
+        // Field 30, wire type 2 = key 242 = varint F2 01; len 4; nonce (1) = 08 01; t_us (2) = 10 02.
+        assert_eq!(
+            encode_frame(&ping).unwrap(),
+            [0, 0, 0, 7, 0xF2, 0x01, 4, 0x08, 0x01, 0x10, 0x02]
+        );
+        let bye = ControlMessage::new(Body::Bye(Bye { reason: "x".into() }));
+        // Field 40 = key 322 = C2 02; len 3; reason = 0A 01 'x'.
+        assert_eq!(
+            encode_frame(&bye).unwrap(),
+            [0, 0, 0, 6, 0xC2, 0x02, 3, 0x0A, 1, b'x']
+        );
+        let start = ControlMessage::new(Body::PairStart(PairStart {
+            method: PairMethod::Pin as i32,
+        }));
+        assert_eq!(
+            encode_frame(&start).unwrap(),
+            [0, 0, 0, 4, 0x12, 2, 0x08, 1]
+        );
+        let stats = ControlMessage::new(Body::Stats(Stats {
+            recommended_bitrate: 1,
+            ..Default::default()
+        }));
+        // Field 32 = key 258 = 82 02; inner field 6 varint = 30 01.
+        assert_eq!(
+            encode_frame(&stats).unwrap(),
+            [0, 0, 0, 5, 0x82, 0x02, 2, 0x30, 1]
+        );
+    }
+
+    #[test]
+    fn encode_rejects_empty_and_oversize() {
+        assert!(matches!(
+            encode_frame(&ControlMessage::default()),
+            Err(ProtoError::InvalidMessage(_))
+        ));
+        let big = ControlMessage::new(Body::Bye(Bye {
+            reason: "x".repeat(MAX_CONTROL_FRAME),
+        }));
+        assert!(matches!(
+            encode_frame(&big),
+            Err(ProtoError::FrameTooLarge {
+                max: MAX_CONTROL_FRAME,
+                ..
+            })
+        ));
+        // The largest allowed payload is accepted and decodes again.
+        let bye = |n: usize| {
+            ControlMessage::new(Body::Bye(Bye {
+                reason: "x".repeat(n),
+            }))
+        };
+        let n = (0..MAX_CONTROL_FRAME)
+            .rev()
+            .find(|&n| bye(n).encoded_len() <= MAX_CONTROL_FRAME)
+            .unwrap();
+        assert_eq!(bye(n).encoded_len(), MAX_CONTROL_FRAME);
+        assert!(encode_frame(&bye(n + 1)).is_err());
+        let fits = bye(n);
+        let frame = encode_frame(&fits).unwrap();
+        assert!(frame.len() - FRAME_PREFIX_LEN <= MAX_CONTROL_FRAME);
+        let mut dec = FrameDecoder::new();
+        dec.push(&frame);
+        assert_eq!(dec.next(), Some(Ok(fits)));
+    }
+
+    #[test]
+    fn partial_and_concatenated_input() {
+        let msgs = sample_messages();
+        let bytes = stream_of(&msgs);
+        // Byte by byte.
+        let mut dec = FrameDecoder::new();
+        let mut got = Vec::new();
+        for b in &bytes {
+            dec.push(std::slice::from_ref(b));
+            got.extend(dec.by_ref().map(|r| r.unwrap()));
+        }
+        assert_eq!(got, msgs);
+        assert_eq!(dec.buffered(), 0);
+        // All at once.
+        let mut dec = FrameDecoder::new();
+        dec.push(&bytes);
+        let got: Vec<_> = dec.by_ref().map(|r| r.unwrap()).collect();
+        assert_eq!(got, msgs);
+        // A trailing partial frame stays buffered.
+        let mut dec = FrameDecoder::new();
+        dec.push(&bytes[..bytes.len() - 1]);
+        assert_eq!(dec.by_ref().count(), msgs.len() - 1);
+        assert!(dec.buffered() > 0);
+        dec.push(&bytes[bytes.len() - 1..]);
+        assert_eq!(dec.next(), Some(Ok(msgs[msgs.len() - 1].clone())));
+    }
+
+    #[test]
+    fn oversize_prefix_is_rejected_without_allocating_and_poisons() {
+        let mut dec = FrameDecoder::new();
+        let len = MAX_CONTROL_FRAME + 1;
+        dec.push(&(len as u32).to_be_bytes());
+        dec.push(&[0; 16]);
+        let err = ProtoError::FrameTooLarge {
+            len,
+            max: MAX_CONTROL_FRAME,
+        };
+        assert_eq!(dec.next(), Some(Err(err.clone())));
+        assert!(dec.is_poisoned());
+        assert_eq!(dec.buffered(), 0);
+        assert!(dec.buf.capacity() < 1024, "announced length was allocated");
+        // Poisoned: later input is ignored, the error repeats.
+        dec.push(&encode_frame(&sample_messages()[0]).unwrap());
+        assert_eq!(dec.buffered(), 0);
+        assert_eq!(dec.next(), Some(Err(err)));
+
+        let mut dec = FrameDecoder::new();
+        dec.push(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            dec.next(),
+            Some(Err(ProtoError::FrameTooLarge { len, .. })) if len == u32::MAX as usize
+        ));
+    }
+
+    #[test]
+    fn bad_frames_are_skipped_without_losing_sync() {
+        let good = ControlMessage::new(Body::StreamStop(StreamStop { stream_id: 1 }));
+        let mut bytes = Vec::new();
+        // An empty frame (no body).
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        // Malformed protobuf: a truncated varint.
+        bytes.extend_from_slice(&[0, 0, 0, 2, 0x08, 0xFF]);
+        // An unknown oneof tag (field 99, varint 1): prost skips it -> empty body.
+        bytes.extend_from_slice(&[0, 0, 0, 3, 0x98, 0x06, 0x01]);
+        bytes.extend_from_slice(&encode_frame(&good).unwrap());
+        let mut dec = FrameDecoder::new();
+        dec.push(&bytes);
+        assert!(matches!(
+            dec.next(),
+            Some(Err(ProtoError::InvalidMessage(_)))
+        ));
+        assert!(matches!(dec.next(), Some(Err(ProtoError::Decode(_)))));
+        assert!(matches!(
+            dec.next(),
+            Some(Err(ProtoError::InvalidMessage(_)))
+        ));
+        assert_eq!(dec.next(), Some(Ok(good)));
+        assert_eq!(dec.next(), None);
+        assert!(!dec.is_poisoned());
+    }
+
+    #[test]
+    fn decoder_debug_hides_buffered_bytes() {
+        let mut dec = FrameDecoder::new();
+        dec.push(&[0, 0, 0, 40, 171, 171, 171]);
+        let text = format!("{dec:?}");
+        assert!(
+            text.contains("buffered: 7") && !text.contains("171"),
+            "{text}"
+        );
+    }
+
+    proptest::proptest! {
+        /// Any chunking of a frame stream yields exactly the original messages.
+        #[test]
+        fn random_chunking(cuts in proptest::collection::vec(0usize..2000, 0..40)) {
+            let msgs = sample_messages();
+            let bytes = stream_of(&msgs);
+            let mut cuts: Vec<usize> = cuts.into_iter().map(|c| c % (bytes.len() + 1)).collect();
+            cuts.push(0);
+            cuts.push(bytes.len());
+            cuts.sort_unstable();
+            let mut dec = FrameDecoder::new();
+            let mut got = Vec::new();
+            for w in cuts.windows(2) {
+                dec.push(&bytes[w[0]..w[1]]);
+                for r in dec.by_ref() {
+                    got.push(r.unwrap());
+                }
+            }
+            proptest::prop_assert_eq!(got, msgs);
+            proptest::prop_assert_eq!(dec.buffered(), 0);
+        }
+
+        /// Arbitrary bytes never panic the decoder, which always terminates.
+        #[test]
+        fn arbitrary_bytes_never_panic(chunks in proptest::collection::vec(
+            proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64), 0..16)) {
+            let mut dec = FrameDecoder::new();
+            for chunk in &chunks {
+                dec.push(chunk);
+                for _ in 0..(chunk.len() + 2) {
+                    match dec.next() {
+                        None => break,
+                        Some(Err(_)) if dec.is_poisoned() => break,
+                        Some(_) => {}
+                    }
+                }
+            }
+            let _ = decode_message(&chunks.concat());
+        }
+    }
+
     #[test]
     fn hello_pairing_required_is_field_7() {
-        use prost::Message;
         let hello = Hello {
             pairing_required: true,
             ..Default::default()
