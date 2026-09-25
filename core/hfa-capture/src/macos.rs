@@ -214,10 +214,7 @@ pub(crate) fn list_apps() -> Result<Vec<CaptureApp>, CaptureError> {
             Err(_) => continue,
         };
         let bundle_id = read_string_property(object, kAudioProcessPropertyBundleID);
-        let name = app_display_name(bundle_id.as_deref()).map_or_else(
-            || process_name(pid).unwrap_or_else(|| format!("pid {pid}")),
-            str::to_owned,
-        );
+        let name = app_name(pid, bundle_id.as_deref());
         apps.push(CaptureApp { pid, name });
     }
     sort_and_dedup_apps(&mut apps);
@@ -304,10 +301,12 @@ impl TapTarget {
             TapTarget::SystemExcludingSelf => {
                 "System audio except this app (Core Audio process tap)".to_owned()
             }
-            TapTarget::Process { pid } => match process_name(pid) {
-                Some(name) => format!("{name} (pid {pid}, Core Audio process tap)"),
-                None => format!("Process {pid} (Core Audio process tap)"),
-            },
+            TapTarget::Process { pid } => {
+                format!(
+                    "{} (pid {pid}, Core Audio process tap)",
+                    app_name(pid, None)
+                )
+            }
         }
     }
 }
@@ -1302,6 +1301,32 @@ fn read_object_list(
     Ok(objects)
 }
 
+/// The name shown for a process: its app bundle's name, else a name from its bundle id, else
+/// its process name, else `pid <n>`.
+fn app_name(pid: u32, bundle_id: Option<&str>) -> String {
+    if let Some(name) = executable_path(pid).as_deref().and_then(app_bundle_name) {
+        return name.to_owned();
+    }
+    if let Some(name) = bundle_id_name(bundle_id) {
+        return name.to_owned();
+    }
+    process_name(pid).unwrap_or_else(|| format!("pid {pid}"))
+}
+
+/// The process's executable path (`proc_pidpath`), if the process exists.
+fn executable_path(pid: u32) -> Option<String> {
+    let pid = i32::try_from(pid).ok()?;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is writable for its full length; proc_pidpath writes at most that many
+    // bytes and returns the length written (<= 0 on failure).
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let len = usize::try_from(len)
+        .ok()
+        .filter(|&l| l > 0 && l <= buf.len())?;
+    let path = String::from_utf8_lossy(buf.get(..len)?).into_owned();
+    (!path.is_empty()).then_some(path)
+}
+
 /// The short process name (`proc_name`), if the process exists.
 fn process_name(pid: u32) -> Option<String> {
     let pid = i32::try_from(pid).ok()?;
@@ -1348,11 +1373,45 @@ fn format_from_asbd(asbd: &AudioStreamBasicDescription) -> Result<AudioFormat, C
     Ok(AudioFormat::new(rate.round() as u32, channels))
 }
 
-/// A friendly app name from a bundle id: its last dot-separated component
-/// (`com.apple.Safari` → `Safari`).
-fn app_display_name(bundle_id: Option<&str>) -> Option<&str> {
-    let last = bundle_id?.trim().rsplit('.').next()?.trim();
-    (!last.is_empty()).then_some(last)
+/// The name of the outermost app bundle in an executable path: what the user knows the app
+/// as, also for its helper processes (`/Applications/Google Chrome.app/Contents/Frameworks/…/
+/// Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper` → `Google Chrome`,
+/// `/Applications/Spotify.app/Contents/MacOS/Spotify` → `Spotify`).
+fn app_bundle_name(executable: &str) -> Option<&str> {
+    executable
+        .split('/')
+        .find_map(|component| component.strip_suffix(".app"))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// Bundle-id components that do not name an app on their own (`com.spotify.client`,
+/// `us.zoom.xos`, `com.google.Chrome.helper`, `com.apple.WebKit.GPU`).
+const GENERIC_BUNDLE_WORDS: &[&str] = &[
+    "agent", "app", "audio", "client", "daemon", "desktop", "gpu", "helper", "mac", "macos", "osx",
+    "plugin", "renderer", "service", "xos", "xpc",
+];
+
+/// A name from a bundle id, for processes outside an app bundle (XPC services, daemons): the
+/// last component, or the one before it when the last is generic (`com.apple.Safari` →
+/// `Safari`, `com.apple.WebKit.GPU` → `WebKit`, `us.zoom.xos` → `zoom`).
+fn bundle_id_name(bundle_id: Option<&str>) -> Option<&str> {
+    let parts: Vec<&str> = bundle_id?
+        .trim()
+        .split('.')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let generic = |p: &str| GENERIC_BUNDLE_WORDS.contains(&p.to_ascii_lowercase().as_str());
+    let (&last, rest) = parts.split_last()?;
+    if !generic(last) {
+        return Some(last);
+    }
+    // Skip the reverse-DNS prefix (`com`, `org`, `us`...): never a name.
+    match rest {
+        [_, .., before] if !generic(before) => Some(before),
+        _ => Some(last),
+    }
 }
 
 /// Sorts by name (case-insensitive) then pid, and drops duplicate pids.
@@ -1544,12 +1603,47 @@ mod tests {
     }
 
     #[test]
-    fn app_names_come_from_bundle_ids() {
-        assert_eq!(app_display_name(Some("com.apple.Safari")), Some("Safari"));
-        assert_eq!(app_display_name(Some("Spotify")), Some("Spotify"));
-        assert_eq!(app_display_name(Some("com.example.")), None);
-        assert_eq!(app_display_name(Some("")), None);
-        assert_eq!(app_display_name(None), None);
+    fn app_names_come_from_the_outermost_app_bundle() {
+        let chrome_helper = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome \
+                             Framework.framework/Versions/131.0/Helpers/Google Chrome Helper.app/\
+                             Contents/MacOS/Google Chrome Helper";
+        assert_eq!(app_bundle_name(chrome_helper), Some("Google Chrome"));
+        assert_eq!(
+            app_bundle_name("/Applications/Spotify.app/Contents/MacOS/Spotify"),
+            Some("Spotify")
+        );
+        assert_eq!(
+            app_bundle_name("/Applications/zoom.us.app/Contents/MacOS/zoom.us"),
+            Some("zoom.us")
+        );
+        assert_eq!(app_bundle_name("/usr/bin/afplay"), None);
+        assert_eq!(
+            app_bundle_name(
+                "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/\
+                 com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU"
+            ),
+            None
+        );
+        assert_eq!(app_bundle_name("/Applications/.app/x"), None);
+    }
+
+    #[test]
+    fn app_names_from_bundle_ids_skip_generic_words() {
+        assert_eq!(bundle_id_name(Some("com.apple.Safari")), Some("Safari"));
+        assert_eq!(bundle_id_name(Some("com.spotify.client")), Some("spotify"));
+        assert_eq!(bundle_id_name(Some("us.zoom.xos")), Some("zoom"));
+        assert_eq!(
+            bundle_id_name(Some("com.google.Chrome.helper")),
+            Some("Chrome")
+        );
+        assert_eq!(bundle_id_name(Some("com.apple.WebKit.GPU")), Some("WebKit"));
+        assert_eq!(bundle_id_name(Some("Spotify")), Some("Spotify"));
+        // Nothing better than the generic word: keep it rather than a reverse-DNS prefix.
+        assert_eq!(bundle_id_name(Some("com.helper")), Some("helper"));
+        assert_eq!(bundle_id_name(Some("helper")), Some("helper"));
+        assert_eq!(bundle_id_name(Some("com.example.")), Some("example"));
+        assert_eq!(bundle_id_name(Some("")), None);
+        assert_eq!(bundle_id_name(None), None);
     }
 
     #[test]
