@@ -31,6 +31,16 @@ broadcast upload extension streams what the phone plays).
 | `captureSupport` | `{supported: true, reason: "broadcast"}` |
 | `startSystemCapture` | `false` (the user starts the broadcast with the picker) |
 | `stopSystemCapture`, `acquireMulticastLock`, `releaseMulticastLock` | no-op |
+| `getBroadcastStatus` | `{broadcasting, state?, message?, timestamp?}`: whether a broadcast runs now, plus the extension's last `broadcast_status.json` |
+
+**Broadcast state re-sync.** Besides forwarding the Darwin notifications (below), the channel compares
+`broadcast_status.json` with the screen capture state (`UIWindowScene.screen.isCaptured`, and
+`sceneCaptureState` on iOS 17+) whenever Dart starts listening, the app becomes active or the capture state
+changes. A status other than `finished` while the screen is captured is a running broadcast: a new listener
+gets `broadcastStarted` (the app was relaunched while the extension kept broadcasting). A status other than
+`finished` while nothing is captured for 8 s means ReplayKit ended the extension without `broadcastFinished`
+(memory limit, crash): the app writes a `finished` status and sends `broadcastFinished` with "The broadcast
+stopped unexpectedly ...". Only changes relative to what Dart was last told are sent.
 
 Events: `{type: "broadcastStarted"}` and `{type: "broadcastFinished", message?}`, driven by the Darwin
 notifications `io.github.shdavlatbek.hfa.broadcast.started` / `.finished` that the extension posts.

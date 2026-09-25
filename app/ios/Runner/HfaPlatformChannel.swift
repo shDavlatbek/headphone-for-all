@@ -4,6 +4,7 @@
 import AVFoundation
 import Flutter
 import Foundation
+import UIKit
 import os
 
 /// Handles the `hfa/platform` method channel, forwards broadcast-extension events to Dart and
@@ -17,6 +18,12 @@ import os
 /// | `captureSupport` | `{supported: true, reason: "broadcast"}` |
 /// | `startSystemCapture` | `false` (capture runs in the broadcast extension) |
 /// | `stopSystemCapture`, `acquireMulticastLock`, `releaseMulticastLock` | no-op |
+/// | `getBroadcastStatus` | `{broadcasting, state?, message?, timestamp?}` |
+///
+/// Broadcast events: `broadcastStarted` / `broadcastFinished` follow the extension's Darwin
+/// notifications and are re-synchronized with `broadcast_status.json` and the screen capture
+/// state when a listener starts, the app becomes active or the capture state changes (see
+/// `syncBroadcastState()`).
 final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   /// Name of the method channel.
   static let methodChannelName = "hfa/platform"
@@ -30,6 +37,22 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   private let eventChannel: FlutterEventChannel
   private var eventSink: FlutterEventSink?
   private var broadcastObserver: DarwinNotificationObserver?
+  /// `NotificationCenter` observers that trigger `syncBroadcastState()`.
+  private var syncObservers: [NSObjectProtocol] = []
+  /// What Dart was last told: `true` after `broadcastStarted`, `false` after `broadcastFinished`
+  /// and when a listener starts (Dart then assumes that no broadcast runs).
+  private var reportedBroadcasting = false
+  /// Pending re-check of a broadcast that looks `vanished`.
+  private var vanishCheck: DispatchWorkItem?
+
+  /// How long a broadcast may look `vanished` before it counts as ended: the extension writes
+  /// its `finished` status after ReplayKit stopped capturing the screen and after it stopped the
+  /// Rust sender (`hfa_ext_sender_stop` waits up to 2 s for its runtime).
+  static let vanishGrace: TimeInterval = 8
+
+  /// Why a broadcast ended when ReplayKit stopped the extension without `broadcastFinished`.
+  static let vanishedMessage =
+    "The broadcast stopped unexpectedly: iOS ended the broadcast extension (for example because it used too much memory). Start it again."
 
   /// Registers the channels and the platform view with the application registrar of the
   /// implicit Flutter engine. Keep the returned object alive for the app's lifetime.
@@ -52,6 +75,20 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     ) { [weak self] name in
       self?.broadcastNotification(name)
     }
+    let center = NotificationCenter.default
+    for name in [UIApplication.didBecomeActiveNotification, UIScreen.capturedDidChangeNotification] {
+      syncObservers.append(
+        center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+          self?.syncBroadcastState()
+        })
+    }
+  }
+
+  deinit {
+    for observer in syncObservers {
+      NotificationCenter.default.removeObserver(observer)
+    }
+    vanishCheck?.cancel()
   }
 
   // MARK: - Method channel
@@ -68,6 +105,8 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
       result(writeBroadcastConfig(call.arguments))
     case "captureSupport":
       result(["supported": true, "reason": "broadcast"])
+    case "getBroadcastStatus":
+      result(broadcastStatusResult())
     case "startSystemCapture":
       // iOS has no in-app system capture: the user starts the broadcast extension with the
       // `hfa/broadcast_picker` view instead.
@@ -231,6 +270,10 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     -> FlutterError?
   {
     eventSink = events
+    // A new listener (the app just started, or Dart subscribed again) assumes that no broadcast
+    // runs; the extension outlives the app, so tell it about one that does.
+    reportedBroadcasting = false
+    DispatchQueue.main.async { [weak self] in self?.syncBroadcastState() }
     return nil
   }
 
@@ -244,8 +287,12 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     var event: [String: Any]
     switch name {
     case HfaShared.broadcastStartedNotification:
+      cancelVanishCheck()
+      reportedBroadcasting = true
       event = ["type": "broadcastStarted"]
     case HfaShared.broadcastFinishedNotification:
+      cancelVanishCheck()
+      reportedBroadcasting = false
       event = ["type": "broadcastFinished"]
       if let status = BroadcastStatus.read(), status.state == "finished",
         let message = status.message, !message.isEmpty
@@ -256,6 +303,117 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
       return
     }
     eventSink?(event)
+  }
+
+  // MARK: - Broadcast state
+
+  /// Brings Dart's broadcast state in line with the extension's status file and the screen
+  /// capture state. The Darwin notifications cover the normal cases; this covers a broadcast
+  /// that runs while the app starts (the notification was posted before), and an extension that
+  /// ReplayKit killed (memory limit, crash) without calling `broadcastFinished`, which never
+  /// writes a `finished` status nor posts its notification.
+  private func syncBroadcastState() {
+    guard let captured = Self.screenCaptured() else { return }
+    switch BroadcastSync.evaluate(status: BroadcastStatus.read(), screenCaptured: captured) {
+    case .running:
+      cancelVanishCheck()
+      report(broadcasting: true, message: nil)
+    case let .idle(message):
+      cancelVanishCheck()
+      report(broadcasting: false, message: message)
+    case .vanished:
+      scheduleVanishCheck()
+    }
+  }
+
+  /// Sends `broadcastStarted` / `broadcastFinished` when it changes what Dart was told.
+  private func report(broadcasting: Bool, message: String?) {
+    guard broadcasting != reportedBroadcasting else { return }
+    reportedBroadcasting = broadcasting
+    var event: [String: Any] = ["type": broadcasting ? "broadcastStarted" : "broadcastFinished"]
+    if let message, !message.isEmpty {
+      event["message"] = message
+    }
+    eventSink?(event)
+  }
+
+  /// A `vanished` broadcast that still looks so after `vanishGrace` ended without the extension
+  /// noticing: record a `finished` status (so a later app start does not take the stale
+  /// `started` for a running broadcast) and tell Dart.
+  private func scheduleVanishCheck() {
+    guard vanishCheck == nil else { return }
+    let check = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.vanishCheck = nil
+      let status = BroadcastStatus.read()
+      guard let captured = Self.screenCaptured(),
+        BroadcastSync.evaluate(status: status, screenCaptured: captured) == .vanished
+      else {
+        self.syncBroadcastState()
+        return
+      }
+      Self.log.error("the broadcast extension ended without finishing the broadcast")
+      BroadcastStatus(
+        state: "finished", message: Self.vanishedMessage, timestamp: Date().timeIntervalSince1970
+      ).write()
+      self.report(broadcasting: false, message: Self.vanishedMessage)
+    }
+    vanishCheck = check
+    DispatchQueue.main.asyncAfter(deadline: .now() + Self.vanishGrace, execute: check)
+  }
+
+  private func cancelVanishCheck() {
+    vanishCheck?.cancel()
+    vanishCheck = nil
+  }
+
+  /// `getBroadcastStatus`: `{broadcasting, state?, message?, timestamp?}` — whether a broadcast
+  /// runs now (`BroadcastSync.running`) and the extension's last `broadcast_status.json`.
+  private func broadcastStatusResult() -> [String: Any] {
+    let status = BroadcastStatus.read()
+    let sync = BroadcastSync.evaluate(status: status, screenCaptured: Self.screenCaptured() ?? false)
+    var answer: [String: Any] = ["broadcasting": sync == .running]
+    if let status {
+      answer["state"] = status.state
+      answer["timestamp"] = status.timestamp
+      if let message = status.message {
+        answer["message"] = message
+      }
+    }
+    return answer
+  }
+
+  /// Whether the screen is being captured (a broadcast, but also a recording or mirroring), or
+  /// `nil` when the app has no window scene to ask.
+  private static func screenCaptured() -> Bool? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    guard !scenes.isEmpty else { return nil }
+    return scenes.contains { scene in
+      if #available(iOS 17.0, *), scene.traitCollection.sceneCaptureState == .active {
+        return true
+      }
+      return scene.screen.isCaptured
+    }
+  }
+}
+
+/// What the app tells Dart about the broadcast, from the extension's last status and whether the
+/// screen is being captured.
+enum BroadcastSync: Equatable {
+  /// A broadcast runs.
+  case running
+  /// No broadcast runs; `message` says why the last one ended, if it failed.
+  case idle(message: String?)
+  /// The status says that the extension runs, but the screen is no longer captured: either the
+  /// extension is finishing right now (its `finished` status follows within moments), or
+  /// ReplayKit ended it without `broadcastFinished`.
+  case vanished
+
+  /// A status other than `finished` counts as running only while the screen is captured.
+  static func evaluate(status: BroadcastStatus?, screenCaptured: Bool) -> BroadcastSync {
+    guard let status else { return .idle(message: nil) }
+    guard status.isActive else { return .idle(message: status.message) }
+    return screenCaptured ? .running : .vanished
   }
 }
 

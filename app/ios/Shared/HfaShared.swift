@@ -125,12 +125,16 @@ struct BroadcastConfig: Codable, Equatable {
 
 /// `broadcast_status.json`: written by the extension before it posts a Darwin notification.
 struct BroadcastStatus: Codable, Equatable {
-  /// `"started"` or `"finished"`.
+  /// `"started"` or `"finished"`. Readers treat any other value like `"started"` (a running
+  /// broadcast), so the extension may report finer states later.
   var state: String
   /// Why the broadcast finished (an error description), or `nil`.
   var message: String?
   /// Seconds since 1970 when the status was written.
   var timestamp: Double
+
+  /// Whether the extension was running when it wrote this status (anything but `finished`).
+  var isActive: Bool { state != "finished" }
 
   /// Reads the status file; `nil` when it is missing or unreadable.
   static func read() -> BroadcastStatus? {

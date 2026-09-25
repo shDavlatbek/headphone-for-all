@@ -111,6 +111,44 @@ final class BroadcastConfigTests: XCTestCase {
   }
 }
 
+final class BroadcastSyncTests: XCTestCase {
+  private func status(_ state: String, _ message: String? = nil) -> BroadcastStatus {
+    BroadcastStatus(state: state, message: message, timestamp: 1_000)
+  }
+
+  func testNoStatusMeansIdle() {
+    XCTAssertEqual(BroadcastSync.evaluate(status: nil, screenCaptured: true), .idle(message: nil))
+  }
+
+  func testFinishedCarriesItsReason() {
+    XCTAssertEqual(
+      BroadcastSync.evaluate(status: status("finished", "hub not paired"), screenCaptured: false),
+      .idle(message: "hub not paired"))
+    // Someone records the screen: still no broadcast of ours.
+    XCTAssertEqual(
+      BroadcastSync.evaluate(status: status("finished"), screenCaptured: true),
+      .idle(message: nil))
+  }
+
+  /// The app was relaunched while the extension kept broadcasting.
+  func testStartedWhileCapturedIsRunning() {
+    XCTAssertEqual(BroadcastSync.evaluate(status: status("started"), screenCaptured: true), .running)
+    XCTAssertEqual(
+      BroadcastSync.evaluate(status: status("streaming"), screenCaptured: true), .running,
+      "unknown states count as running")
+  }
+
+  /// ReplayKit ended the extension without `broadcastFinished` (memory limit, crash).
+  func testStartedWithoutCaptureHasVanished() {
+    XCTAssertEqual(BroadcastSync.evaluate(status: status("started"), screenCaptured: false), .vanished)
+  }
+
+  func testStatusIsActiveUntilFinished() {
+    XCTAssertTrue(status("started").isActive)
+    XCTAssertFalse(status("finished").isActive)
+  }
+}
+
 final class PcmInterleaverTests: XCTestCase {
   /// Builds a linear PCM sample buffer holding `bytes` (the block buffer layout Core Media
   /// uses: interleaved frames, or one plane per channel for non-interleaved audio).

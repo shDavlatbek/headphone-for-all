@@ -1572,6 +1572,18 @@ or scan its QR code."): the extension cannot discover a hub by id (mDNS needs th
 entitlement), so a host-less configuration could only fail after the broadcast started. `hubDeviceId` stays
 optional. `writeBroadcastConfig`'s `NO_APP_GROUP` uses the same message as `getDataDir`.
 
+**Broadcast state re-sync (iOS).** `broadcastStarted` / `broadcastFinished` no longer come only from the Darwin
+notifications. `HfaPlatformChannel` also evaluates `broadcast_status.json` against the screen capture state
+(`BroadcastSync.evaluate`: no status or `finished` → idle with its message; any other state → running while the
+screen is captured, else "vanished") when Dart starts listening, when the app becomes active and on
+`UIScreen.capturedDidChangeNotification`, and sends an event only when the result differs from what Dart was last
+told (a new listener counts as told "not broadcasting"). So a relaunched app learns about a broadcast that is still
+running, and a broadcast whose extension ReplayKit killed without `broadcastFinished` (memory limit, crash) ends
+after 8 s "vanished" with `broadcastFinished` and the message "The broadcast stopped unexpectedly ...", which the
+app also writes as a `finished` status. `broadcast_status.json` readers treat any `state` other than `finished`
+as running. New method **`getBroadcastStatus`** → `{broadcasting: bool, state?, message?, timestamp?}` (iOS only;
+other platforms do not implement it).
+
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 
 **Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).
