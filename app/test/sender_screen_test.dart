@@ -302,4 +302,36 @@ void main() {
     expect(fake.lastSenderStart?.pairingSecret, 'TOKEN');
     await unmount(tester);
   });
+
+  testWidgets('a live sender shows its warning (capture fallback)', (
+    tester,
+  ) async {
+    final fake = senderFake();
+    await pumpApp(tester, fake, section: AppSection.sender);
+    fake.emitSenderStatus(
+      const SenderStatusDto(
+        state: 'streaming',
+        hubName: 'Desk PC',
+        error:
+            'cannot exclude this app from the capture (x); capturing the '
+            'whole system mix instead',
+        bitrate: 128000,
+        lossPct: 0,
+        rttMs: 3,
+        levelDb: -20,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Streaming'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('sender-warning')),
+        matching: find.textContaining('cannot exclude this app'),
+      ),
+      findsOneWidget,
+    );
+    // Not the red failure block of a stopped sender.
+    expect(find.byKey(const Key('sender-error')), findsNothing);
+    await unmount(tester);
+  });
 }

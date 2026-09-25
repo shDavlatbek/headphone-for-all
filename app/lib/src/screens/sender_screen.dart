@@ -155,6 +155,31 @@ class SenderStatusCard extends ConsumerWidget {
                   Text('level ${formatDb(status.levelDb)}'),
                 ],
               ),
+              // A live sender's error is a warning: e.g. the capture fell
+              // back to the whole system mix (§8.5), or why it reconnects.
+              if (error != null) ...[
+                const SizedBox(height: 8),
+                Row(
+                  key: const Key('sender-warning'),
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      Icons.warning_amber_rounded,
+                      size: 20,
+                      color: theme.colorScheme.tertiary,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        error,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
             ],
             if (error != null && !sender.isLive) ...[
               const SizedBox(height: 12),
@@ -182,10 +207,14 @@ class SenderStatusCard extends ConsumerWidget {
                   const SizedBox(width: 16),
                   Expanded(
                     child: Text(
+                      // The extension connects in the background and does
+                      // not report the connection (§8.9), so this does not
+                      // claim that audio arrives.
                       sender.broadcasting
-                          ? 'Audio from other apps is being sent to '
-                                '${sender.target?.name ?? 'the hub'}. Tap the '
-                                'button to stop the broadcast.'
+                          ? 'The broadcast to '
+                                '${sender.target?.name ?? 'the hub'} has '
+                                'started. Check on the hub that the audio '
+                                'arrives. Tap the button to stop it.'
                           : 'Tap the button, choose "Headphone for All" and '
                                 'Start Broadcast. Then switch to the app you '
                                 'want to hear.',
