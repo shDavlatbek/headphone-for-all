@@ -934,6 +934,11 @@ Modules:
   `OUTPUT_STALL = 300 ms` without reporting `has_error()` (a suspended device) is treated like a stopped one: the
   streams are consumed at wall-clock pace and the mix is discarded until it pulls again, so the jitter buffers do
   not overflow.
+- **Reconnects after a network change.** On `StreamStart`, streams of the **same device id and label** on **another**
+  connection that received no datagram for `IDLE_AFTER` are removed first (`SourceRemoved`; they no longer linger as
+  inactive duplicates for `REMOVE_AFTER` or hold a `MAX_STREAMS` slot); such a connection is closed with
+  `Bye("replaced by a new connection")` once it owns no stream. An authenticated connection that sent nothing for
+  **`CONTROL_IDLE_TIMEOUT = 15 s`** (senders ping every second) is closed with `Bye("nothing received for 15 s")`.
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

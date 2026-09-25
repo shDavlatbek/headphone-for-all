@@ -13,7 +13,8 @@
 //!   [`FIRST_MESSAGE_TIMEOUT`]; at most [`MAX_PENDING_PER_IP`] handshakes per IP address run
 //!   at once (more are closed); when [`MAX_PENDING_HANDSHAKES`] are running, the oldest is
 //!   dropped for a newcomer. Authenticated connections (at most [`MAX_CONNECTIONS`]) do not
-//!   count against that budget; one that owns no stream for [`NO_STREAM_TIMEOUT`] is closed.
+//!   count against that budget; one that owns no stream for [`NO_STREAM_TIMEOUT`], or that
+//!   sent nothing (senders ping every second) for [`CONTROL_IDLE_TIMEOUT`], is closed.
 //!   Then:
 //!   - `StreamStart` is validated (48 kHz, 2 channels, `frame_ms` 10 or 20, a 32-byte key, at
 //!     most [`MAX_STREAMS`] streams, a stream id not in use) and registered with the
@@ -99,6 +100,9 @@ pub const MAX_PENDING_PER_IP: usize = 4;
 pub const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// An authenticated connection without a stream for this long is closed.
 pub const NO_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+/// An authenticated connection that sent nothing (senders `Ping` every second) for this long
+/// is closed: its peer is gone, e.g. it changed networks and left a half-open connection.
+pub const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Jitter-buffer target before the first jitter estimate (clamped to the settings' bounds).
 const INITIAL_JITTER_TARGET_MS: u32 = 40;
 /// Capacity of the event channel.
@@ -550,6 +554,7 @@ impl Shared {
             active: true,
             stats: StreamStats::default(),
         };
+        self.replace_stale_streams(peer, tx, &info.label);
         {
             let mut st = self.state.lock();
             if st.sources.len() >= MAX_STREAMS {
@@ -581,6 +586,47 @@ impl Shared {
         );
         self.emit(HubEvent::SourceAdded(info));
         Ok(controls)
+    }
+
+    /// A device that reconnects (e.g. after roaming to another network) usually leaves its
+    /// old connection half-open, so its old stream would linger as an inactive duplicate
+    /// until [`REMOVE_AFTER`] and hold a [`MAX_STREAMS`] slot. Removes the streams of the same
+    /// device and label on **other** connections that received nothing for [`IDLE_AFTER`],
+    /// and closes such a connection once it owns no stream any more.
+    fn replace_stale_streams(
+        &self,
+        peer: &PeerInfo,
+        tx: &mpsc::UnboundedSender<ConnCommand>,
+        label: &str,
+    ) {
+        let now = Instant::now();
+        let stale: Vec<(u32, mpsc::UnboundedSender<ConnCommand>)> = self
+            .state
+            .lock()
+            .sources
+            .iter()
+            .filter(|e| {
+                e.info.device_id == peer.device_id
+                    && e.info.label == label
+                    && !e.tx.same_channel(tx)
+                    && now.saturating_duration_since(e.shared.state.lock().last_packet)
+                        >= IDLE_AFTER
+            })
+            .map(|e| (e.info.stream_id, e.tx.clone()))
+            .collect();
+        for (stream_id, old_tx) in stale {
+            tracing::info!(stream_id, device = %peer.device_id, "replacing a stale stream");
+            self.remove_stream(stream_id);
+            let still_used = self
+                .state
+                .lock()
+                .sources
+                .iter()
+                .any(|e| e.tx.same_channel(&old_tx));
+            if !still_used {
+                let _ = old_tx.send(ConnCommand::Close("replaced by a new connection".into()));
+            }
+        }
     }
 
     /// Changes a stream's controls, remembers them for its device, tells the mixer and the
@@ -881,10 +927,12 @@ async fn connection(
     let mut owned: Vec<u32> = Vec::new();
     // A connection without a stream is closed after NO_STREAM_TIMEOUT (it only holds a slot).
     let mut no_stream_deadline = tokio::time::Instant::now() + NO_STREAM_TIMEOUT;
+    let mut idle_deadline = tokio::time::Instant::now() + CONTROL_IDLE_TIMEOUT;
     let close = loop {
         tokio::select! {
             msg = ch.recv() => match msg {
                 Ok(msg) => {
+                    idle_deadline = tokio::time::Instant::now() + CONTROL_IDLE_TIMEOUT;
                     let flow = on_message(&shared, &peer, &tx, &mut owned, &mut ch, msg).await;
                     if !owned.is_empty() {
                         no_stream_deadline = tokio::time::Instant::now() + NO_STREAM_TIMEOUT;
@@ -912,6 +960,10 @@ async fn connection(
             _ = tokio::time::sleep_until(no_stream_deadline), if owned.is_empty() => {
                 tracing::debug!(conn, "no stream on this connection; closing it");
                 break Some(format!("no stream started for {} s", NO_STREAM_TIMEOUT.as_secs()));
+            }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                tracing::info!(conn, device = %peer.device_id, "the sender went silent; closing");
+                break Some(format!("nothing received for {} s", CONTROL_IDLE_TIMEOUT.as_secs()));
             }
             _ = wait_stop(&mut shutdown) => break Some("hub stopping".to_owned()),
         }
