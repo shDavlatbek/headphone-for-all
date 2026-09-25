@@ -9,10 +9,16 @@ import '../models/hub_target.dart';
 import '../models/source_choice.dart';
 import '../platform/native_channel.dart';
 import 'core_providers.dart';
+import 'hub_address_book.dart';
 import 'settings_controller.dart';
 
 /// Sender states in which a sender is live (`sender_start` would refuse).
 const liveSenderStates = {'connecting', 'pairing', 'streaming', 'reconnecting'};
+
+/// Why a hub without an address cannot be used on iOS.
+const iosNeedsHubAddress =
+    'This device cannot look for hubs on the network. Add the hub by '
+    "address or scan its QR code (on the hub: Pair a device).";
 
 /// iOS pre-pairing: how often the core's sender status is polled as a
 /// fallback for a status event the subscription may have missed.
@@ -101,7 +107,29 @@ final senderControllerProvider =
 class SenderController extends Notifier<SenderState> {
   StreamSubscription<SenderStatusDto>? _statusSub;
   StreamSubscription<NativeEvent>? _nativeSub;
+
+  /// Android: a native capture may run for the core's sender. Set while its
+  /// start is pending, while it records, and when a live sender is adopted
+  /// from an earlier UI; cleared once `stopSystemCapture` was called.
   bool _nativeCapture = false;
+
+  /// Android: `startSystemCapture` is in flight.
+  bool _capturePending = false;
+
+  /// Android: the reason of a `captureError` that arrived while the start
+  /// was pending (the start then answers `false`, §8.8).
+  String? _pendingCaptureError;
+
+  /// The first status of the subscription (the core's status before this
+  /// controller did anything) has not arrived yet.
+  bool _awaitingFirstStatus = true;
+
+  /// [start] ran in this controller.
+  bool _startedHere = false;
+
+  /// This sender holds a reference on the multicast lock (it finds its hub
+  /// by id over mDNS, also on every reconnect).
+  bool _holdsMulticast = false;
 
   /// iOS pairing run in progress (its target is updated when it ends).
   bool _pairingOnly = false;
@@ -121,6 +149,7 @@ class SenderController extends Notifier<SenderState> {
     ref.onDispose(() {
       _statusSub?.cancel();
       _nativeSub?.cancel();
+      _releaseMulticast(native);
     });
     final info = ref.read(appInfoProvider);
     final sources = availableSources(info);
@@ -142,9 +171,8 @@ class SenderController extends Notifier<SenderState> {
     } catch (e) {
       debugPrint('capture status: ${describeError(e)}');
     }
-    if (native == null || !ref.mounted || state.busy || _nativeCapture) {
-      return;
-    }
+    // A start in this controller owns the capture from then on.
+    if (native == null || !ref.mounted || state.busy || _startedHere) return;
     if (!native.running && native.endedWhileAway == null) return;
     SenderStatusDto? now;
     try {
@@ -152,7 +180,7 @@ class SenderController extends Notifier<SenderState> {
     } catch (e) {
       debugPrint('sender status: ${describeError(e)}');
     }
-    if (now == null || !ref.mounted || state.busy || _nativeCapture) return;
+    if (now == null || !ref.mounted || state.busy || _startedHere) return;
     final live = liveSenderStates.contains(now.state);
     if (native.running) {
       if (live) {
@@ -161,6 +189,8 @@ class SenderController extends Notifier<SenderState> {
         await _quietly(_native.stopSystemCapture);
       }
     } else if (live) {
+      // The first status may have adopted this sender's capture already.
+      _nativeCapture = false;
       final why = native.endedWhileAway!;
       state = state.copyWith(
         error:
@@ -171,8 +201,12 @@ class SenderController extends Notifier<SenderState> {
     }
   }
 
+  bool get _isAndroid => ref.read(appInfoProvider).isAndroid;
+
   void _onStatus(SenderStatusDto status) {
     if (!ref.mounted) return;
+    final first = _awaitingFirstStatus;
+    _awaitingFirstStatus = false;
     final target = state.target;
     // Connected with a PIN or token: the hub is paired now and the one-time
     // secret is spent, so a later start must not send it again.
@@ -186,9 +220,41 @@ class SenderController extends Notifier<SenderState> {
     state = state.copyWith(status: status, target: paired, error: state.error);
     // The core saved the hub as trusted: refresh the lists that show it.
     if (paired != null) ref.invalidate(trustedPeersProvider);
-    if (_nativeCapture && !liveSenderStates.contains(status.state)) {
-      // The engine ended by itself (failed / stopped): stop the capture too.
-      _nativeCapture = false;
+    // Where the hub was reached: iOS cannot find it by id later (§8.9).
+    final hubId = target?.deviceId;
+    if (status.state == 'streaming' && target != null && hubId != null) {
+      ref
+          .read(hubAddressBookProvider.notifier)
+          .remember(hubId, target.host, target.port);
+    }
+    final live = liveSenderStates.contains(status.state);
+    if (first) {
+      // The status from before this controller acted.
+      if (!_startedHere && _isAndroid) _adoptAndroidCapture(live);
+      return;
+    }
+    if (!live) {
+      _releaseMulticast(_native);
+      if (_nativeCapture) {
+        // The engine ended by itself (failed / stopped), possibly while the
+        // consent dialog was open: stop (or cancel) the capture too.
+        _nativeCapture = false;
+        unawaited(_quietly(_native.stopSystemCapture));
+      }
+    }
+  }
+
+  /// Android: the core's sender and `CaptureService` live as long as the
+  /// process, this controller only as long as the Flutter engine (§8.8), e.g.
+  /// the task was swiped away while sending and the app was opened again.
+  /// A live sender found at startup may therefore have a capture that this
+  /// controller must stop with it; with no live sender, a capture left
+  /// behind would record for nobody, so it is stopped now.
+  /// (`stopSystemCapture` is idempotent and emits no event.)
+  void _adoptAndroidCapture(bool live) {
+    if (live) {
+      _nativeCapture = true;
+    } else {
       unawaited(_quietly(_native.stopSystemCapture));
     }
   }
@@ -198,6 +264,13 @@ class SenderController extends Notifier<SenderState> {
     switch (event.type) {
       case NativeEventType.captureStopped:
       case NativeEventType.captureError:
+        if (_capturePending) {
+          // The start answers `false`; [_startAndroid] explains why.
+          if (event.type == NativeEventType.captureError) {
+            _pendingCaptureError = event.message ?? 'unknown error';
+          }
+          return;
+        }
         if (!_nativeCapture) return;
         _nativeCapture = false;
         state = state.copyWith(
@@ -242,7 +315,19 @@ class SenderController extends Notifier<SenderState> {
     }
     final target = pin == null ? baseTarget : baseTarget.withPin(pin);
     if (pin != null) state = state.copyWith(target: target);
+    if (target.host.isEmpty && ref.read(appInfoProvider).isIos) {
+      // No mDNS on iOS (§8.9): neither the app's sender nor the broadcast
+      // extension could find the hub by its id.
+      state = state.copyWith(error: iosNeedsHubAddress);
+      return;
+    }
     state = state.copyWith(busy: true);
+    _startedHere = true;
+    // Found by id over mDNS (now and on every reconnect): Android filters
+    // multicast without the lock, also after the sender screen is left.
+    if (target.host.isEmpty && source.kind != SourceKind.broadcast) {
+      _acquireMulticast();
+    }
     try {
       switch (source.kind) {
         case SourceKind.deviceAudio:
@@ -257,6 +342,7 @@ class SenderController extends Notifier<SenderState> {
       if (!ref.mounted) return;
       state = state.copyWith(busy: false);
     } catch (e) {
+      _releaseMulticast(_native);
       if (!ref.mounted) return;
       state = state.copyWith(busy: false, error: describeError(e));
     }
@@ -267,7 +353,12 @@ class SenderController extends Notifier<SenderState> {
       target.toRequest(source.toDto(), label: source.label),
     );
     // The consent dialog can stay open for a while; the sender may fail
-    // meanwhile (wrong PIN, pairing required, key mismatch).
+    // meanwhile (wrong PIN, pairing required, key mismatch). Its capture
+    // counts from now on, so such a failure stops (cancels) it too, and
+    // capture events are honoured.
+    _nativeCapture = true;
+    _capturePending = true;
+    _pendingCaptureError = null;
     final bool started;
     try {
       started = await _native.startSystemCapture(
@@ -277,14 +368,33 @@ class SenderController extends Notifier<SenderState> {
       );
     } on PlatformException catch (e) {
       // `permissionDenied` (RECORD_AUDIO refused) or `invalidArgument`.
+      _nativeCapture = false;
       await _quietly(_api.senderStop);
       throw HfaApiException(e.message ?? 'Audio capture failed (${e.code}).');
+    } catch (e) {
+      _nativeCapture = false;
+      await _quietly(_api.senderStop);
+      rethrow;
+    } finally {
+      _capturePending = false;
+    }
+    final captureError = _pendingCaptureError;
+    _pendingCaptureError = null;
+    if (!_nativeCapture) {
+      // The sender ended while the dialog was open; its capture was stopped
+      // (the start cancelled) then. Its reason is what matters.
+      throw HfaApiException(
+        (ref.mounted ? state.status.error : null) ?? 'The sender stopped.',
+      );
     }
     if (!started) {
+      _nativeCapture = false;
       await _quietly(_api.senderStop);
-      throw const HfaApiException(
-        'Audio capture was not allowed. Tap Start again and accept the '
-        'screen-capture prompt.',
+      throw HfaApiException(
+        captureError != null
+            ? 'Audio capture could not start: $captureError'
+            : 'Audio capture was not allowed. Tap Start again and accept the '
+                  'screen-capture prompt.',
       );
     }
     // Ask the core (not the possibly late event stream) whether the sender
@@ -299,12 +409,14 @@ class SenderController extends Notifier<SenderState> {
         ref.mounted &&
         liveSenderStates.contains(now?.state ?? state.status.state);
     if (!live) {
-      await _quietly(_native.stopSystemCapture);
+      if (_nativeCapture) {
+        _nativeCapture = false;
+        await _quietly(_native.stopSystemCapture);
+      }
       throw HfaApiException(
         now?.error ?? state.status.error ?? 'The sender stopped.',
       );
     }
-    _nativeCapture = true;
   }
 
   /// iOS: makes sure the hub trusts us (pairing through a short-lived
@@ -343,6 +455,11 @@ class SenderController extends Notifier<SenderState> {
       }
     }
     if (target.pairingSecret != null) ref.invalidate(trustedPeersProvider);
+    if (deviceId != null) {
+      ref
+          .read(hubAddressBookProvider.notifier)
+          .remember(deviceId, target.host, target.port);
+    }
     await _native.writeBroadcastConfig(
       BroadcastConfig(
         hubHost: target.host,
@@ -434,19 +551,27 @@ class SenderController extends Notifier<SenderState> {
     }
   }
 
+  /// Stops a live sender and starts it again with the same hub and source
+  /// (e.g. so it picks up new settings). Android asks for consent again.
+  Future<void> restart() async {
+    if (!state.isLive) return;
+    await stop();
+    if (!ref.mounted || state.error != null) return;
+    await start();
+  }
+
   /// Stops streaming (and the Android capture service).
   Future<void> stop() async {
     if (state.busy) return;
     state = state.copyWith(busy: true);
     try {
-      // Also when this controller did not start the capture (a capture
-      // started by an earlier UI): stopping an idle capture is a no-op.
-      if (_nativeCapture ||
-          (ref.read(appInfoProvider).isAndroid &&
-              state.source?.kind == SourceKind.deviceAudio)) {
+      // On Android always: a capture may run that this controller did not
+      // start (§8.8: idempotent, no event).
+      if (_nativeCapture || _isAndroid) {
         _nativeCapture = false;
         await _quietly(_native.stopSystemCapture);
       }
+      _releaseMulticast(_native);
       await _api.senderStop();
       if (!ref.mounted) return;
       state = state.copyWith(busy: false);
@@ -454,6 +579,18 @@ class SenderController extends Notifier<SenderState> {
       if (!ref.mounted) return;
       state = state.copyWith(busy: false, error: describeError(e));
     }
+  }
+
+  void _acquireMulticast() {
+    if (_holdsMulticast) return;
+    _holdsMulticast = true;
+    unawaited(_quietly(_native.acquireMulticastLock));
+  }
+
+  void _releaseMulticast(NativeChannel native) {
+    if (!_holdsMulticast) return;
+    _holdsMulticast = false;
+    unawaited(_quietly(native.releaseMulticastLock));
   }
 
   void _setError(String message) {

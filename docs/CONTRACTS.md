@@ -1926,6 +1926,90 @@ subscription (e.g. a final `failed` that would leave the stream at `pairing`). L
   `broadcast.log.1`. No new dependency (a file writer, not the `oslog` crate, whose C shim would break the Linux
   `cargo check --target aarch64-apple-ios --no-default-features`). Other targets keep `init_tracing`.
 
+### 8.12 Refinements made by `fix/flutter` (the code in `app/lib` is authoritative)
+
+These supersede the matching statements of §8.5 and §8.7.
+
+**Loading the Rust library (`bootstrap.dart` `loadRustLibrary` / `rustExternalLibrary`).** flutter_rust_bridge's
+default loader derives the library name from the crate (`stem: 'hfa_ffi'`): `libhfa_ffi.so` (Android, Linux),
+`hfa_ffi.dll` (Windows), and on iOS/macOS `hfa_ffi.framework/hfa_ffi`, which does not exist: cargokit force-loads
+`libhfa_ffi.a` into the CocoaPods target `rust_lib_headphone_for_all`, and Flutter's Podfile uses `use_frameworks!`.
+So on iOS and macOS the app passes `RustLib.init(externalLibrary: ExternalLibrary.open(
+'rust_lib_headphone_for_all.framework/rust_lib_headphone_for_all'))`, falling back to
+`ExternalLibrary.process(iKnowHowToUseIt: true)` if the pods are ever linked statically. **Renaming the pod or the
+crate's `[lib] name` must update `appleRustFramework`.** `integration_test/bridge_test.dart` uses the same loader and
+now also covers `initApp` (idempotent, first-run name), a settings round trip and, where an output device exists, hub
+start → pairing window → stop → start.
+
+**Errors.** `describeError` shows a `PlatformException`'s message (or a sentence for a known code without one:
+`NO_APP_GROUP`, `serviceFailed`), never `PlatformException(code, message, null, null)`. **Hub errors are sticky:**
+`HubState.error` is kept (the source poll and `SourceUpdated` no longer clear it) until the user dismisses it, the
+hub starts successfully or stops; a new start clears it first so a repeated failure is reported again. `AppShell`
+(not `HubScreen`) shows each new hub error in a snack bar on every section, `HubScreen`'s header shows the current
+one with a dismiss button, and a tray Hub toggle that fails brings the window up. A live sender's `error` (e.g. the
+`open_capture` fallback warning, or why it reconnects) is shown as a warning row under the stats.
+
+**Settings save.** The snack bar says what must restart: "Restart the hub" (hub running; action "Restart hub"),
+"Stop and start sending" (sender live; action "Restart sending" = `SenderController.restart()`: stop, then start
+with the same hub and source; Android asks for consent again), or both. The actions use notifiers captured before
+the save (the form is rebuilt by it).
+
+**Android capture lifecycle (supersedes the Android bullet of §8.7).** The core's sender and `CaptureService`
+outlive the Flutter engine, `SenderController` does not. The first `senderEvents` status of a new controller that
+has not started anything: live → the controller adopts the capture (it honours `captureStopped` / `captureError`
+and stops the capture with the sender); not live → `stopSystemCapture` (a capture left behind). `stop()` always
+calls `stopSystemCapture` on Android. The capture counts from the moment `startSystemCapture` is sent: a sender that
+leaves the live states while the consent dialog is open calls `stopSystemCapture`, which cancels the start
+(`false`), and the sender's error is shown; a `captureError` that arrives while the start is pending is kept and
+shown as "Audio capture could not start: <reason>" (the generic "not allowed" text is for a plain `false`).
+*Integration with §8.8.1:* `build()` also runs §8.8.1's `_syncNativeCapture` (the native `captureStatus`), which
+has the last word unless this controller started a sender itself: a running capture with a live sender is adopted,
+a running capture without one is stopped, and a live sender whose capture ended while no UI listened
+(`endedWhileAway`) is stopped with "Capture stopped while the app was closed: <reason>", even if the first status
+had already adopted it. A `PlatformException` from `startSystemCapture` (e.g. `permissionDenied`) stops the sender
+and is shown with its message.
+**Multicast lock:** `NativeChannel` counts `acquireMulticastLock` / `releaseMulticastLock` references (only the
+first acquire and the last release reach the single native lock); besides the sender screen's discovery, a sender
+started with an empty host (found by id over mDNS, also on reconnects) holds a reference until it is no longer
+live.
+
+**Discovery.** A new `discoverHubs` waits until the previous `stopDiscovery` sent to the same `HfaApi` completed
+(frb runs calls on a thread pool, and the core's stop ends whatever browse is current). A browse stream that ends
+without being cancelled sets the error "Stopped looking for hubs. Tap refresh to search again."
+
+**Hub targets.** Start (and "Enter PIN") re-resolve a discovered or paired target by device id against the current
+discovery list and trust store (`currentHubTarget`), keeping an entered PIN, so a changed address, port or trust
+state is used. **Files the app keeps in the data directory** (never read by the core): `hub_addresses.json`
+(`{<device id>: {"host", "port"}}`, the last address a sender streamed to or a broadcast config was written for;
+removed with "Forget") and `app_prefs.json` (`{"startHubOnLaunch": bool}`). Both are written through a temp file
+and a rename; a missing or broken file means empty/defaults. `dataDirProvider` is `null` in tests and the demo mode
+(nothing is written). **iOS** (no mDNS, §8.9): paired hubs are dialled at their remembered address; a start with an
+empty host is refused ("This device cannot look for hubs on the network. Add the hub by address or scan its QR
+code ..."), so no broadcast config with an empty `hubHost` is written; the hub list explains this instead of
+"Looking for hubs…" and labels host-less paired hubs "address unknown: add it by address". The broadcast card says
+the broadcast started and to check the hub, not that audio is being sent.
+
+**Trust.** "Forget" also stops a live sender whose target is the forgotten hub and drops its remembered address.
+The hub restart on "Forget" stays until the shared trust store of `fix/core-sec` / `fix/core-engine` is merged;
+then it can go (a running hub then honours a forget by itself).
+
+**Hub and pairing sheet.** Stopping the hub while the pairing sheet is open shows "The hub stopped" with Close
+(`PairingPhase.hubStopped`) instead of an endless spinner. The sheet shows the hub's address (`host:port` from the
+pairing URI) for "Add by address".
+
+**Startup preference.** Settings → "Start the hub when the app opens" (`app_prefs.json`, default off, applied at
+once): `appPrefsProvider` is loaded by `AppShell` at launch and then starts the hub (a failure shows like any hub
+error).
+
+**Desktop tray.** Menu: Show/Hide window, Hub on/off, **"Stop sending to <hub>"** ("Not sending", disabled, while
+idle), Quit. Tooltip: "Headphone for All — Hub on · Sending to <hub> · Hub error: <message>" (only the parts that
+apply).
+
+**Licences.** `app/tool/gen_rust_licenses.py` (cargo metadata; hfa-ffi's normal dependencies on every target)
+writes `app/assets/licenses/rust.txt` (entries separated by a line of 80 `-`; each: comma-separated package names,
+empty line, text), including libopus' `COPYING`; `main()` registers it with `LicenseRegistry`
+(`lib/src/licenses.dart`). Regenerate it after changing `core/Cargo.lock`.
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |

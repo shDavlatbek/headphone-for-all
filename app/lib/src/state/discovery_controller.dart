@@ -30,15 +30,25 @@ final discoveryControllerProvider =
 /// meanwhile, and stops when no longer watched.
 class DiscoveryController extends Notifier<DiscoveryState> {
   StreamSubscription<DiscoveryEventDto>? _sub;
+  int _generation = 0;
+
+  /// The last `stopDiscovery` sent to each core (any instance of this
+  /// controller). flutter_rust_bridge runs calls on a thread pool, and the
+  /// core's stop ends whatever browse is current, so a new browse starts
+  /// only after the previous screen's stop is done (leaving and quickly
+  /// re-entering the sender screen).
+  static final Expando<Future<void>> _lastStop = Expando('discovery stop');
 
   @override
   DiscoveryState build() {
     final api = ref.watch(hfaApiProvider);
     final native = ref.watch(nativeChannelProvider);
     ref.onDispose(() {
+      _generation++;
       _sub?.cancel();
       _sub = null;
-      unawaited(_stop(api, native));
+      final previous = _lastStop[api] ?? Future<void>.value();
+      _lastStop[api] = previous.then((_) => _stop(api, native));
     });
     unawaited(native.acquireMulticastLock().catchError(_logNative));
     _listen(api);
@@ -60,12 +70,30 @@ class DiscoveryController extends Notifier<DiscoveryState> {
 
   void _listen(HfaApi api) {
     _sub?.cancel();
-    _sub = api.discoverHubs().listen(
-      _onEvent,
-      onError: (Object e) {
-        if (!ref.mounted) return;
-        state = DiscoveryState(hubs: state.hubs, error: describeError(e));
-      },
+    _sub = null;
+    final generation = ++_generation;
+    bool current() => ref.mounted && generation == _generation;
+    unawaited(
+      (_lastStop[api] ?? Future<void>.value()).then((_) {
+        if (!current()) return;
+        _sub = api.discoverHubs().listen(
+          _onEvent,
+          onError: (Object e) {
+            if (!current()) return;
+            state = DiscoveryState(hubs: state.hubs, error: describeError(e));
+          },
+          onDone: () {
+            // Not cancelled by this controller: the core ended the browse.
+            if (!current()) return;
+            state = DiscoveryState(
+              hubs: state.hubs,
+              error:
+                  state.error ??
+                  'Stopped looking for hubs. Tap refresh to search again.',
+            );
+          },
+        );
+      }),
     );
   }
 

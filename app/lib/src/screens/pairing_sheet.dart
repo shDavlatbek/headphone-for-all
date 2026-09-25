@@ -73,6 +73,13 @@ class _PairingSheetState extends ConsumerState<PairingSheet> {
               onAction: () =>
                   ref.read(pairingControllerProvider.notifier).start(),
             ),
+            PairingPhase.hubStopped => _Outcome(
+              icon: Icons.headset_off_outlined,
+              title: 'The hub stopped',
+              message: 'Start the hub again to pair a device.',
+              actionLabel: 'Close',
+              onAction: () => Navigator.of(context).pop(),
+            ),
             PairingPhase.completed => _Outcome(
               icon: Icons.check_circle_outline,
               title: 'Paired with ${state.pairedName ?? 'a device'}',
@@ -132,6 +139,19 @@ class _PairingSheetState extends ConsumerState<PairingSheet> {
             color: expired ? theme.colorScheme.outline : null,
           ),
         ),
+        if (pairingUriAddress(info.uri) case final address?) ...[
+          const SizedBox(height: 8),
+          Text(
+            'Or, on the other device, choose Add by address:',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodySmall,
+          ),
+          SelectableText(
+            address,
+            key: const Key('pairing-address'),
+            style: theme.textTheme.titleMedium,
+          ),
+        ],
         const SizedBox(height: 4),
         Text(
           expired
@@ -184,6 +204,17 @@ class _PairingSheetState extends ConsumerState<PairingSheet> {
       ],
     );
   }
+}
+
+/// The hub's address (`host:port`) inside a pairing URI, for "Add by
+/// address" where the QR code cannot be used (no camera, no multicast).
+String? pairingUriAddress(String uri) {
+  final parsed = Uri.tryParse(uri);
+  final host = parsed?.queryParameters['h'];
+  if (host == null || host.isEmpty) return null;
+  final port = int.tryParse(parsed?.queryParameters['p'] ?? '') ?? 0;
+  final h = host.contains(':') ? '[$host]' : host;
+  return port == 0 ? h : '$h:$port';
 }
 
 class _Outcome extends StatelessWidget {

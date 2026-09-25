@@ -6,10 +6,12 @@ import 'screens/home_screen.dart';
 import 'screens/hub_screen.dart';
 import 'screens/sender_screen.dart';
 import 'screens/settings_screen.dart';
+import 'state/app_prefs.dart';
 import 'state/core_providers.dart';
 import 'state/hub_controller.dart';
 import 'state/navigation.dart';
 import 'state/sender_controller.dart';
+import 'widgets/dialogs.dart';
 
 /// Title shown in the app bar, window and task switcher.
 const appTitle = 'Headphone for All';
@@ -108,6 +110,13 @@ class AppShell extends ConsumerWidget {
     final hubOn = ref.watch(hubControllerProvider.select((h) => h.running));
     final sending = ref.watch(senderControllerProvider.select((s) => s.isLive));
     final select = ref.read(sectionProvider.notifier).select;
+    // Hub errors (a failed start from the tray, a lost output device...)
+    // are announced wherever the user is; the hub screen keeps the last one.
+    ref.listen(hubControllerProvider.select((h) => h.error), (_, error) {
+      if (error != null) showMessage(context, error);
+    });
+    // Loaded at launch: it starts the hub if the user asked for that.
+    ref.listen(appPrefsProvider, (_, _) {});
 
     Widget badged(IconData icon, AppSection s) {
       final on =

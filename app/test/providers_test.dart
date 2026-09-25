@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -7,8 +8,10 @@ import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/models/hub_target.dart';
 import 'package:headphone_for_all/src/models/source_choice.dart';
 import 'package:headphone_for_all/src/platform/native_channel.dart';
+import 'package:headphone_for_all/src/state/app_prefs.dart';
 import 'package:headphone_for_all/src/state/core_providers.dart';
 import 'package:headphone_for_all/src/state/discovery_controller.dart';
+import 'package:headphone_for_all/src/state/hub_address_book.dart';
 import 'package:headphone_for_all/src/state/hub_controller.dart';
 import 'package:headphone_for_all/src/state/pairing_controller.dart';
 import 'package:headphone_for_all/src/state/sender_controller.dart';
@@ -18,6 +21,16 @@ import 'helpers.dart';
 
 /// Lets stream events and microtasks run.
 Future<void> settle() => Future<void>.delayed(Duration.zero);
+
+/// A live sender's status.
+const streamingStatus = SenderStatusDto(
+  state: 'streaming',
+  hubName: 'Desk PC',
+  bitrate: 128000,
+  lossPct: 0,
+  rttMs: 3,
+  levelDb: -20,
+);
 
 const trustedHub = HubInfoDto(
   deviceId: 'hub1-0000-0000-0001',
@@ -485,9 +498,11 @@ void main() {
         sender.selectTarget(HubTarget.manual(host: '10.0.0.9'));
         final starting = sender.start();
         await settle();
-        expect(native.calls, ['startSystemCapture']);
+        // The failure stops the capture at once, which cancels the start.
+        expect(native.calls, ['startSystemCapture', 'stopSystemCapture']);
         expect(fake.senderStatusNow.state, 'failed');
-        native.consent.complete(true);
+        // A cancelled start answers false (§8.8).
+        native.consent.complete(false);
         await starting;
         await settle();
 
@@ -624,6 +639,129 @@ void main() {
     });
 
     test(
+      'Android: a sender adopted from an earlier UI stops its capture',
+      () async {
+        // The Flutter engine was recreated while the core kept sending.
+        final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+        fake.emitSenderStatus(streamingStatus);
+        final native = RecordingNativeChannel();
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        await settle();
+        expect(c.read(senderControllerProvider).isLive, isTrue);
+        expect(native.calls, isEmpty);
+
+        await c.read(senderControllerProvider.notifier).stop();
+        expect(native.calls, ['stopSystemCapture']);
+        expect(fake.calls.last, 'senderStop');
+      },
+    );
+
+    test('Android: an adopted sender honours capture events', () async {
+      final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+      fake.emitSenderStatus(streamingStatus);
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      await settle();
+      native.emit(
+        const NativeEvent(NativeEventType.captureStopped, message: 'revoked'),
+      );
+      await settle();
+      await settle();
+      final state = c.read(senderControllerProvider);
+      expect(fake.calls, contains('senderStop'));
+      expect(state.status.state, 'idle');
+      expect(state.error, 'Capture stopped: revoked');
+    });
+
+    test('Android: an adopted sender that fails stops its capture', () async {
+      final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+      fake.emitSenderStatus(streamingStatus);
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      await settle();
+      fake.emitSenderStatus(
+        const SenderStatusDto(
+          state: 'failed',
+          error: 'the hub went away',
+          bitrate: 0,
+          lossPct: 0,
+          rttMs: 0,
+          levelDb: -120,
+        ),
+      );
+      await settle();
+      expect(native.calls, ['stopSystemCapture']);
+    });
+
+    test(
+      'Android: a capture left behind without a sender is stopped at startup',
+      () async {
+        final fake = FakeHfaApi(platform: 'android');
+        final native = RecordingNativeChannel();
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        await settle();
+        expect(native.calls, ['stopSystemCapture']);
+      },
+    );
+
+    test('Android: the reason of a failed capture start is shown', () async {
+      final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+      final native = _ConsentNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.discovered(trustedHub));
+      final starting = sender.start();
+      await settle();
+      native.emit(
+        const NativeEvent(
+          NativeEventType.captureError,
+          message: 'ForegroundServiceStartNotAllowedException',
+        ),
+      );
+      await settle();
+      native.consent.complete(false);
+      await starting;
+      await settle();
+      final state = c.read(senderControllerProvider);
+      expect(
+        state.error,
+        'Audio capture could not start: '
+        'ForegroundServiceStartNotAllowedException',
+      );
+      expect(fake.calls, contains('senderStop'));
+      expect(state.isLive, isFalse);
+    });
+
+    test(
+      'Android: a sender that finds its hub by id holds the multicast lock',
+      () async {
+        final fake = FakeHfaApi(platform: 'android', trusted: [trustedPeer]);
+        final native = RecordingNativeChannel();
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        final sender = c.read(senderControllerProvider.notifier);
+        sender.selectTarget(HubTarget.paired(trustedPeer));
+        await sender.start();
+        await settle();
+        expect(c.read(senderControllerProvider).isLive, isTrue);
+        expect(native.calls, contains('acquireMulticastLock'));
+        expect(native.calls, isNot(contains('releaseMulticastLock')));
+
+        await sender.stop();
+        await settle();
+        expect(
+          native.calls.where((m) => m == 'releaseMulticastLock'),
+          hasLength(1),
+        );
+      },
+    );
+
+    test(
       'iOS: pairs through the app, then writes the broadcast config',
       () async {
         final fake = FakeHfaApi(platform: 'ios');
@@ -712,6 +850,73 @@ void main() {
       expect(state.target?.trusted, isTrue);
     });
 
+    test('iOS: a paired hub without an address is refused', () async {
+      final fake = FakeHfaApi(platform: 'ios', trusted: [trustedPeer]);
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.paired(trustedPeer));
+      await sender.start();
+      final state = c.read(senderControllerProvider);
+      expect(state.error, iosNeedsHubAddress);
+      expect(state.busy, isFalse);
+      expect(native.lastBroadcastConfig, isNull);
+      expect(fake.calls, isNot(contains('senderStart')));
+    });
+
+    test(
+      'iOS: the address a hub was reached at is remembered across restarts',
+      () async {
+        final dir = await Directory.systemTemp.createTemp('hfa_book_');
+        addTearDown(() => dir.delete(recursive: true));
+        ProviderContainer containerIn(FakeHfaApi fake, NativeChannel native) {
+          return ProviderContainer.test(
+            overrides: [
+              ...overridesFor(fake, native: native),
+              dataDirProvider.overrideWithValue(dir.path),
+            ],
+            retry: (retryCount, error) => null,
+          );
+        }
+
+        // Paired with a PIN at a typed-in address.
+        final fake = FakeHfaApi(platform: 'ios');
+        var c = containerIn(fake, RecordingNativeChannel());
+        c.listen(senderControllerProvider, (_, _) {});
+        c.listen(hubAddressBookProvider, (_, _) {});
+        final sender = c.read(senderControllerProvider.notifier);
+        sender.selectTarget(HubTarget.manual(host: '10.0.0.9', port: 47811));
+        await sender.start(pin: '222333');
+        expect(c.read(senderControllerProvider).error, isNull);
+        expect(
+          c.read(hubAddressBookProvider)['hub-10.0.0.9'],
+          const HubAddress('10.0.0.9', 47811),
+        );
+        // Let the write finish, then "restart the app".
+        await c.read(hubAddressBookProvider.notifier).flush();
+        c.dispose();
+
+        final native = RecordingNativeChannel();
+        c = containerIn(fake, native);
+        c.listen(senderControllerProvider, (_, _) {});
+        c.listen(hubAddressBookProvider, (_, _) {});
+        await c.read(hubAddressBookProvider.notifier).flush();
+        final book = c.read(hubAddressBookProvider);
+        expect(book['hub-10.0.0.9'], const HubAddress('10.0.0.9', 47811));
+        final peer = fake.trusted.single;
+        c
+            .read(senderControllerProvider.notifier)
+            .selectTarget(HubTarget.paired(peer, address: book[peer.deviceId]));
+        await c.read(senderControllerProvider.notifier).start();
+        expect(c.read(senderControllerProvider).error, isNull);
+        expect(native.lastBroadcastConfig?.hubHost, '10.0.0.9');
+        expect(native.lastBroadcastConfig?.hubPort, 47811);
+        expect(native.lastBroadcastConfig?.hubDeviceId, 'hub-10.0.0.9');
+        c.dispose();
+      },
+    );
+
     test('iOS: a failed pairing does not write the config', () async {
       final fake = FakeHfaApi(platform: 'ios', connectAutomatically: false);
       final native = RecordingNativeChannel();
@@ -770,6 +975,92 @@ void main() {
       expect(fake.calls, contains('stopDiscovery'));
       expect(native.calls, contains('releaseMulticastLock'));
       expect(fake.discovering, isFalse);
+    });
+
+    test('a new browse waits for the previous screen\'s stop', () async {
+      final fake = _SlowStopApi(discoverableHubs: [trustedHub]);
+      final c = containerFor(fake);
+      var sub = c.listen(discoveryControllerProvider, (_, _) {});
+      await settle();
+      sub.close();
+      await settle(); // autoDispose: the stop is now in flight
+      await settle();
+      expect(fake.calls, contains('stopDiscovery'));
+
+      // The sender screen is entered again before the stop finished.
+      sub = c.listen(discoveryControllerProvider, (_, _) {});
+      await settle();
+      expect(fake.calls.where((m) => m == 'discoverHubs'), hasLength(1));
+      fake.stopGate.complete();
+      await settle();
+      await settle();
+      expect(fake.calls.where((m) => m == 'discoverHubs'), hasLength(2));
+      expect(fake.discovering, isTrue);
+      expect(c.read(discoveryControllerProvider).hubs, hasLength(1));
+      expect(c.read(discoveryControllerProvider).error, isNull);
+      sub.close();
+    });
+
+    test('a browse the core ends is reported', () async {
+      final fake = FakeHfaApi(discoverableHubs: [trustedHub]);
+      final c = containerFor(fake);
+      c.listen(discoveryControllerProvider, (_, _) {});
+      await settle();
+      await fake.stopDiscovery(); // e.g. another caller stopped it
+      await settle();
+      expect(c.read(discoveryControllerProvider).error, contains('refresh'));
+    });
+  });
+
+  group('AppPrefs', () {
+    test(
+      'the hub starts on launch when asked, and the choice is kept',
+      () async {
+        final dir = await Directory.systemTemp.createTemp('hfa_prefs_');
+        addTearDown(() => dir.delete(recursive: true));
+        ProviderContainer launch(FakeHfaApi fake) {
+          final c = ProviderContainer.test(
+            overrides: [
+              ...overridesFor(fake),
+              dataDirProvider.overrideWithValue(dir.path),
+            ],
+            retry: (retryCount, error) => null,
+          );
+          c.listen(hubControllerProvider, (_, _) {});
+          c.listen(appPrefsProvider, (_, _) {});
+          return c;
+        }
+
+        var fake = FakeHfaApi();
+        var c = launch(fake);
+        await c.read(appPrefsProvider.notifier).flush();
+        expect(fake.hubRunning, isFalse);
+        c.read(appPrefsProvider.notifier).setStartHubOnLaunch(true);
+        await c.read(appPrefsProvider.notifier).flush();
+        // Only at launch: switching it on does not start the hub now.
+        expect(fake.hubRunning, isFalse);
+        c.dispose();
+
+        fake = FakeHfaApi();
+        c = launch(fake);
+        await c.read(appPrefsProvider.notifier).flush();
+        expect(c.read(appPrefsProvider).startHubOnLaunch, isTrue);
+        expect(fake.hubRunning, isTrue);
+        expect(c.read(hubControllerProvider).running, isTrue);
+        c.dispose();
+      },
+    );
+
+    test('a broken prefs file means the defaults', () {
+      expect(AppPrefs.fromJson('nonsense').startHubOnLaunch, isFalse);
+      expect(
+        AppPrefs.fromJson({'startHubOnLaunch': 'yes'}).startHubOnLaunch,
+        isFalse,
+      );
+      expect(
+        AppPrefs.fromJson({'startHubOnLaunch': true}).startHubOnLaunch,
+        isTrue,
+      );
     });
   });
 
@@ -836,6 +1127,22 @@ void main() {
       expect(c.read(hubControllerProvider).running, isTrue);
     });
 
+    test('forget stops a live sender that streams to that hub', () async {
+      final fake = FakeHfaApi(trusted: [trustedPeer]);
+      final c = containerFor(fake);
+      c.listen(trustedPeersProvider, (_, _) {});
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.discovered(trustedHub));
+      await sender.start();
+      await settle();
+      expect(c.read(senderControllerProvider).isLive, isTrue);
+      await c.read(trustedPeersProvider.notifier).forget(trustedHub.deviceId);
+      await settle();
+      expect(fake.calls, containsAllInOrder(['forgetPeer', 'senderStop']));
+      expect(c.read(senderControllerProvider).isLive, isFalse);
+    });
+
     test('forget removes the peer and reloads the list', () async {
       final fake = FakeHfaApi(
         trusted: [
@@ -879,6 +1186,21 @@ class _SlowPairingApi extends FakeHfaApi {
     // Like the core: the window exists now, whatever was cancelled before.
     pairing = info;
     return info;
+  }
+}
+
+/// A core whose `stopDiscovery` takes until [stopGate] completes.
+class _SlowStopApi extends FakeHfaApi {
+  _SlowStopApi({super.discoverableHubs});
+
+  final Completer<void> stopGate = Completer<void>();
+
+  @override
+  Future<void> stopDiscovery() async {
+    calls.add('stopDiscovery');
+    await stopGate.future;
+    await super.stopDiscovery();
+    calls.removeLast();
   }
 }
 

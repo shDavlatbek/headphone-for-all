@@ -9,6 +9,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'src/api/hfa_api.dart';
 import 'src/app.dart';
 import 'src/bootstrap.dart';
+import 'src/licenses.dart';
 import 'src/platform/desktop_integration.dart';
 import 'src/platform/native_channel.dart';
 import 'src/state/core_providers.dart';
@@ -18,6 +19,7 @@ const demoMode = bool.fromEnvironment('HFA_FAKE');
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  registerRustLicenses();
   try {
     await initDesktopWindow();
   } catch (e) {
@@ -34,8 +36,13 @@ Future<void> start() async {
       ? FakeHfaApi.demo(platform: hostPlatformName())
       : const RustHfaApi();
   final AppInfo info;
+  final String dataDir;
   try {
-    info = await initCore(api: api, native: native, loadRust: !demoMode);
+    (:info, :dataDir) = await initCore(
+      api: api,
+      native: native,
+      loadRust: !demoMode,
+    );
   } catch (e, stack) {
     debugPrint('startup failed: $e\n$stack');
     runApp(InitErrorApp(error: describeError(e), onRetry: start));
@@ -50,6 +57,8 @@ Future<void> start() async {
         nativeChannelProvider.overrideWithValue(native),
         initialAppInfoProvider.overrideWithValue(info),
         demoModeProvider.overrideWithValue(demoMode),
+        // The demo mode writes nothing next to a real core's files.
+        dataDirProvider.overrideWithValue(demoMode ? null : dataDir),
       ],
       child: DesktopIntegration(enabled: isDesktopHost, child: const HfaApp()),
     ),

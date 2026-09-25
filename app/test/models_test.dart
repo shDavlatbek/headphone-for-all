@@ -1,9 +1,11 @@
+import 'package:flutter/services.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
     show AnyhowException, PanicException;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/models/hub_target.dart';
 import 'package:headphone_for_all/src/models/source_choice.dart';
+import 'package:headphone_for_all/src/screens/pairing_sheet.dart';
 import 'package:headphone_for_all/src/util/format.dart';
 import 'package:headphone_for_all/src/widgets/level_meter.dart';
 
@@ -209,5 +211,96 @@ void main() {
       describeError(PanicException('todo: engineBacktrace [{ fn: "x" }]')),
       'Internal error: todo: engine',
     );
+    // Native channel errors: the message, never Flutter's debug format.
+    expect(
+      describeError(
+        PlatformException(
+          code: 'serviceFailed',
+          message: 'The hub service could not start: not allowed',
+        ),
+      ),
+      'The hub service could not start: not allowed',
+    );
+    expect(
+      describeError(PlatformException(code: 'NO_APP_GROUP')),
+      contains('app group'),
+    );
+    expect(
+      describeError(PlatformException(code: 'WEIRD', message: ' ')),
+      'Platform error (WEIRD)',
+    );
+  });
+
+  test('the selected hub follows discovery and the trust store', () {
+    const hub = HubInfoDto(
+      deviceId: 'hub1',
+      name: 'Desk',
+      addrs: ['192.168.1.20'],
+      port: 47810,
+      platform: 'windows',
+      trusted: false,
+    );
+    const peer = TrustedPeerDto(
+      deviceId: 'hub1',
+      name: 'Desk',
+      pairedAtUnix: 1,
+    );
+    final selected = HubTarget.discovered(hub).withPin('123456');
+
+    // The hub restarted on another port and got another address.
+    const moved = HubInfoDto(
+      deviceId: 'hub1',
+      name: 'Desk',
+      addrs: ['192.168.1.77'],
+      port: 50000,
+      platform: 'windows',
+      trusted: false,
+    );
+    var fresh = currentHubTarget(
+      selected,
+      discovered: {'hub1': moved},
+      peers: const [],
+    );
+    expect(fresh.host, '192.168.1.77');
+    expect(fresh.port, 50000);
+    expect(fresh.pairingSecret, '123456');
+
+    // Paired from elsewhere meanwhile: no PIN needed any more.
+    fresh = currentHubTarget(
+      HubTarget.discovered(hub),
+      discovered: {'hub1': hub},
+      peers: const [peer],
+    );
+    expect(fresh.trusted, isTrue);
+    expect(fresh.needsPin, isFalse);
+
+    // No longer announced: the paired entry, at its last address if known.
+    fresh = currentHubTarget(
+      HubTarget.discovered(hub),
+      discovered: const {},
+      peers: const [peer],
+      addresses: const {'hub1': HubAddress('192.168.1.20', 47810)},
+    );
+    expect(fresh.origin, HubOrigin.paired);
+    expect(fresh.address, '192.168.1.20:47810');
+
+    // Typed-in and scanned targets are what the user entered.
+    final manual = HubTarget.manual(host: '10.0.0.2');
+    expect(
+      currentHubTarget(manual, discovered: {'hub1': hub}, peers: const [peer]),
+      same(manual),
+    );
+  });
+
+  test('the hub address is read from a pairing URI', () {
+    expect(
+      pairingUriAddress('hfa://pair?v=0&h=192.168.1.5&p=47810&id=x&t=y&n=D'),
+      '192.168.1.5:47810',
+    );
+    expect(
+      pairingUriAddress('hfa://pair?v=0&h=fe80::1&p=1&id=x'),
+      '[fe80::1]:1',
+    );
+    expect(pairingUriAddress('hfa://pair?v=0&id=x'), isNull);
   });
 }

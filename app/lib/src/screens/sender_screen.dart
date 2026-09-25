@@ -6,6 +6,7 @@ import '../models/hub_target.dart';
 import '../models/source_choice.dart';
 import '../state/core_providers.dart';
 import '../state/discovery_controller.dart';
+import '../state/hub_address_book.dart';
 import '../state/sender_controller.dart';
 import '../state/settings_controller.dart';
 import '../util/format.dart';
@@ -35,10 +36,36 @@ class SenderScreen extends ConsumerWidget {
   }
 }
 
+/// Last known addresses of paired hubs, used where mDNS cannot find them
+/// (iOS, §8.9); empty elsewhere (the core finds a paired hub by id).
+Map<String, HubAddress> _pairedAddresses(WidgetRef ref, AppInfo info) =>
+    info.isIos ? ref.watch(hubAddressBookProvider) : const {};
+
+/// Replaces the selected hub with what discovery and the trust store know
+/// about it now (a new address, port or trust state), keeping an entered
+/// PIN. Returns the current target.
+HubTarget? refreshSelectedHub(WidgetRef ref) {
+  final selected = ref.read(senderControllerProvider).target;
+  if (selected == null) return null;
+  final info = ref.read(appInfoProvider);
+  final fresh = currentHubTarget(
+    selected,
+    discovered: {
+      for (final hub in ref.read(discoveryControllerProvider).hubs.values)
+        if (hub.deviceId != info.deviceId) hub.deviceId: hub,
+    },
+    peers: ref.read(trustedPeersProvider).value ?? const [],
+    addresses: info.isIos ? ref.read(hubAddressBookProvider) : const {},
+  );
+  if (fresh != selected) {
+    ref.read(senderControllerProvider.notifier).selectTarget(fresh);
+  }
+  return fresh;
+}
+
 /// Starts the sender, asking for a PIN first when the hub needs one.
 Future<void> startSending(BuildContext context, WidgetRef ref) async {
-  final sender = ref.read(senderControllerProvider);
-  final target = sender.target;
+  final target = refreshSelectedHub(ref);
   if (target == null) return;
   String? pin;
   if (target.needsPin) {
@@ -50,7 +77,7 @@ Future<void> startSending(BuildContext context, WidgetRef ref) async {
 
 /// Asks for a PIN and retries after a "pairing required" failure.
 Future<void> retryWithPin(BuildContext context, WidgetRef ref) async {
-  final target = ref.read(senderControllerProvider).target;
+  final target = refreshSelectedHub(ref);
   if (target == null) return;
   final pin = await showPinDialog(context, hubName: target.name);
   if (pin == null) return;
@@ -155,6 +182,31 @@ class SenderStatusCard extends ConsumerWidget {
                   Text('level ${formatDb(status.levelDb)}'),
                 ],
               ),
+              // A live sender's error is a warning: e.g. the capture fell
+              // back to the whole system mix (§8.5), or why it reconnects.
+              if (error != null) ...[
+                const SizedBox(height: 8),
+                Row(
+                  key: const Key('sender-warning'),
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      Icons.warning_amber_rounded,
+                      size: 20,
+                      color: theme.colorScheme.tertiary,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        error,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
             ],
             if (error != null && !sender.isLive) ...[
               const SizedBox(height: 12),
@@ -182,10 +234,14 @@ class SenderStatusCard extends ConsumerWidget {
                   const SizedBox(width: 16),
                   Expanded(
                     child: Text(
+                      // The extension connects in the background and does
+                      // not report the connection (§8.9), so this does not
+                      // claim that audio arrives.
                       sender.broadcasting
-                          ? 'Audio from other apps is being sent to '
-                                '${sender.target?.name ?? 'the hub'}. Tap the '
-                                'button to stop the broadcast.'
+                          ? 'The broadcast to '
+                                '${sender.target?.name ?? 'the hub'} has '
+                                'started. Check on the hub that the audio '
+                                'arrives. Tap the button to stop it.'
                           : 'Tap the button, choose "Headphone for All" and '
                                 'Start Broadcast. Then switch to the app you '
                                 'want to hear.',
@@ -263,10 +319,11 @@ class _HubPicker extends ConsumerWidget {
           ),
     ];
     final seen = {for (final t in discovered) t.deviceId};
+    final addresses = _pairedAddresses(ref, info);
     final paired = [
       for (final peer in peers)
         if (!seen.contains(peer.deviceId) && peer.deviceId != info.deviceId)
-          HubTarget.paired(peer),
+          HubTarget.paired(peer, address: addresses[peer.deviceId]),
     ];
     final extra =
         selected != null &&
@@ -287,7 +344,7 @@ class _HubPicker extends ConsumerWidget {
               : platformIcon(target.platform),
         ),
         title: Text(target.name),
-        subtitle: Text(_hubSubtitle(target)),
+        subtitle: Text(_hubSubtitle(target, ios: info.isIos)),
         trailing: isSelected
             ? const Icon(Icons.check_circle)
             : const Icon(Icons.radio_button_unchecked),
@@ -334,9 +391,17 @@ class _HubPicker extends ConsumerWidget {
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text(
-                        discovery.error ??
-                            'Looking for hubs on this network… Start the hub '
-                                'on the device your headphone is connected to.',
+                        info.isIos
+                            // No mDNS without the multicast entitlement.
+                            ? 'This device cannot look for hubs on the '
+                                  'network. Start the hub on the device your '
+                                  'headphone is connected to, then scan its '
+                                  'QR code (Pair a device) or add it by '
+                                  'address.'
+                            : discovery.error ??
+                                  'Looking for hubs on this network… Start '
+                                      'the hub on the device your headphone '
+                                      'is connected to.',
                       ),
                     ),
                   ],
@@ -348,7 +413,7 @@ class _HubPicker extends ConsumerWidget {
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
                 child: Text(
-                  'Paired, not seen right now',
+                  info.isIos ? 'Paired hubs' : 'Paired, not seen right now',
                   style: theme.textTheme.labelLarge,
                 ),
               ),
@@ -423,8 +488,12 @@ class _HubPicker extends ConsumerWidget {
     );
   }
 
-  static String _hubSubtitle(HubTarget target) {
-    final parts = <String>[target.address];
+  static String _hubSubtitle(HubTarget target, {required bool ios}) {
+    final parts = <String>[
+      ios && target.host.isEmpty
+          ? 'address unknown: add it by address'
+          : target.address,
+    ];
     if (target.pairingSecret != null) {
       parts.add(
         target.origin == HubOrigin.pairingLink ? 'from QR code' : 'PIN entered',

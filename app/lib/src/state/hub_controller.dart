@@ -36,17 +36,21 @@ class HubState {
   /// Master linear gain (0..=4).
   final double masterGain;
 
-  /// The last error to show (cleared by [HubController.clearError]).
+  /// The last error, kept until [HubController.clearError], a successful
+  /// start or a stop: the app shell shows it in a snack bar wherever the
+  /// user is, and the hub screen keeps showing it (e.g. after a failure from
+  /// the desktop tray while the window was hidden).
   final String? error;
 
-  /// A copy with the given fields replaced (`error` is always replaced).
+  /// A copy with the given fields replaced. [error] is kept unless passed
+  /// (pass `null` to clear it).
   HubState copyWith({
     bool? running,
     bool? busy,
     int? port,
     List<SourceDto>? sources,
     double? masterGain,
-    String? error,
+    Object? error = _keep,
   }) {
     return HubState(
       running: running ?? this.running,
@@ -54,9 +58,11 @@ class HubState {
       port: port ?? this.port,
       sources: sources ?? this.sources,
       masterGain: masterGain ?? this.masterGain,
-      error: error,
+      error: identical(error, _keep) ? this.error : error as String?,
     );
   }
+
+  static const _keep = Object();
 }
 
 /// The hub: start/stop, live sources (events + polling) and mixer controls.
@@ -107,7 +113,8 @@ class HubController extends Notifier<HubState> {
   /// Starts the hub (and, on mobile, the native hub service first).
   Future<void> start() async {
     if (state.busy || state.running) return;
-    state = state.copyWith(busy: true);
+    // A new attempt: a repeated failure is reported again.
+    state = state.copyWith(busy: true, error: null);
     final native = ref.read(nativeChannelProvider);
     final HubStatusDto status;
     try {
@@ -241,7 +248,7 @@ class HubController extends Notifier<HubState> {
 
   /// Forgets the current error.
   void clearError() {
-    if (state.error != null) state = state.copyWith();
+    if (state.error != null) state = state.copyWith(error: null);
   }
 
   Future<void> _control(

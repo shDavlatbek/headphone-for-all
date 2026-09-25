@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
+import 'package:headphone_for_all/src/models/hub_target.dart';
+import 'package:headphone_for_all/src/state/app_prefs.dart';
+import 'package:headphone_for_all/src/state/hub_controller.dart';
+import 'package:headphone_for_all/src/state/sender_controller.dart';
 import 'package:headphone_for_all/src/state/navigation.dart';
 
 import 'helpers.dart';
@@ -37,6 +41,95 @@ void main() {
     container.read(sectionProvider.notifier).select(AppSection.home);
     await tester.pumpAndSettle();
     expect(find.text('Kitchen'), findsOneWidget);
+    await unmount(tester);
+  });
+
+  testWidgets(
+    'saving with the hub running offers a restart that works although the '
+    'form was rebuilt',
+    (tester) async {
+      final fake = FakeHfaApi(deviceName: 'Laptop');
+      final container = await pumpApp(
+        tester,
+        fake,
+        section: AppSection.settings,
+      );
+      await container.read(hubControllerProvider.notifier).start();
+      await tester.pumpAndSettle();
+      expect(fake.calls.where((c) => c == 'hubStart'), hasLength(1));
+
+      // A changed setting: the saved value differs, so the form (keyed by
+      // it) is replaced while the snack bar is still shown.
+      await tester.enterText(find.byKey(const Key('device-name')), 'Kitchen');
+      await tester.tap(find.byKey(const Key('save-settings')));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Saved. Restart the hub to apply the changes.'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Restart hub'));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+      expect(fake.calls.where((c) => c == 'hubStart'), hasLength(2));
+      expect(fake.calls, contains('hubStop'));
+      expect(container.read(hubControllerProvider).running, isTrue);
+      await unmount(tester);
+    },
+  );
+
+  testWidgets('saving while sending says the sender needs a restart', (
+    tester,
+  ) async {
+    final fake = FakeHfaApi(
+      trusted: [
+        const TrustedPeerDto(
+          deviceId: 'hub-1',
+          name: 'Desk',
+          pairedAtUnix: 1700000000,
+        ),
+      ],
+    );
+    final container = await pumpApp(tester, fake, section: AppSection.settings);
+    final sender = container.read(senderControllerProvider.notifier);
+    sender.selectTarget(
+      const HubTarget(
+        name: 'Desk',
+        origin: HubOrigin.manual,
+        host: '10.0.0.2',
+        deviceId: 'hub-1',
+        trusted: true,
+      ),
+    );
+    await sender.start();
+    await tester.pumpAndSettle();
+    expect(container.read(senderControllerProvider).isLive, isTrue);
+
+    await tester.tap(find.byKey(const Key('fec')));
+    await tester.tap(find.byKey(const Key('save-settings')));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Saved. Stop and start sending to apply the changes.'),
+      findsOneWidget,
+    );
+    final starts = fake.calls.where((c) => c == 'senderStart').length;
+    await tester.tap(find.text('Restart sending'));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(fake.calls.where((c) => c == 'senderStart'), hasLength(starts + 1));
+    expect(container.read(senderControllerProvider).isLive, isTrue);
+    await unmount(tester);
+  });
+
+  testWidgets('the start-on-launch switch applies at once', (tester) async {
+    final container = await pumpApp(
+      tester,
+      FakeHfaApi(),
+      section: AppSection.settings,
+    );
+    expect(container.read(appPrefsProvider).startHubOnLaunch, isFalse);
+    await tester.tap(find.byKey(const Key('start-hub-on-launch')));
+    await tester.pumpAndSettle();
+    expect(container.read(appPrefsProvider).startHubOnLaunch, isTrue);
     await unmount(tester);
   });
 

@@ -70,3 +70,6 @@ flutter:
   assets:
     # Tray icon (desktop), loaded from disk by tray_manager.
     - assets/tray_icon.png
+    # Licences of the Rust core (libopus and the crates), shown on the
+    # licence page; regenerate with tool/gen_rust_licenses.py.
+    - assets/licenses/rust.txt

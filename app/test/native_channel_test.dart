@@ -92,6 +92,27 @@ void main() {
     });
   });
 
+  test('the multicast lock is reference counted', () async {
+    final methods = <String>[];
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      methods.add(call.method);
+      return null;
+    });
+    final native = NativeChannel(eventsSupported: false);
+    // Discovery and a sender that finds its hub by id overlap.
+    await native.acquireMulticastLock();
+    await native.acquireMulticastLock();
+    await native.releaseMulticastLock();
+    expect(methods, ['acquireMulticastLock']);
+    await native.releaseMulticastLock();
+    expect(methods, ['acquireMulticastLock', 'releaseMulticastLock']);
+    // An unbalanced release does not reach the platform.
+    await native.releaseMulticastLock();
+    expect(methods, hasLength(2));
+    await native.acquireMulticastLock();
+    expect(methods.last, 'acquireMulticastLock');
+  });
+
   test('platform errors are not swallowed', () async {
     messenger.setMockMethodCallHandler(channel, (call) async {
       throw PlatformException(code: 'denied', message: 'no');
@@ -124,12 +145,13 @@ void main() {
       return call.method == 'getDataDir' ? '/native/hfa' : null;
     });
     final fake = _DirRecordingFake();
-    final info = await initCore(
+    final (:info, :dataDir) = await initCore(
       api: fake,
       native: NativeChannel(eventsSupported: false),
       loadRust: false,
     );
     expect(fake.dataDir, '/native/hfa');
+    expect(dataDir, '/native/hfa');
     expect(info.deviceName, 'Test device');
   });
   test(
@@ -160,6 +182,25 @@ void main() {
       expect(await resolveDataDir(native, requireNative: true), '/group/hfa');
     },
   );
+
+  test('the Rust library is loaded from the pod framework on Apple', () {
+    // Android, Linux, Windows: flutter_rust_bridge's default (named after
+    // the crate, libhfa_ffi.so / hfa_ffi.dll).
+    for (final os in ['android', 'linux', 'windows']) {
+      expect(rustExternalLibrary(os), isNull, reason: os);
+    }
+    expect(
+      appleRustFramework,
+      'rust_lib_headphone_for_all.framework/rust_lib_headphone_for_all',
+    );
+    // iOS / macOS: the framework (not on this test host), else the symbols
+    // linked into the process; never the non-existent hfa_ffi.framework.
+    for (final os in ['ios', 'macos']) {
+      final library = rustExternalLibrary(os);
+      expect(library, isNotNull, reason: os);
+      expect(library!.debugInfo, contains('process'), reason: os);
+    }
+  });
 }
 
 class _DirRecordingFake extends FakeHfaApi {
