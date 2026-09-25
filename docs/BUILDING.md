@@ -368,7 +368,7 @@ the same branch cancels the older run (except on `main`). Workflows have read-on
 | Job | Runner | What |
 |---|---|---|
 | rustfmt | ubuntu-latest | `cargo fmt --check` (every Rust job uses `RUST_TOOLCHAIN`, see [Toolchain versions](#toolchain-versions)) |
-| clippy + test | ubuntu, windows, macos (-latest) | `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` (the first real run of the WASAPI and Core Audio backends' unit tests) |
+| clippy + test | ubuntu, windows, macos (-latest) | `clippy --workspace --all-targets -D warnings`, `cargo test --workspace --no-fail-fast` (every crate's tests run even when one fails; includes the WASAPI and Core Audio backends' unit tests) |
 | Android | ubuntu-latest | `cargo ndk -t arm64-v8a clippy -p hfa-ffi` with the runner's newest NDK |
 | iOS | macos-latest | `cargo check` + `clippy -p hfa-ffi --target aarch64-apple-ios` (default features: bundled libopus + frb) |
 | CLI selftest | ubuntu-latest | `hfa selftest --seconds 8 --loss 5 --jitter 20` (release) |
@@ -417,7 +417,7 @@ python3 -c "import yaml,glob; [yaml.safe_load(open(f)) for f in glob.glob('.gith
 | `cargo expand returned empty output` from the codegen | `hfa-ffi` does not compile (see the command output), or cargo-expand is missing / too new for the toolchain: `cargo install cargo-expand --locked`. |
 | Linux build: `Package 'x11'` / `'xi'` / `'gtk+-3.0'` not found | Install `libgtk-3-dev libx11-dev libxi-dev` (tray_manager's `cnativeapi` compiles native code on every platform). |
 | macOS / iOS link errors such as `Undefined symbols … _AudioObjectGetPropertyData` or `_objc_msgSend` | A framework is missing from the target that links the Rust library; compare with `--print native-static-libs` (see iOS notes). |
-| Windows: `path too long`, MSBuild / CMake errors deep inside `build\windows\…\cargokit_build` | Clone to a short path (`C:\src\hfa`) and enable long paths (`git config --global core.longpaths true`, and the `LongPathsEnabled` registry setting). |
+| Windows: `path too long`, `C1041: cannot open program database` or other MSBuild / CMake errors deep inside `build\windows\x64\cargokit` | A build path crossed `MAX_PATH` (260 characters; MSVC's compiler is not long-path aware). libopus' CMake build nests about 160 characters below cargokit's Cargo target directory `app\build\windows\x64\cargokit`, which leaves room for a checkout path of about 70 characters. Clone to a short path (`C:\src\hfa`) and enable long paths (`git config --global core.longpaths true`, and the `LongPathsEnabled` registry setting). |
 | Windows: capturing one app (or "everything except this app") fails with "process loopback needs Windows 10 build 20348 or newer" | Process loopback is officially available from build 20348 (it usually works from 19041, version 2004); update Windows or capture the whole system mix. |
 | Linux: `failed to connect` / `Host is down` from `pw-cli`, or PipeWire exits with `File name too long` | No PipeWire session for this user, or `XDG_RUNTIME_DIR` is so long that the socket path exceeds 108 bytes; use a short directory such as `/tmp/pw-run`. |
 | `ALSA lib … Unknown PCM` noise in test output in containers | Harmless: cpal probes ALSA devices that a container does not have. |
