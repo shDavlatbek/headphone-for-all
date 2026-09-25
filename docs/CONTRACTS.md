@@ -1622,6 +1622,15 @@ window hidden (Activity Monitor's "App Nap" column), add `beginStreaming` / `end
 formatting). `verify_xcodeproj.rb` and `configure_xcodeproj.rb` fail when a committed PNG differs from the
 generator output, so regenerate and copy both together.
 
+**Not done in `fix/apple` (and why).** Native Bonjour for iOS (browse with `NWBrowser`, advertise an iOS hub with
+`NWListener`/`NetService`) needs `fix/core-sec`'s `discovery::set_platform_backend` hook and a registration path
+through `hfa-ffi`, neither of which exists on this branch; until then iOS dials hubs at their remembered address
+(`fix/flutter`), and both `writeBroadcastConfig` and the C ABI (`fix/ffi-cli`) refuse an empty host. The
+extension's live connection state (`hfa_ext_sender_state`, ending the broadcast on `failed`) is `fix/ffi-cli`'s;
+forwarding `connecting`/`reconnecting` to the app (a `broadcast_status.json` state other than `started`, which the
+re-sync above already treats as running) can build on it after the merge. The running engines' trust-store
+snapshot is `fix/core-sec`'s shared store.
+
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 
 **Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).
