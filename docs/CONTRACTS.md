@@ -1032,6 +1032,65 @@ flutter build windows | macos | ios   # on the matching OS (CI)
 Clean up after local builds: `rm -rf app/build app/.dart_tool/flutter_build app/android/.gradle app/android/app/build`
 (cargokit puts its own Rust target directory under `app/build`).
 
+### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
+
+**Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).
+- Window title "Headphone for All"; initial size 960 × 680 logical px, centred in the primary monitor's work area
+  and clamped to it; minimum size 380 × 520 (DPI-scaled `WM_GETMINMAXINFO`, written before the plugins see the
+  message, so `windowManager.setMinimumSize` from Dart still overrides it).
+- Window class **`io.github.shdavlatbek.hfa.MainWindow`** (the template's generic `FLUTTER_RUNNER_WIN32_WINDOW`
+  is shared by every Flutter app). Explicit **AppUserModelID `io.github.shdavlatbek.hfa`** (the installer's
+  shortcuts carry the same id).
+- **Single instance per user session:** named mutex **`io.github.shdavlatbek.hfa.SingleInstance`** (no `Global\`
+  prefix; also the installer's `AppMutex`). A second launch finds the main window by class (hidden windows
+  included, waiting up to 5 s for a starting first instance), calls `AllowSetForegroundWindow` for its process
+  and posts the registered message **`io.github.shdavlatbek.hfa.Activate`**; the first instance restores /
+  shows the window and brings it to the front, then the second exits with its arguments dropped. Dart sees the
+  usual `window_manager` `show` / `focus` events.
+- **Close to tray:** the runner still quits when the window is destroyed (`SetQuitOnClose(true)`), which is
+  what happens when Dart has not called `setPreventClose(true)`. With prevent-close on, `WM_CLOSE` only reaches
+  Dart; `windowManager.hide()` (`SW_HIDE`) keeps the message loop running, and `windowManager.destroy()`
+  posts `WM_QUIT`, which ends it.
+- **Data directory:** `path_provider`'s application support directory on Windows is
+  `%APPDATA%\<CompanyName>\<ProductName>` from the exe's version resource, so the app's data lives in
+  `%APPDATA%\io.github.shdavlatbek\Headphone for All\hfa`. `Runner.rc` keeps `CompanyName =
+  io.github.shdavlatbek` and `ProductName = Headphone for All` for that reason (changing either loses the
+  user's identity and pairings); `FileDescription` "Headphone for All", `LegalCopyright` "headphone-for-all
+  contributors. MIT OR Apache-2.0", `Comments` = the tagline.
+
+**Linux runner** (`app/linux/`).
+- Application id `io.github.shdavlatbek.hfa` (also `g_set_prgname`, hence `WM_CLASS` / `StartupWMClass`),
+  title "Headphone for All", default size 960 × 680, minimum 380 × 520 (geometry hints), centred on X11.
+- **Unique `GApplication`** (the template used `G_APPLICATION_NON_UNIQUE`): one instance per D-Bus session; a
+  second launch activates the first one, which `gtk_window_present`s its window (also when hidden to the tray),
+  and exits; its command-line arguments are dropped. Without a session bus GLib runs non-unique.
+- The bundle installs `app/linux/icons/hicolor/**` into `data/icons/hicolor/`; the runner sets the window icon
+  from those PNGs (found via `/proc/self/exe`) and falls back to the themed icon named after the application
+  id. Data directory: `$XDG_DATA_HOME/io.github.shdavlatbek.hfa/hfa` (`path_provider_linux` uses the
+  application id).
+
+**Icon.** One source, `packaging/icon/hfa.svg` (ids `tile` and `glyph` are used to derive variants), rendered
+by `packaging/icon/generate.py` into `app/windows/runner/resources/app_icon.ico` (16–256 px),
+`app/linux/icons/hicolor/<N>x<N>/apps/io.github.shdavlatbek.hfa.png` (16–512, plus `scalable/`) and
+`packaging/icon/out/` for the other work packages to adopt: `android/res/` (legacy mipmaps + adaptive icon
+layers, background `#3949AB`), `ios/AppIcon.appiconset` and `macos/AppIcon.appiconset` (drop-in replacements
+with the Flutter template's file names and `Contents.json`), `png/` (512, 1024).
+
+**Packaging** (`packaging/`, details in `packaging/README.md`). Outputs go to `packaging/dist/` (git-ignored);
+the version comes from `app/pubspec.yaml` without the `+build` part.
+- Windows: `windows/hfa.iss` (Inno Setup ≥ 6.3, fixed `AppId` GUID, per-user by default, optional all-users
+  install with a private-network firewall rule, MSVC runtime DLLs deployed app-locally, user data kept on
+  uninstall unless the user asks) built by `windows/build-installer.ps1` →
+  `Headphone_for_All-<ver>-windows-<x64|arm64>-setup.exe`. MSIX via the `msix` pub package is documented, not
+  wired (needs `msix_config` in `app/pubspec.yaml`, feat/app).
+- Linux: `linux/io.github.shdavlatbek.hfa.desktop` + `.metainfo.xml`; `linux/build-appimage.sh` →
+  `Headphone_for_All-<ver>-<arch>.AppImage` (appimagetool, no linuxdeploy; GTK 3 and **libpipewire-0.3 are
+  required from the host, never bundled**); `linux/io.github.shdavlatbek.hfa.yml` (runtime
+  `org.freedesktop.Platform` 26.08, which provides libpipewire; packages the prebuilt release bundle) +
+  `linux/build-flatpak.sh` → `Headphone_for_All-<ver>-<arch>.flatpak`.
+- macOS: `macos/build-dmg.sh` → `Headphone_for_All-<ver>-macos.dmg` (create-dmg or hdiutil; optional Developer ID
+  signing with the hardened runtime and `notarytool` notarization, credentials only from the environment).
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |
