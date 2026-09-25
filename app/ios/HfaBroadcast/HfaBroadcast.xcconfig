@@ -1,0 +1,11 @@
+// Base configuration of the HfaBroadcast extension target (all build configurations).
+//
+// Flutter writes FLUTTER_BUILD_NAME / FLUTTER_BUILD_NUMBER (pubspec version) into
+// Generated.xcconfig; the extension's Info.plist uses them so that its version always matches
+// the containing app (App Store validation requires that). Optional include: the file only
+// exists after `flutter pub get` / `flutter build`.
+//
+// Deliberately NOT based on Flutter/Debug.xcconfig or Release.xcconfig: those include the
+// CocoaPods configuration of Runner, which would link Flutter and the plugins (including the
+// Flutter app's copy of hfa-ffi) into the extension.
+#include? "../Flutter/Generated.xcconfig"
