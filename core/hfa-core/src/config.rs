@@ -1,11 +1,12 @@
 //! Persisted user settings (`<data_dir>/settings.json`).
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use hfa_capture::OutputTarget;
 use serde::{Deserialize, Serialize};
 
-use crate::Result;
+use crate::{CoreError, Result};
 
 /// File name of the settings inside the data directory.
 pub const SETTINGS_FILE: &str = "settings.json";
@@ -56,23 +57,166 @@ impl Default for Settings {
     }
 }
 
+/// Smallest accepted Opus bitrate (bits per second).
+pub const MIN_BITRATE: u32 = 6_000;
+/// Largest accepted Opus bitrate (bits per second).
+pub const MAX_BITRATE: u32 = 510_000;
+/// Opus frame durations the engines support (ms).
+pub const FRAME_MS_CHOICES: [u32; 2] = [10, 20];
+/// Upper bound for the jitter-buffer targets (ms).
+pub const MAX_JITTER_MS: u32 = 2_000;
+/// Longest accepted device name in bytes (same limit as the pairing URI's `n` parameter).
+pub const MAX_DEVICE_NAME_LEN: usize = hfa_proto::uri::MAX_NAME_LEN;
+
 impl Settings {
     /// Loads `<dir>/settings.json`, or returns defaults (with `data_dir = dir`) if the file does
-    /// not exist. Creates `dir` if needed.
+    /// not exist. Creates `dir` if needed. The loaded settings are [validated](Self::validate).
     ///
     /// # Errors
-    /// [`crate::CoreError::Io`] / [`crate::CoreError::Json`] for unreadable or corrupt files.
-    pub fn load_or_default(_dir: &Path) -> Result<Settings> {
-        todo!("feat/core-engine")
+    /// [`crate::CoreError::Io`] / [`crate::CoreError::Json`] for unreadable or corrupt files,
+    /// [`crate::CoreError::Config`] if the file holds invalid values.
+    pub fn load_or_default(dir: &Path) -> Result<Settings> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(SETTINGS_FILE);
+        let mut settings = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<Settings>(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(path = %path.display(), "no settings file, using defaults");
+                Settings::default()
+            }
+            Err(e) => return Err(e.into()),
+        };
+        settings.data_dir = dir.to_path_buf();
+        settings.validate()?;
+        Ok(settings)
     }
 
-    /// Writes `<data_dir>/settings.json` atomically (write temp file + rename).
+    /// Writes `<data_dir>/settings.json` atomically (write temp file + rename). Creates
+    /// `data_dir` if needed. Invalid settings are refused (nothing is written).
     ///
     /// # Errors
+    /// [`crate::CoreError::Config`] (see [`Settings::validate`]),
     /// [`crate::CoreError::Io`] / [`crate::CoreError::Json`].
     pub fn save(&self) -> Result<()> {
-        todo!("feat/core-engine")
+        self.validate()?;
+        let json = serde_json::to_vec_pretty(self)?;
+        write_file_atomic(&self.data_dir.join(SETTINGS_FILE), &json, false)
     }
+
+    /// Checks every field:
+    /// - `device_name`: not blank, at most [`MAX_DEVICE_NAME_LEN`] bytes, no control characters;
+    /// - `frame_ms` ∈ [`FRAME_MS_CHOICES`] (10 or 20);
+    /// - `bitrate` in [`MIN_BITRATE`]`..=`[`MAX_BITRATE`];
+    /// - `1 <= jitter_min_ms <= jitter_max_ms <=` [`MAX_JITTER_MS`].
+    ///
+    /// Every `port` is valid: `0` lets the hub bind any free port (see `HubHandle::local_port`).
+    ///
+    /// # Errors
+    /// [`crate::CoreError::Config`] naming the first invalid field.
+    pub fn validate(&self) -> Result<()> {
+        let name = self.device_name.trim();
+        if name.is_empty() {
+            return Err(config_err("device_name must not be empty"));
+        }
+        if self.device_name.len() > MAX_DEVICE_NAME_LEN {
+            return Err(config_err(format!(
+                "device_name is longer than {MAX_DEVICE_NAME_LEN} bytes"
+            )));
+        }
+        if self.device_name.chars().any(char::is_control) {
+            return Err(config_err("device_name contains control characters"));
+        }
+        if !FRAME_MS_CHOICES.contains(&self.frame_ms) {
+            return Err(config_err(format!(
+                "frame_ms must be 10 or 20, got {}",
+                self.frame_ms
+            )));
+        }
+        if !(MIN_BITRATE..=MAX_BITRATE).contains(&self.bitrate) {
+            return Err(config_err(format!(
+                "bitrate must be in {MIN_BITRATE}..={MAX_BITRATE}, got {}",
+                self.bitrate
+            )));
+        }
+        if self.jitter_min_ms == 0 || self.jitter_min_ms > self.jitter_max_ms {
+            return Err(config_err(format!(
+                "jitter bounds must satisfy 1 <= min <= max, got {}..={}",
+                self.jitter_min_ms, self.jitter_max_ms
+            )));
+        }
+        if self.jitter_max_ms > MAX_JITTER_MS {
+            return Err(config_err(format!(
+                "jitter_max_ms must be at most {MAX_JITTER_MS}, got {}",
+                self.jitter_max_ms
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn config_err(msg: impl Into<String>) -> CoreError {
+    CoreError::Config(msg.into())
+}
+
+/// Replaces `path` with `bytes` atomically: the data goes to a fresh temporary file in the
+/// same directory (created with `create_new`, unix mode 0600 when `private`, else 0644, both
+/// reduced by the umask), is flushed to disk and then renamed over `path`. Readers see either
+/// the old or the new complete file, never a partial one. Creates the parent directory.
+pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+    let tmp = write_temp_file(path, bytes, private)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// Writes `bytes` into a new temporary file next to `path` (see [`write_file_atomic`]) and
+/// returns its path. The file is fully written and synced; the caller renames or links it.
+pub(crate) fn write_temp_file(path: &Path, bytes: &[u8], private: bool) -> Result<PathBuf> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(dir)?;
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let tmp = dir.join(format!(".{base}.{:016x}.tmp", rand::random::<u64>()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The mode applies at creation, so a private file is never readable by others, not
+        // even between creation and a later chmod.
+        options.mode(if private { 0o600 } else { 0o644 });
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let result = options.open(&tmp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(tmp)
+}
+
+/// Flushes the directory entry of a rename (best effort; unix only).
+fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Platform data directory for headphone-for-all (via `directories`), e.g.
