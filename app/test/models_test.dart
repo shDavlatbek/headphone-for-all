@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
     show AnyhowException, PanicException;
 import 'package:flutter_test/flutter_test.dart';
@@ -208,6 +209,24 @@ void main() {
     expect(
       describeError(PanicException('todo: engineBacktrace [{ fn: "x" }]')),
       'Internal error: todo: engine',
+    );
+    // Native channel errors: the message, never Flutter's debug format.
+    expect(
+      describeError(
+        PlatformException(
+          code: 'serviceFailed',
+          message: 'The hub service could not start: not allowed',
+        ),
+      ),
+      'The hub service could not start: not allowed',
+    );
+    expect(
+      describeError(PlatformException(code: 'NO_APP_GROUP')),
+      contains('app group'),
+    );
+    expect(
+      describeError(PlatformException(code: 'WEIRD', message: ' ')),
+      'Platform error (WEIRD)',
     );
   });
 }

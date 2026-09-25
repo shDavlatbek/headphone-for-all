@@ -6,6 +6,7 @@
 /// demo mode). The DTO types are the generated ones and are re-exported here.
 library;
 
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
     show AnyhowException, PanicException;
 
@@ -147,11 +148,25 @@ String describeError(Object error) {
     PanicException(:final message) =>
       'Internal error: ${_firstLine(message.split('Backtrace [').first)}',
     HfaApiException(:final message) => message,
+    // Native channel errors carry a human-readable message (§8.3/§8.8/§8.9).
+    PlatformException(:final code, :final message) =>
+      (message == null || message.trim().isEmpty)
+          ? _platformCodeText(code)
+          : message.trim(),
     StateError(:final message) => message,
     ArgumentError(:final message) => '$message',
     _ => error.toString(),
   };
 }
+
+/// A platform error without a message: known codes get a sentence.
+String _platformCodeText(String code) => switch (code) {
+  'NO_APP_GROUP' =>
+    'The app group shared with the broadcast extension is not available. '
+        'Check the entitlements and signing.',
+  'serviceFailed' => 'The background service could not start.',
+  _ => 'Platform error ($code)',
+};
 
 /// anyhow messages can carry a backtrace after the first line.
 String _firstLine(String message) {
