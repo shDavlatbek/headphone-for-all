@@ -198,7 +198,7 @@ non-zero when the result is out of bounds; CI runs:
 cargo run --release -p hfa-cli --manifest-path core/Cargo.toml -- selftest --seconds 8 --loss 5 --jitter 20
 ```
 
-(`--seconds` 1..=3600, default 5; `--loss` 0..=100 %; `--jitter` extra delay in ms, uniform 0..=N.)
+(`--seconds` 1..=600, default 5 (the hub's WAV takes about 23 MB per minute); `--loss` 0..=100 %; `--jitter` extra delay in ms, uniform 0..=N.)
 
 ## Flutter app
 
@@ -361,8 +361,10 @@ newer.
 ## Continuous integration
 
 GitHub Actions runs `rust.yml` and `flutter.yml` on pushes to `main` and `claude/**`, on every pull
-request (so a `feat/**` branch gets CI through its pull request) and on demand (`workflow_dispatch`). Changes to Markdown files and `docs/` alone do not trigger it. A newer push to
-the same branch cancels the older run (except on `main`). Workflows have read-only repository access.
+request (so a `feat/**` branch gets CI through its pull request) and on demand (`workflow_dispatch`).
+Changes to Markdown files and `docs/` alone do not trigger it. A newer push to the same branch cancels
+the older run (except on `main`). Workflows have read-only repository access (only the publish job of
+`release.yml` may write, to create the release).
 
 **`rust.yml`**
 

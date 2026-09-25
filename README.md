@@ -26,19 +26,47 @@ The headphone sees one normal source, so no firmware hacks and no special headph
 
 ## Status
 
-📐 **Planning.** Research and architecture are done. Implementation starts with milestone M0 (see the roadmap).
+🧪 **Pre-release.** The Rust core, the headless `hfa` CLI and the Flutter app are implemented for all
+five platforms (roadmap milestones M0–M4; M5 polish and distribution is in progress), with installers
+and CI builds. Nothing has been released yet, and the builds have not been through the long-run
+exit tests of the roadmap on real hardware. Expect rough edges.
 
-## Planned platform support
+## Platform support
 
 | Platform | Send its audio (sender) | Headphone connected here (hub) | How the audio is captured |
 |---|---|---|---|
-| Windows 10 2004+ / 11 | ✅ M1 | ✅ M1 | WASAPI loopback / process loopback |
-| macOS 14.2+ | ✅ M1 | ✅ M1 | Core Audio process taps |
-| Linux (PipeWire) | ✅ M0 | ✅ M0 | PipeWire monitor source |
-| Android 10+ | ✅ M2 ⚠️ some apps block capture | ✅ M4 | AudioPlaybackCapture + MediaProjection |
-| iOS 15+ | ⚠️ M3 via screen-broadcast extension, DRM audio is silent | ✅ M4 | ReplayKit Broadcast Upload Extension |
+| Windows 10 2004+ / 11 | ✅ | ✅ | WASAPI loopback / process loopback |
+| macOS 12+ | ✅ macOS 14.2+ | ✅ | Core Audio process taps |
+| Linux (PipeWire) | ✅ | ✅ | PipeWire monitor of the default sink |
+| Android 10+ | ✅ ⚠️ apps that opt out of capture stay silent | ✅ | AudioPlaybackCapture + MediaProjection |
+| iOS 15+ | ⚠️ through the screen-broadcast extension; DRM audio is silent | ✅ | ReplayKit Broadcast Upload Extension |
 
-Any device can be the hub. The first hub builds are desktop; the mobile hub comes in M4.
+Any device can be the hub.
+
+**Known limitations**
+- **iOS has no network discovery yet:** an iPhone or iPad does not list hubs and is not found as a hub;
+  connect with the hub's QR code, pairing link or address.
+- **The sender keeps playing out loud** on Windows, Linux and Android (only macOS mutes the original
+  output while it captures), so turn the sender's own volume down or use its headphone jack.
+- DRM-protected audio (e.g. Apple Music, Netflix) is silent in an iOS broadcast; some Android apps
+  (and calls) block capture, see [docs/ANDROID_APPS.md](docs/ANDROID_APPS.md).
+- The hub listens on IPv4 only (TCP + UDP port 47810); discovery uses mDNS. Guest networks and access
+  points with client isolation block it: use "Add by address" or a network without isolation.
+- The CLI and the app keep separate identities and pairings (different data directories).
+- No store releases, no crash reporting yet.
+
+## Install
+
+- **Released builds:** tagged versions are published on the
+  [GitHub releases page](https://github.com/shDavlatbek/headphone-for-all/releases) (Windows installer,
+  AppImage, Flatpak, macOS DMG, Android APK, and the `hfa` CLI), with `SHA256SUMS`.
+- **Test builds:** every CI run on `main` keeps its packages for 14 days (Actions → a "Flutter" run →
+  Artifacts; needs a GitHub login). They are unsigned; the APK is debug-signed.
+- **From source:** [docs/BUILDING.md](docs/BUILDING.md) (core, CLI and app on every platform) and
+  [packaging/README.md](packaging/README.md) (installers).
+
+How to pair devices, grant the capture permissions and fix network problems:
+**[docs/USER_GUIDE.md](docs/USER_GUIDE.md)**.
 
 ## Tech stack (short)
 
@@ -109,3 +137,5 @@ hfa selftest --senders 4 --wav mix.wav         # 4 senders, keep the hub's outpu
   threading, repo layout, security.
 - [docs/ROADMAP.md](docs/ROADMAP.md): milestones M0–M5 with exit criteria, future work, risks and open questions.
 - [docs/BUILDING.md](docs/BUILDING.md): prerequisites, building and testing the core, CLI and app on every platform, packaging, CI.
+- [docs/USER_GUIDE.md](docs/USER_GUIDE.md): installing and using the app, permissions per platform, network troubleshooting.
+- [docs/ANDROID_APPS.md](docs/ANDROID_APPS.md): which Android apps can be captured.
