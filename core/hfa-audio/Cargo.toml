@@ -1,0 +1,25 @@
+[package]
+name = "hfa-audio"
+description = "headphone-for-all DSP and codec: Opus, jitter buffer, drift control, resampler, mixer, meters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["bundled-opus"]
+# Build libopus from bundled source (static). Disable to link the system libopus.
+bundled-opus = ["opusic-sys/bundled"]
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+opusic-sys = { workspace = true }
+rubato = { workspace = true }
+hound = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

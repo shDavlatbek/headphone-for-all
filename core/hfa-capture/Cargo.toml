@@ -1,0 +1,44 @@
+[package]
+name = "hfa-capture"
+description = "headphone-for-all OS audio I/O: system/app capture backends and playback outputs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["bundled-opus"]
+# Build libopus from bundled source (static). Disable to link the system libopus.
+bundled-opus = ["hfa-audio/bundled-opus"]
+
+[dependencies]
+hfa-audio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+rtrb = { workspace = true }
+parking_lot = { workspace = true }
+cpal = { workspace = true }
+
+# OS-specific backends. Declared here up front so the per-OS work packages
+# (feat/capture-linux, -windows, -macos) only edit their `src/<os>.rs`.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
+windows-core = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-core-audio = { workspace = true }
+objc2-core-audio-types = { workspace = true }
+objc2-core-foundation = { workspace = true }
+block2 = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
