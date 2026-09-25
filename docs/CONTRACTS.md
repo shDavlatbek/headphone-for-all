@@ -85,7 +85,7 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
     - Controls: `SetVolume{stream_id, gain}`, `SetMute{stream_id, muted}`, `SetPriority{stream_id, priority}`.
     - Keep-alive and feedback: `Ping{nonce, t_us}`, `Pong{nonce, t_us}`,
       `Stats{stream_id, loss_pct, jitter_ms, buffer_ms, latency_ms, recommended_bitrate}`, `Bye{reason}`.
-  - Helpers: `encode_frame(&ControlMessage) -> Vec<u8>` (u32 BE length prefix) and a streaming `FrameDecoder`
+  - Helpers: `encode_frame(&ControlMessage) -> Result<Vec<u8>>` (u32 BE length prefix; see §3.2) and a streaming `FrameDecoder`
     (`push(&[u8])`, `next() -> Option<Result<ControlMessage>>`).
 - `noise.rs`:
   - `NOISE_PATTERN = "Noise_XX_25519_ChaChaPoly_BLAKE2s"`.
@@ -151,6 +151,46 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
 - **Secrets never reach `Debug` (review fix):** `StreamStart`, `PairSpake` and `PairConfirm` use `#[prost(skip_debug)]`
   with manual `Debug` impls (`media_key`, SPAKE message and MAC print only their length). `PairingUri`'s `Debug`
   redacts the token; its `Display` (the URI) contains the token and must not be logged.
+
+### 3.2 Refinements made by `feat/proto` (the code in `core/hfa-proto` is authoritative)
+
+- **`encode_frame(&ControlMessage) -> Result<Vec<u8>>`** (was infallible): `InvalidMessage` for an empty `body`,
+  `FrameTooLarge` if the protobuf payload exceeds `MAX_CONTROL_FRAME`. New `control::FRAME_PREFIX_LEN = 4` and
+  `decode_message(&[u8]) -> Result<ControlMessage>` (one payload without prefix; re-exported at the crate root).
+- `FrameDecoder`: an undecodable or body-less frame (including an unknown oneof variant from a newer peer) yields
+  `Some(Err(Decode | InvalidMessage))` for that frame only, and decoding continues. A length prefix above
+  `MAX_CONTROL_FRAME` yields `FrameTooLarge` **without allocating** and **poisons** the decoder (buffer dropped, later
+  input ignored; the error is returned **once**, then `next()` returns `None`, so error-skipping loops end; check
+  `is_poisoned()` / `poison_error()`): the caller closes the connection. `Debug` prints sizes only.
+- Media: `MediaOpener::open` rejects datagrams shorter than header + tag (`Truncated{needed: 32}`) or longer than
+  `MAX_DATAGRAM` (`FrameTooLarge`); extra `MediaOpener::highest_seq()`. `MediaSealer::seal` does not allocate when
+  `out` has capacity (reuse one buffer per stream). `hfa-proto/Cargo.toml` enables `chacha20poly1305/zeroize`.
+- Noise (wire contract): **prologue `NOISE_PROLOGUE = b"hfa-v0 control"`** on both sides; `NOISE_MAX_MESSAGE = 65535`,
+  `NOISE_TAG_LEN = 16`, `NOISE_MAX_PLAINTEXT = 65519` (a const assertion guarantees a maximal control frame fits).
+  Oversize inputs give `FrameTooLarge`, a transport message below 16 bytes `Truncated`, snow failures `Noise(..)`.
+  A remote static key of small order is rejected with `InvalidKey` (libsodium's blocklist; its DH output would be
+  predictable). The first XX message payload is not encrypted, so **handshake payloads should be empty** and `Hello`
+  goes over the transport. `handshake_hash()` is final only once `is_finished()`. Extras: `NoiseHandshake::is_my_turn()`,
+  **`NoiseTransport::handshake_hash()` and `NoiseTransport::remote_static() -> [u8;32]`** (kept from the handshake, so
+  `hfa-core` can call `into_transport` first and still bind pairing). Transport messages must be decrypted in order;
+  after a failed `decrypt` the channel must be closed. `Debug` impls never print keys.
+- Pairing (wire contract): SPAKE2 symmetric mode with **`SPAKE2_IDENTITY = b"hfa-pairing-v0"`**, password = UTF-8 PIN or
+  token. **`PairingKey = HKDF-SHA256(ikm = SPAKE2 key, salt = Noise handshake hash, info = PAIRING_KDF_INFO = b"hfa pairing v0")`**,
+  `confirm_mac(role) = HMAC-SHA256(key, role.label() ‖ handshake_hash)`. `finish` refuses the peer message if it equals our
+  own (reflection) or is malformed (`Pairing`). `generate_pin()` uses rejection sampling (exactly uniform); constants
+  `PIN_DIGITS = 6`, `TOKEN_BYTES = 16`, `MAC_LEN = 32`. `PairingKey`/`PairingSession` `Debug` are redacted.
+- URI (wire contract, see `uri.rs` module docs): values percent-encoded (all but ASCII alphanumerics and `-._~:`; `+` is
+  literal); IPv6 hosts bracketed in the URI (`h=%5Bfe80::1%5D`) but stored **without** brackets in `PairingUri.host`, no
+  zone ids; strict parsing (scheme `hfa` / host `pair` case-insensitive, no fragment, each parameter exactly once, `v=0`,
+  port 1..=65535 digits only, `id` = exactly 32 bytes of unpadded base64url, token base64url alphabet ≤ `MAX_TOKEN_LEN` = 128,
+  host name `[A-Za-z0-9._-]{1,253}`, name ≤ `MAX_NAME_LEN` = 256 bytes without control characters, total ≤ `MAX_URI_LEN` = 2048);
+  unknown parameters are ignored, surrounding whitespace is trimmed. Constant `URI_PATH = "pair"`.
+  **Build it with `PairingUri::new(host: &str, port, hub_id, token, name: &str) -> Result<PairingUri>`** (review fix):
+  it validates host (IPv6 with or without brackets), port ≠ 0 and token (`InvalidUri`) and sanitizes the free-form name
+  with `sanitize_name(&str) -> String` (re-exported; drops control characters, truncates on a char boundary to
+  `MAX_NAME_LEN`), so `to_string()` always parses back. `Display` also sanitizes the name.
+- Identity: extra `is_fingerprint(&str) -> bool` (re-exported) and `FINGERPRINT_LEN = 19`, e.g. to tell a device id from
+  a name in `HubAddress::Discover`.
 
 ## 4. `hfa-audio` (pure DSP + codec)
 

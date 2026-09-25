@@ -26,15 +26,15 @@ pub mod pairing;
 pub mod replay;
 pub mod uri;
 
-pub use control::{encode_frame, ControlMessage, FrameDecoder};
+pub use control::{decode_message, encode_frame, ControlMessage, FrameDecoder};
 pub use crypto::{MediaKey, MediaOpener, MediaSealer};
 pub use error::ProtoError;
-pub use identity::fingerprint;
+pub use identity::{fingerprint, is_fingerprint};
 pub use media::{MediaHeader, FLAG_DTX, FLAG_FEC, FLAG_RESET};
 pub use noise::{NoiseHandshake, NoiseTransport, StaticKeypair, NOISE_PATTERN};
 pub use pairing::{generate_pin, generate_token, PairingKey, PairingRole, PairingSession};
 pub use replay::{ReplayWindow, REPLAY_WINDOW};
-pub use uri::PairingUri;
+pub use uri::{sanitize_name, PairingUri};
 
 /// Result type used throughout this crate.
 pub type Result<T> = std::result::Result<T, ProtoError>;
