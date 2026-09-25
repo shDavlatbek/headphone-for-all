@@ -13,7 +13,8 @@ tracing = { workspace = true }
 prost = { workspace = true }
 snow = { workspace = true }
 spake2 = { workspace = true }
-chacha20poly1305 = { workspace = true }
+# `zeroize`: wipe the cipher (key copy) on drop.
+chacha20poly1305 = { workspace = true, features = ["zeroize"] }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 hkdf = { workspace = true }
