@@ -147,7 +147,8 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
   `check` → AEAD open → `accept` (only after authentication, so forged packets cannot move the window). Duplicates
   and packets older than the window fail with the new **`ProtoError::Replay { seq }`**.
 - **Wire addition (review fix):** `Hello.pairing_required` (`bool`, tag **7**): set by the hub iff it does not trust
-  the sender's key; senders send `false`. See §6.1 for the pairing procedure.
+  the sender's key; senders send `false`. See §6.1 for the pairing procedure. **Refined by `feat/core-net` (§6.2):**
+  the sender sets it iff it does not trust the hub's key, and the hub's value also covers that request.
 - **Secrets never reach `Debug` (review fix):** `StreamStart`, `PairSpake` and `PairConfirm` use `#[prost(skip_debug)]`
   with manual `Debug` impls (`media_key`, SPAKE message and MAC print only their length). `PairingUri`'s `Debug`
   redacts the token; its `Display` (the URI) contains the token and must not be logged.
@@ -698,6 +699,95 @@ Modules:
   **new** `device_id()`, `stop(self).await`. `HubEvent::{SourceAdded(SourceInfo), SourceRemoved{stream_id},
   SourceUpdated(SourceInfo), PairingCompleted{device_id,name}, PairingFailed{reason}, Error(String)}`.
   `StreamStats`/`SenderStatus` `Default` use `SILENCE_DB` for levels.
+
+### 6.2 Refinements made by `feat/core-net` (the code and module docs in `core/hfa-core/src/{config,identity,pairing,control,discovery,media}.rs` are authoritative)
+
+- **Control procedure (wire contract, `control.rs` module docs):**
+  - `expected_hub_key` is compared right after Noise XX message 2 (where the initiator learns the hub's static key),
+    so on `KeyMismatch(<hub device id>)` the sender aborts **before** message 3 and the hub never learns the sender's key.
+  - **`Hello.pairing_required` from the sender** = "I do not trust your key" (it knows the hub key after the handshake).
+    The hub answers `pairing_required = !hub_trusts_sender || sender_hello.pairing_required`. Both sides therefore agree
+    whether a pairing phase follows without an extra round trip (otherwise a hub that trusts the sender could not tell
+    whether the sender's next message is a `PairStart` or its first engine message). The sender's own trust check stays
+    mandatory whatever the hub answers.
+  - Both sides validate the peer `Hello`: `protocol_version == 0`, `role` (Sender ↔ Hub) and `device_id ==
+    fingerprint(authenticated static key)` → `Protocol` (+ best-effort `Bye`). Names are sanitized
+    (`hfa_proto::sanitize_name`; empty → the device id), `platform`/`app_version` truncated to 64 chars.
+  - **Pairing message order:** sender `PairStart{method}` → hub `begin_attempt` → hub `PairSpake` (or
+    `PairResult{ok:false, reason}` when `begin_attempt` returns `None`) → sender `PairSpake` + `PairConfirm` → hub
+    verifies, **`attempt.succeed()` (now `-> bool`, see Pairing below; `false` → `PairResult{ok:false,"pairing was
+    cancelled on the hub"}` + `PairingFailed`, nobody trusted)**, saves the sender in its `TrustStore`, then
+    `PairConfirm` + `PairResult{ok:true}` → sender verifies the hub MAC and saves the hub. The sender waits for the hub's `PairSpake` before sending its own, so a
+    refused `PairStart` never leaves unread bytes (a close with unread data becomes a TCP reset that can swallow the
+    reason). Wrong secret → `PairResult{ok:false,"wrong PIN or token"}` and `PairingFailed` on both sides. A hub that
+    fails to prove the secret → sender `Bye` + `PairingFailed`, nothing trusted. Invalid `PairStart.method` →
+    `Protocol`. A sender `Bye` instead of `PairStart` → hub `PairingRequired`.
+  - `HANDSHAKE_TIMEOUT` is one deadline around the whole phase (TCP connect included), so every step is bounded
+    (`Timeout`) — **except the trust-store save after a successful pairing** (review fix): it starts only after the
+    one-time secret was consumed and always completes (a `spawn_blocking` write cannot be cancelled, so a deadline in
+    the middle used to leave the peer trusted on disk while the call reported `Timeout` and the secret stayed valid);
+    the hub's `PairConfirm` + `PairResult` after it get the remaining time, at least 2 s. If those cannot be delivered
+    the sender (which proved the secret) stays trusted on the hub and `accept` returns the error; the sender pairs
+    again next time. Error mapping: I/O → `Io`, EOF → `Closed`, Noise/framing → `Proto`, unexpected message →
+    `Protocol`. Trust-store writes run in `spawn_blocking` (any tokio runtime works).
+  - `ControlChannel` extras: `close(self, reason).await` (best-effort `Bye` within 2 s + shutdown), `peer_addr()`,
+    `remote_static()`, `handshake_hash()`, `is_closed()`; `RECORD_PREFIX_LEN = 2`. **Every error from `send`/`recv` is
+    fatal** (later calls return it again or `Closed`), except an unencodable message in `send` (nothing written). A
+    `send` future dropped mid-write marks the channel closed (next call → `Closed`). `recv` closes on a poisoned
+    `FrameDecoder` (`Proto(FrameTooLarge)`). **Undecodable frames (review fix):** fatal (`Protocol`) during
+    `connect`/`accept`; afterwards skipped (a newer peer's unknown variant), logged at most once per 5 s with a count,
+    and more than **`pub const MAX_SKIPPED_FRAMES: u32 = 64`** in a row close the channel (`Protocol`). A transport
+    record with an empty plaintext is fatal (`Protocol`). The record reader consumes records with an offset and
+    compacts once per socket read (no per-record memmove). The single-task
+    `tokio::select!` pattern (recv as branch future, `send` awaited in branch bodies) is a doc example in `control.rs`.
+- **Pairing:** **`PairingAttempt::succeed(self) -> bool`** (`#[must_use]`, review fix): atomically checks that the
+  attempt's window is still the current, unexpired one (not `cancel()`ed, not replaced by `start()`), and only then
+  closes it and returns `true`; `false` means the pairing must be refused. `cancel()`/`start()` therefore really stop
+  an attempt that is in flight. `PairingManager::with_clock(hub_id, name, port, UnixClock)` with `pub type UnixClock = Arc<dyn Fn() -> u64
+  + Send + Sync>` (unix seconds; tests expire windows with it). `start(ttl)` rounds `ttl` up to whole seconds and builds
+  the URI with `PairingUri::new(lan_ipv4() or 127.0.0.1, port, hub_id, token, name)`; if that fails (manager built with
+  port 0) `uri` is `""` (warning logged) and the PIN still works — the hub engine must create the manager with its
+  **bound** port. New `pub fn lan_ipv4() -> Option<Ipv4Addr>`: up, non-loopback, non-link-local, non-p2p IPv4,
+  preferring RFC 1918 addresses and non-virtual interface names (docker/veth/vmnet/tun/wg/…).
+- **Identity / trust files:** `identity.json` = `{"version":1,"private_key":"<b64>","public_key":"<b64>"}` (standard
+  base64), created through a temp file opened with mode 0600 + `hard_link` (never overwrites; concurrent creators end
+  up with the same key); a wider mode found on load is tightened to 0600; a corrupt file is an error (never regenerated).
+  `trusted.json` = `{"version":1,"peers":[{device_id,name,public_key:"<b64>",paired_at}]}`, mode 0600, rewritten
+  atomically (temp + rename); a failed save leaves the in-memory store unchanged. New `FILE_FORMAT_VERSION = 1`,
+  `TrustedPeer::new(public_key, name)` (id = fingerprint, `paired_at` = now). `TrustStore::add` rejects a `device_id`
+  that is not the key's fingerprint (`Config`); `load` drops such entries and rejects other file versions (`Config`).
+  `TrustStore` has a manual `Debug` (path + count). **Readers never wait for disk I/O (review fix):** writers
+  (`add`/`remove`) are serialized by a separate save lock held during write + fsync; the peer-list lock is held only
+  to copy the list and to swap in the saved one, so `is_trusted`/`get`/`peers` are safe on async workers. `add` and
+  `remove` still block — call them from `spawn_blocking` or a non-async thread.
+- **Settings:** new `Settings::validate() -> Result<()>` (`Config`): device name non-blank, ≤ 256 bytes, no control
+  characters; `frame_ms` ∈ `FRAME_MS_CHOICES = [10, 20]`; `bitrate` ∈ `MIN_BITRATE = 6000 ..= MAX_BITRATE = 510000`;
+  `1 <= jitter_min_ms <= jitter_max_ms <= MAX_JITTER_MS = 2000`; every port (0 = any free port). `load_or_default`
+  creates the directory, does not write defaults, and fails on invalid values (`Config`) or corrupt JSON (`Json`);
+  `save` validates first and writes atomically (temp + fsync + rename).
+- **Media:** `MediaSender` sends through a duplicated, non-blocking std handle of the tokio socket (fallback:
+  `try_send_to`), so it never depends on reactor readiness (the first packet from the encoder thread goes out) and
+  never blocks. **`send` returns `Ok(false)` (packet dropped, `seq` consumed) for transient errors (review fix):**
+  `WouldBlock`, `ENOBUFS` (how macOS/iOS and some Wi-Fi drivers report a full queue; `WSAENOBUFS` on Windows),
+  host/network unreachable or down, `EHOSTDOWN`, connection refused, interrupted. Any other `Err` is fatal for the
+  stream. Extra `dest()`, `set_dest(addr)` (e.g. `StreamAccepted.udp_port`; key and seq continue),
+  `MAX_MEDIA_PAYLOAD = MAX_DATAGRAM − 32` (larger payloads → `Proto(FrameTooLarge)`, no seq consumed). Announce each
+  sender's key in exactly one `StreamStart`. `MediaDemux::open` rejects, cheapest first: bad header/size, unknown
+  stream, **`seq` outside the stream's window** — more than **`MAX_SEQ_JUMP = 32768`** above the highest accepted seq
+  (above 32768 before the first packet: streams start at 0) or duplicate/older than `REPLAY_WINDOW` (both
+  `Proto(Replay{seq})`), then AEAD failure (`Proto(Crypto)`); the window moves only after authentication. Rejections
+  are counted (`stats() -> DemuxStats {accepted, malformed, unknown_stream, out_of_window, unauthenticated}`,
+  `rejected()`) and logged at most once per `REJECT_LOG_INTERVAL = 5 s`. Extras `len()`, `is_empty()`,
+  `highest_seq(stream_id)`.
+- **Discovery:** instance name `"<sanitized name> (<first 4 id chars>)"` (≤ 63 bytes, `.`/`\` replaced by `-`), host
+  `hfa-<device id>.local.`, addresses follow the interfaces (`enable_addr_auto`), TXT `name` ≤ 200 bytes;
+  `Advertiser::start` rejects port 0 / empty id; `Advertiser::fullname()`; `stop()`/`Drop` unregister (goodbye) and
+  shut the daemon down without blocking. `browse()` runs a `hfa-mdns-browse` thread (mdns-sd's flume receiver →
+  tokio mpsc, capacity 64, overflow dropped with a warning); only resolved instances with `v=0`, a valid fingerprint
+  `id` and a non-zero port are reported (name falls back to the id, link-local IPv6 dropped, IPv4 first); `Lost(id)`
+  when the last instance of that id is removed; dropping the `Browser` stops browsing and shuts the daemon down.
+  Verified in the container: advertise + browse + goodbye over real multicast (`tests/net_discovery.rs`, not ignored).
+- `hfa-core/Cargo.toml`: added `zeroize` (workspace dep) for wiping key material read from/written to disk.
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

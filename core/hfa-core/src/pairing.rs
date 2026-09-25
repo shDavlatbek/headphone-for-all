@@ -11,7 +11,9 @@
 //! have been handed out and none succeeded, the window is closed.
 
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
+use std::time::Duration;
 
 use hfa_proto::control::PairMethod;
 use serde::{Deserialize, Serialize};
@@ -64,11 +66,16 @@ struct State {
     next_generation: u64,
 }
 
+/// Source of the current unix time in seconds (injectable for tests, see
+/// [`PairingManager::with_clock`]).
+pub type UnixClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// Hub-side pairing state. `Send + Sync`; share it with `Arc`. `Debug` never prints secrets.
 pub struct PairingManager {
     hub_id: [u8; 32],
     name: String,
     port: u16,
+    clock: UnixClock,
     state: parking_lot::Mutex<State>,
 }
 
@@ -89,29 +96,70 @@ impl PairingManager {
     /// Creates a manager for the hub with static public key `hub_id`, display `name`, listening
     /// on `port` (used to build the URI; the host is the hub's primary LAN address).
     pub fn new(hub_id: [u8; 32], name: String, port: u16) -> Self {
+        Self::with_clock(hub_id, name, port, Arc::new(crate::identity::unix_now))
+    }
+
+    /// Like [`PairingManager::new`], with a custom clock returning unix seconds (tests use it
+    /// to expire windows without waiting).
+    pub fn with_clock(hub_id: [u8; 32], name: String, port: u16, clock: UnixClock) -> Self {
         Self {
             hub_id,
             name,
             port,
+            clock,
             state: parking_lot::Mutex::new(State::default()),
         }
     }
 
-    /// Opens (or replaces) a pairing window valid for `ttl`, with a fresh PIN and token and
-    /// a zero attempt counter.
-    pub fn start(&self, _ttl: Duration) -> PairingInfo {
-        let _ = (&self.hub_id, &self.name, self.port);
-        todo!("feat/core-engine")
+    /// Opens (or replaces) a pairing window valid for `ttl` (rounded up to whole seconds),
+    /// with a fresh PIN and token and a zero attempt counter. A replaced window's in-flight
+    /// attempt can no longer succeed ([`PairingAttempt::succeed`] returns `false`) or touch
+    /// the new window.
+    ///
+    /// The URI's host is the hub's best LAN IPv4 address (see [`lan_ipv4`]), or `127.0.0.1`
+    /// if there is none. If the URI cannot be built (the manager was created with port 0),
+    /// `uri` is empty and a warning is logged; the PIN still works.
+    pub fn start(&self, ttl: Duration) -> PairingInfo {
+        let pin = hfa_proto::generate_pin();
+        let token = hfa_proto::generate_token();
+        let host = lan_ipv4().unwrap_or(Ipv4Addr::LOCALHOST).to_string();
+        let uri = match hfa_proto::PairingUri::new(
+            &host,
+            self.port,
+            self.hub_id,
+            token.clone(),
+            &self.name,
+        ) {
+            Ok(uri) => uri.to_string(),
+            Err(e) => {
+                tracing::warn!(error = %e, port = self.port, "cannot build the pairing URI");
+                String::new()
+            }
+        };
+        let secs = ttl.as_secs() + u64::from(ttl.subsec_nanos() > 0);
+        let info = PairingInfo {
+            pin,
+            token,
+            uri,
+            expires_at_unix: (self.clock)().saturating_add(secs),
+        };
+        self.open_window(info.clone());
+        tracing::info!(
+            expires_at_unix = info.expires_at_unix,
+            "pairing window opened"
+        );
+        info
     }
 
-    /// Closes the current window.
+    /// Closes the current window. An attempt in flight can no longer succeed
+    /// ([`PairingAttempt::succeed`] returns `false`).
     pub fn cancel(&self) {
         self.state.lock().window = None;
     }
 
     /// The open window, if any and not expired.
     pub fn current(&self) -> Option<PairingInfo> {
-        let now = unix_now();
+        let now = (self.clock)();
         let mut state = self.state.lock();
         close_if_expired(&mut state, now);
         state.window.as_ref().map(|w| w.info.clone())
@@ -124,11 +172,11 @@ impl PairingManager {
     /// no other attempt is in flight and that fewer than [`MAX_FAILED_ATTEMPTS`] attempts were
     /// made, then **counts the attempt**. Returns `None` otherwise (and for
     /// `PairMethod::Unspecified`, which does not count). Call [`PairingAttempt::succeed`] when
-    /// the peer's confirmation MAC verified; dropping the guard in any other way (wrong
-    /// secret, error, disconnect, timeout) is a failed attempt, and the window closes once
-    /// the limit is reached.
+    /// the peer's confirmation MAC verified (and trust the peer only if it returns `true`);
+    /// dropping the guard in any other way (wrong secret, error, disconnect, timeout) is a
+    /// failed attempt, and the window closes once the limit is reached.
     pub fn begin_attempt(&self, method: PairMethod) -> Option<PairingAttempt<'_>> {
-        let now = unix_now();
+        let now = (self.clock)();
         let mut state = self.state.lock();
         close_if_expired(&mut state, now);
         let window = state.window.as_mut()?;
@@ -146,14 +194,12 @@ impl PairingManager {
             manager: self,
             generation: window.generation,
             secret,
-            succeeded: false,
+            finished: false,
         })
     }
 
     /// Installs `info` as the open window (fresh counter, new generation). `start` builds the
     /// PIN, token and URI and then calls this.
-    // Only the tests call it until `start` is implemented by feat/core-engine.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn open_window(&self, info: PairingInfo) {
         let mut state = self.state.lock();
         let generation = state.next_generation;
@@ -166,8 +212,8 @@ impl PairingManager {
         });
     }
 
-    /// Ends the attempt of window `generation`.
-    fn finish_attempt(&self, generation: u64, succeeded: bool) {
+    /// Ends the attempt of window `generation` as a failure (no-op for a stale generation).
+    fn fail_attempt(&self, generation: u64) {
         let mut state = self.state.lock();
         let Some(window) = state.window.as_mut() else {
             return;
@@ -177,20 +223,37 @@ impl PairingManager {
             return;
         }
         window.in_flight = false;
-        if succeeded || window.attempts >= MAX_FAILED_ATTEMPTS {
-            // Success: PIN and token are one-time. Failure: guess budget used up.
+        if window.attempts >= MAX_FAILED_ATTEMPTS {
+            // Guess budget used up.
             state.window = None;
+        }
+    }
+
+    /// Commits a successful attempt of window `generation`: `true` and the window closes if
+    /// it is still the current, unexpired window; `false` (nothing changes) otherwise.
+    fn commit_attempt(&self, generation: u64) -> bool {
+        let now = (self.clock)();
+        let mut state = self.state.lock();
+        close_if_expired(&mut state, now);
+        match &state.window {
+            Some(window) if window.generation == generation => {
+                // PIN and token are one-time.
+                state.window = None;
+                true
+            }
+            _ => false,
         }
     }
 }
 
 /// One in-flight pairing attempt (see [`PairingManager::begin_attempt`]). Dropping it
-/// without calling [`PairingAttempt::succeed`] records a failure.
+/// without a successful [`PairingAttempt::succeed`] records a failure.
 pub struct PairingAttempt<'a> {
     manager: &'a PairingManager,
     generation: u64,
     secret: String,
-    succeeded: bool,
+    /// Set once `succeed` ran (whatever its outcome), so `Drop` does nothing more.
+    finished: bool,
 }
 
 impl PairingAttempt<'_> {
@@ -199,16 +262,23 @@ impl PairingAttempt<'_> {
         &self.secret
     }
 
-    /// The peer proved knowledge of the secret: closes the window (one-time secrets).
-    pub fn succeed(mut self) {
-        self.succeeded = true;
-        // Drop runs `finish_attempt(.., true)`.
+    /// The peer proved knowledge of the secret: atomically (under the window lock) checks
+    /// that this attempt's window is still open — not cancelled, replaced by a new
+    /// [`PairingManager::start`] or expired — and if so closes it (one-time secrets) and
+    /// returns `true`. Returns `false` otherwise: the pairing must then be refused (the user
+    /// withdrew the secret while the attempt was running), and nothing else changes.
+    #[must_use = "a `false` result means the pairing was cancelled and must be refused"]
+    pub fn succeed(mut self) -> bool {
+        self.finished = true;
+        self.manager.commit_attempt(self.generation)
     }
 }
 
 impl Drop for PairingAttempt<'_> {
     fn drop(&mut self) {
-        self.manager.finish_attempt(self.generation, self.succeeded);
+        if !self.finished {
+            self.manager.fail_attempt(self.generation);
+        }
     }
 }
 
@@ -221,11 +291,73 @@ impl fmt::Debug for PairingAttempt<'_> {
     }
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// The best IPv4 address of this device for other LAN devices to reach it: an up,
+/// non-loopback, non-link-local, non-point-to-point interface, preferring private
+/// (RFC 1918) addresses and physical-looking interfaces over virtual ones (Docker, VM,
+/// VPN bridges). `None` if there is none.
+pub fn lan_ipv4() -> Option<Ipv4Addr> {
+    let interfaces = match if_addrs::get_if_addrs() {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::debug!(error = %e, "cannot list network interfaces");
+            return None;
+        }
+    };
+    interfaces
+        .iter()
+        .filter_map(|i| match i.ip() {
+            IpAddr::V4(ip)
+                if !ip.is_loopback()
+                    && !ip.is_link_local()
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && !i.is_p2p()
+                    && !matches!(
+                        i.oper_status,
+                        if_addrs::IfOperStatus::Down
+                            | if_addrs::IfOperStatus::NotPresent
+                            | if_addrs::IfOperStatus::LowerLayerDown
+                    ) =>
+            {
+                Some((lan_score(&i.name, ip), ip))
+            }
+            _ => None,
+        })
+        .max_by_key(|(score, ip)| (*score, std::cmp::Reverse(u32::from(*ip))))
+        .map(|(_, ip)| ip)
+}
+
+/// Ranks a candidate address: private ranges first, then interfaces that do not look virtual.
+fn lan_score(if_name: &str, ip: Ipv4Addr) -> u8 {
+    const VIRTUAL_PREFIXES: [&str; 14] = [
+        "docker",
+        "br-",
+        "veth",
+        "virbr",
+        "vmnet",
+        "vboxnet",
+        "tun",
+        "tap",
+        "wg",
+        "utun",
+        "zt",
+        "tailscale",
+        "podman",
+        "cni",
+    ];
+    let name = if_name.to_ascii_lowercase();
+    let looks_virtual = VIRTUAL_PREFIXES.iter().any(|p| name.starts_with(p))
+        || name.contains("virtual")
+        || name.contains("vethernet")
+        || name.contains("vpn");
+    let mut score = 0;
+    if ip.is_private() {
+        score += 2;
+    }
+    if !looks_virtual {
+        score += 1;
+    }
+    score
 }
 
 fn close_if_expired(state: &mut State, now: u64) {
@@ -252,6 +384,10 @@ pub fn method_for_secret(secret: &str) -> PairMethod {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    fn unix_now() -> u64 {
+        crate::identity::unix_now()
+    }
 
     fn manager_with_window(expires_in: u64) -> PairingManager {
         let m = PairingManager::new([7; 32], "Desk".into(), 47810);
@@ -326,7 +462,7 @@ mod tests {
     #[test]
     fn success_closes_the_window() {
         let m = manager_with_window(300);
-        m.begin_attempt(PairMethod::Token).expect("open").succeed();
+        assert!(m.begin_attempt(PairMethod::Token).expect("open").succeed());
         assert!(m.current().is_none());
         assert!(m.begin_attempt(PairMethod::Pin).is_none());
     }
@@ -352,7 +488,8 @@ mod tests {
             expires_at_unix: unix_now() + 300,
         });
         let fresh = m.begin_attempt(PairMethod::Pin).expect("new window");
-        stale.succeed(); // must not close the new window or clear its in-flight flag
+        // Must fail, and must not close the new window or clear its in-flight flag.
+        assert!(!stale.succeed());
         assert!(m.current().is_some());
         assert!(
             m.begin_attempt(PairMethod::Pin).is_none(),
@@ -360,6 +497,40 @@ mod tests {
         );
         drop(fresh);
         assert!(m.begin_attempt(PairMethod::Pin).is_some());
+    }
+
+    #[test]
+    fn cancelled_or_expired_attempt_cannot_succeed() {
+        let m = manager_with_window(300);
+        let attempt = m.begin_attempt(PairMethod::Pin).expect("open");
+        m.cancel();
+        assert!(!attempt.succeed(), "cancel withdraws the secret");
+        assert!(m.current().is_none());
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let now = Arc::new(AtomicU64::new(1_000));
+        let clock = Arc::clone(&now);
+        let m = PairingManager::with_clock(
+            [7; 32],
+            "Desk".into(),
+            47810,
+            Arc::new(move || clock.load(Ordering::SeqCst)),
+        );
+        m.start(Duration::from_secs(60));
+        let attempt = m.begin_attempt(PairMethod::Pin).expect("open");
+        now.store(1_060, Ordering::SeqCst);
+        assert!(!attempt.succeed(), "the window expired mid-attempt");
+
+        // A replaced window: the old attempt fails, the new window stays open and usable.
+        let m = manager_with_window(300);
+        let attempt = m.begin_attempt(PairMethod::Pin).expect("open");
+        let fresh = m.start(DEFAULT_PAIRING_TTL);
+        assert!(!attempt.succeed());
+        assert_eq!(m.current(), Some(fresh));
+        assert!(m
+            .begin_attempt(PairMethod::Pin)
+            .expect("new window")
+            .succeed());
     }
 
     #[test]
@@ -376,6 +547,76 @@ mod tests {
                 !text.contains("123456") && !text.contains("tok-en"),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn start_builds_a_parsable_uri_and_fresh_secrets() {
+        let m = PairingManager::new([7; 32], "Desk\u{7}PC".into(), 47810);
+        let first = m.start(DEFAULT_PAIRING_TTL);
+        assert_eq!(first.pin.len(), 6);
+        assert!(first.pin.bytes().all(|b| b.is_ascii_digit()));
+        let uri: hfa_proto::PairingUri = first.uri.parse().expect("valid URI");
+        assert_eq!(uri.hub_id, [7; 32]);
+        assert_eq!(uri.port, 47810);
+        assert_eq!(uri.token, first.token);
+        assert_eq!(uri.name, "DeskPC", "control characters are dropped");
+        assert!(uri.host.parse::<Ipv4Addr>().is_ok(), "{}", uri.host);
+        let now = unix_now();
+        assert!((now + 299..=now + 301).contains(&first.expires_at_unix));
+        assert_eq!(m.current(), Some(first.clone()));
+
+        // A new window replaces the old one with new secrets and a fresh budget.
+        drop(m.begin_attempt(PairMethod::Pin));
+        let second = m.start(Duration::from_millis(1500));
+        assert_ne!(second.token, first.token);
+        assert_eq!(second.expires_at_unix, unix_now() + 2);
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            drop(m.begin_attempt(PairMethod::Pin).expect("fresh budget"));
+        }
+        assert!(m.current().is_none());
+    }
+
+    #[test]
+    fn port_zero_gives_an_empty_uri_but_a_working_pin() {
+        let m = PairingManager::new([7; 32], "Desk".into(), 0);
+        let info = m.start(DEFAULT_PAIRING_TTL);
+        assert!(info.uri.is_empty());
+        assert_eq!(
+            m.begin_attempt(PairMethod::Pin).expect("open").secret(),
+            info.pin
+        );
+    }
+
+    #[test]
+    fn injected_clock_expires_the_window() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let now = Arc::new(AtomicU64::new(1_000));
+        let clock = Arc::clone(&now);
+        let m = PairingManager::with_clock(
+            [7; 32],
+            "Desk".into(),
+            47810,
+            Arc::new(move || clock.load(Ordering::SeqCst)),
+        );
+        let info = m.start(Duration::from_secs(60));
+        assert_eq!(info.expires_at_unix, 1_060);
+        now.store(1_059, Ordering::SeqCst);
+        assert!(m.begin_attempt(PairMethod::Pin).is_some());
+        now.store(1_060, Ordering::SeqCst);
+        assert!(m.current().is_none());
+        assert!(m.begin_attempt(PairMethod::Pin).is_none());
+    }
+
+    #[test]
+    fn lan_address_ranking() {
+        let private = Ipv4Addr::new(192, 168, 1, 20);
+        let public = Ipv4Addr::new(8, 8, 8, 8);
+        assert!(lan_score("eth0", private) > lan_score("docker0", private));
+        assert!(lan_score("docker0", private) > lan_score("eth0", public));
+        assert!(lan_score("wlan0", private) > lan_score("vEthernet (WSL)", private));
+        if let Some(ip) = lan_ipv4() {
+            assert!(!ip.is_loopback() && !ip.is_link_local());
         }
     }
 
