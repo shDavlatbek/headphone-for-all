@@ -3,7 +3,9 @@
 //! How a capture is built (a Rust translation of insidegui/AudioCap `ProcessTap.swift`):
 //!
 //! 1. A [`CATapDescription`] describes what to tap: a stereo global tap that excludes a list of
-//!    process objects (system mix; the list holds our own process when excluding self), or a
+//!    process objects (system mix; the list holds our own process: required when excluding
+//!    self, and whenever Core Audio knows it for the plain system mix too, because our own
+//!    playback is a hub's mix that must neither be sent back nor muted by the tap), or a
 //!    stereo mixdown of one process object (per-app capture). It gets a fresh UUID, is private
 //!    (only visible to this process) and uses [`MUTE_BEHAVIOR`].
 //! 2. `AudioHardwareCreateProcessTap` turns the description into a tap `AudioObjectID` (its
@@ -23,6 +25,15 @@
 //! `stop` tears it down in the reverse order: `AudioDeviceStop`, `AudioDeviceDestroyIOProcID`,
 //! `AudioHardwareDestroyAggregateDevice`, `AudioHardwareDestroyProcessTap`.
 //!
+//! **Health.** The format is fixed when the source opens, so the device is watched with
+//! property listeners ([`HealthWatch`]): the aggregate device dying
+//! (`kAudioDevicePropertyDeviceIsAlive`), the audio server restarting
+//! (`kAudioHardwarePropertyServiceRestarted`), and a change of the aggregate's nominal sample
+//! rate or of its input stream's virtual format (the tap follows the output device, e.g. when
+//! the default output switches to a 44.1 kHz device). Any of them makes
+//! [`CaptureSource::error`] report it and the IOProc stop pushing (audio at another rate would
+//! play at the wrong pitch); the owner opens a new source.
+//!
 //! **Availability.** `AudioHardwareCreateProcessTap`/`AudioHardwareDestroyProcessTap` and the
 //! `CATapDescription` class only exist on macOS 14.2+. The two functions are resolved at run
 //! time with `dlsym` (a direct reference would be a strong import that makes the whole binary
@@ -41,7 +52,7 @@
 use std::ffi::{c_void, CStr};
 use std::mem::{self, size_of};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -53,18 +64,21 @@ use objc2_core_audio::{
     kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceIsStackedKey,
     kAudioAggregateDeviceNameKey, kAudioAggregateDeviceTapAutoStartKey,
     kAudioAggregateDeviceTapListKey, kAudioAggregateDeviceUIDKey, kAudioDevicePermissionsError,
+    kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate,
     kAudioDevicePropertyStreams, kAudioHardwareIllegalOperationError,
-    kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyTranslatePIDToProcessObject,
-    kAudioHardwareUnsupportedOperationError, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
-    kAudioObjectUnknown, kAudioProcessPropertyBundleID, kAudioProcessPropertyIsRunningOutput,
-    kAudioProcessPropertyPID, kAudioStreamPropertyVirtualFormat, kAudioSubTapDriftCompensationKey,
-    kAudioSubTapUIDKey, kAudioTapPropertyFormat, AudioDeviceCreateIOProcID,
-    AudioDeviceDestroyIOProcID, AudioDeviceIOProc, AudioDeviceIOProcID, AudioDeviceStart,
-    AudioDeviceStop, AudioHardwareCreateAggregateDevice, AudioHardwareDestroyAggregateDevice,
-    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
-    AudioObjectPropertyAddress, AudioObjectPropertyScope, AudioObjectPropertySelector,
-    CATapDescription, CATapMuteBehavior,
+    kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyServiceRestarted,
+    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioHardwareUnsupportedOperationError,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioObjectUnknown,
+    kAudioProcessPropertyBundleID, kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID,
+    kAudioStreamPropertyVirtualFormat, kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
+    kAudioTapPropertyFormat, AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID,
+    AudioDeviceIOProc, AudioDeviceIOProcID, AudioDeviceStart, AudioDeviceStop,
+    AudioHardwareCreateAggregateDevice, AudioHardwareDestroyAggregateDevice,
+    AudioObjectAddPropertyListener, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyScope,
+    AudioObjectPropertySelector, AudioObjectRemovePropertyListener, CATapDescription,
+    CATapMuteBehavior,
 };
 use objc2_core_audio_types::{
     kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
@@ -146,7 +160,8 @@ pub(crate) fn capabilities() -> Capabilities {
             notes: format!(
                 "Core Audio process taps (macOS {}.{}+). {permission} While capturing, the tapped \
                  audio is muted on this Mac's own speakers (CATapMutedWhenTapped) and plays only \
-                 in the hub's headphone.",
+                 in the hub's headphone. \"system\" also leaves out this app's own playback (a \
+                 hub's mix) once Core Audio knows this app, like \"system-excl\".",
                 MIN_MACOS.0, MIN_MACOS.1
             ),
         },
@@ -199,10 +214,7 @@ pub(crate) fn list_apps() -> Result<Vec<CaptureApp>, CaptureError> {
             Err(_) => continue,
         };
         let bundle_id = read_string_property(object, kAudioProcessPropertyBundleID);
-        let name = app_display_name(bundle_id.as_deref()).map_or_else(
-            || process_name(pid).unwrap_or_else(|| format!("pid {pid}")),
-            str::to_owned,
-        );
+        let name = app_name(pid, bundle_id.as_deref());
         apps.push(CaptureApp { pid, name });
     }
     sort_and_dedup_apps(&mut apps);
@@ -289,10 +301,12 @@ impl TapTarget {
             TapTarget::SystemExcludingSelf => {
                 "System audio except this app (Core Audio process tap)".to_owned()
             }
-            TapTarget::Process { pid } => match process_name(pid) {
-                Some(name) => format!("{name} (pid {pid}, Core Audio process tap)"),
-                None => format!("Process {pid} (Core Audio process tap)"),
-            },
+            TapTarget::Process { pid } => {
+                format!(
+                    "{} (pid {pid}, Core Audio process tap)",
+                    app_name(pid, None)
+                )
+            }
         }
     }
 }
@@ -361,6 +375,7 @@ impl CaptureSource for TapCapture {
             channels,
             scratch: vec![0.0; SCRATCH_FRAMES * channels].into_boxed_slice(),
             layout_mismatches: Arc::clone(&self.layout_mismatches),
+            health: device.watch.health,
         };
         let started = IoProc::start(device.aggregate.id, context);
         self.device = Some(device);
@@ -385,6 +400,11 @@ impl CaptureSource for TapCapture {
             }
             tracing::info!(target_desc = %self.target.describe(), "Core Audio tap capture stopped");
         }
+    }
+
+    fn error(&self) -> Option<String> {
+        let reason = self.device.as_ref()?.watch.health.failure()?;
+        Some(format!("{reason}; open the capture again"))
     }
 }
 
@@ -435,7 +455,9 @@ impl Drop for AggregateDevice {
 
 /// A tap plus the private aggregate device that exposes it as an input stream.
 struct TapDevice {
-    /// Declared first: dropped (destroyed) before the tap it contains.
+    /// Declared first: its listeners are removed before the objects they watch go away.
+    watch: HealthWatch,
+    /// Dropped (destroyed) before the tap it contains.
     aggregate: AggregateDevice,
     _tap: ProcessTap,
     format: AudioFormat,
@@ -508,12 +530,197 @@ impl TapDevice {
                 "aggregate device input format differs from the tap format; using the aggregate's"
             );
         }
+        let watch = HealthWatch::install(aggregate.id, format);
         Ok(Self {
+            watch,
             aggregate,
             _tap: tap,
             format,
         })
     }
+}
+
+/// Why a tap device stopped being usable, as stored in [`DeviceHealth::failure`].
+const HEALTH_OK: u32 = 0;
+const HEALTH_DEVICE_DIED: u32 = 1;
+const HEALTH_SERVER_RESTARTED: u32 = 2;
+const HEALTH_FORMAT_CHANGED: u32 = 3;
+
+/// What the property listeners of one tap device compare against and report into.
+struct DeviceHealth {
+    /// `HEALTH_OK` until the first failure (never reset: the device is rebuilt instead).
+    failure: AtomicU32,
+    /// The format the source reported (the input stream's virtual format at open).
+    format: AudioFormat,
+    /// The aggregate device's nominal sample rate at open (`None` if it could not be read).
+    nominal_rate: Option<f64>,
+}
+
+impl DeviceHealth {
+    fn fail(&self, reason: u32) {
+        // Keep the first reason.
+        let _ =
+            self.failure
+                .compare_exchange(HEALTH_OK, reason, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn failed(&self) -> bool {
+        self.failure.load(Ordering::Acquire) != HEALTH_OK
+    }
+
+    /// Why the device is unusable, if it is.
+    fn failure(&self) -> Option<&'static str> {
+        match self.failure.load(Ordering::Acquire) {
+            HEALTH_OK => None,
+            HEALTH_DEVICE_DIED => Some("the Core Audio tap device went away"),
+            HEALTH_SERVER_RESTARTED => Some("the Core Audio server restarted"),
+            _ => Some(
+                "the output device changed the captured sample rate or format (e.g. another \
+                 default output device)",
+            ),
+        }
+    }
+
+    /// Checks one changed property of `object` against what the source reported.
+    fn on_changed(&self, object: AudioObjectID, selector: AudioObjectPropertySelector) {
+        match selector {
+            s if s == kAudioHardwarePropertyServiceRestarted => self.fail(HEALTH_SERVER_RESTARTED),
+            s if s == kAudioDevicePropertyDeviceIsAlive => {
+                // SAFETY: kAudioDevicePropertyDeviceIsAlive is a UInt32.
+                let alive = unsafe { read_property::<u32>(object, selector, None, 1) };
+                if !matches!(alive, Ok(alive) if alive != 0) {
+                    self.fail(HEALTH_DEVICE_DIED);
+                }
+            }
+            s if s == kAudioDevicePropertyNominalSampleRate => {
+                // SAFETY: kAudioDevicePropertyNominalSampleRate is a Float64.
+                let rate = unsafe { read_property::<f64>(object, selector, None, 0.0) };
+                if let (Ok(rate), Some(expected)) = (rate, self.nominal_rate) {
+                    if (rate - expected).abs() > 0.5 {
+                        self.fail(HEALTH_FORMAT_CHANGED);
+                    }
+                }
+            }
+            s if s == kAudioStreamPropertyVirtualFormat => {
+                // SAFETY: kAudioStreamPropertyVirtualFormat is an AudioStreamBasicDescription.
+                let asbd = unsafe {
+                    read_property::<AudioStreamBasicDescription>(object, selector, None, EMPTY_ASBD)
+                };
+                if let Ok(asbd) = asbd {
+                    if format_from_asbd(&asbd).ok() != Some(self.format) {
+                        self.fail(HEALTH_FORMAT_CHANGED);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Property listeners that watch a tap device ([`DeviceHealth`]); removed on drop.
+struct HealthWatch {
+    /// Leaked on purpose (a few bytes per opened device): Core Audio does not promise that no
+    /// listener call is still running once `AudioObjectRemovePropertyListener` returned, so the
+    /// listeners' data must never be freed.
+    health: &'static DeviceHealth,
+    registered: Vec<(AudioObjectID, AudioObjectPropertyAddress)>,
+}
+
+impl HealthWatch {
+    /// Watches `aggregate` (and its input stream, and the audio server) against `format`.
+    /// Listeners that cannot be installed are logged and skipped (the capture still works,
+    /// only that change goes unnoticed).
+    fn install(aggregate: AudioObjectID, format: AudioFormat) -> Self {
+        // SAFETY: kAudioDevicePropertyNominalSampleRate is a Float64.
+        let nominal_rate = unsafe {
+            read_property::<f64>(aggregate, kAudioDevicePropertyNominalSampleRate, None, 0.0)
+        }
+        .ok()
+        .filter(|r| r.is_finite() && *r > 0.0);
+        let health: &'static DeviceHealth = Box::leak(Box::new(DeviceHealth {
+            failure: AtomicU32::new(HEALTH_OK),
+            format,
+            nominal_rate,
+        }));
+        let mut watch = Self {
+            health,
+            registered: Vec::new(),
+        };
+        watch.add(aggregate, kAudioDevicePropertyDeviceIsAlive);
+        watch.add(aggregate, kAudioDevicePropertyNominalSampleRate);
+        let input = property_address(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput);
+        let streams = read_object_list(aggregate, input).unwrap_or_default();
+        if let Some(&stream) = streams.first() {
+            watch.add(stream, kAudioStreamPropertyVirtualFormat);
+        }
+        watch.add(SYSTEM_OBJECT, kAudioHardwarePropertyServiceRestarted);
+        watch
+    }
+
+    fn add(&mut self, object: AudioObjectID, selector: AudioObjectPropertySelector) {
+        let address = global_address(selector);
+        // SAFETY: `address` is valid for the call; `health_listener` matches
+        // AudioObjectPropertyListenerProc and its client data (`self.health`) is never freed.
+        let status = unsafe {
+            AudioObjectAddPropertyListener(
+                object,
+                NonNull::from(&address),
+                Some(health_listener),
+                ptr::from_ref(self.health).cast_mut().cast(),
+            )
+        };
+        if status == NO_ERR {
+            self.registered.push((object, address));
+        } else {
+            tracing::debug!(
+                object,
+                selector,
+                status = %status_string(status),
+                "cannot watch a Core Audio property"
+            );
+        }
+    }
+}
+
+impl Drop for HealthWatch {
+    fn drop(&mut self) {
+        for (object, address) in self.registered.drain(..) {
+            // SAFETY: exactly the (object, address, listener, client data) registered in `add`.
+            let status = unsafe {
+                AudioObjectRemovePropertyListener(
+                    object,
+                    NonNull::from(&address),
+                    Some(health_listener),
+                    ptr::from_ref(self.health).cast_mut().cast(),
+                )
+            };
+            if status != NO_ERR {
+                tracing::debug!(status = %status_string(status), "removing a Core Audio listener failed");
+            }
+        }
+    }
+}
+
+/// Property listener of [`HealthWatch`] (runs on a Core Audio notification thread, not the
+/// I/O thread).
+unsafe extern "C-unwind" fn health_listener(
+    object: AudioObjectID,
+    count: u32,
+    addresses: NonNull<AudioObjectPropertyAddress>,
+    client_data: *mut c_void,
+) -> OsStatus {
+    if client_data.is_null() {
+        return NO_ERR;
+    }
+    // SAFETY: `client_data` is the leaked `&'static DeviceHealth` registered in
+    // `HealthWatch::add`.
+    let health = unsafe { &*client_data.cast::<DeviceHealth>() };
+    // SAFETY: Core Audio passes `count` valid addresses for the duration of the call.
+    let addresses = unsafe { std::slice::from_raw_parts(addresses.as_ptr(), count as usize) };
+    for address in addresses {
+        health.on_changed(object, address.mSelector);
+    }
+    NO_ERR
 }
 
 /// Reads the aggregate device's input stream format (what the IOProc receives), retrying while
@@ -576,20 +783,25 @@ fn tap_description(target: TapTarget) -> Result<Retained<CATapDescription>, Capt
     let description = match target {
         TapTarget::System | TapTarget::SystemExcludingSelf => {
             let mut excluded = Vec::new();
-            if target == TapTarget::SystemExcludingSelf {
-                match own_process_object() {
-                    Ok(Some(object)) => excluded.push(NSNumber::numberWithUnsignedInt(object)),
-                    // Never fall back to a tap that includes us: once this device also plays
-                    // the hub mix, it would be captured again (a feedback loop).
-                    Ok(None) => {
-                        return Err(CaptureError::Backend(
-                            "this process is not registered with Core Audio yet, so it cannot \
-                             be excluded from the system tap"
-                                .to_owned(),
-                        ))
-                    }
-                    Err(status) => return Err(os_error("looking up this process", status)),
+            match (own_process_object(), target) {
+                // This app's own playback (a hub's mix) is never wanted in a system capture:
+                // it would be sent back to a hub, and `MUTE_BEHAVIOR` would silence it here.
+                // So the plain system tap leaves us out too whenever Core Audio knows us.
+                (Ok(Some(object)), _) => excluded.push(NSNumber::numberWithUnsignedInt(object)),
+                // Never fall back to a tap that includes us: once this device also plays the
+                // hub mix, it would be captured again (a feedback loop).
+                (Ok(None), TapTarget::SystemExcludingSelf) => {
+                    return Err(CaptureError::Backend(
+                        "this process is not registered with Core Audio yet, so it cannot be \
+                         excluded from the system tap"
+                            .to_owned(),
+                    ))
                 }
+                (Err(status), TapTarget::SystemExcludingSelf) => {
+                    return Err(os_error("looking up this process", status))
+                }
+                // Not registered yet means we play nothing yet: the plain tap is fine.
+                (Ok(None) | Err(_), _) => {}
             }
             let excluded = NSArray::from_retained_slice(&excluded);
             // SAFETY: `alloc` returns a fresh CATapDescription allocation (class availability
@@ -677,6 +889,8 @@ struct IoContext {
     /// Interleaving buffer for non-interleaved input (`SCRATCH_FRAMES * channels` samples).
     scratch: Box<[f32]>,
     layout_mismatches: Arc<AtomicU64>,
+    /// Once the device failed (format change...), nothing is pushed any more.
+    health: &'static DeviceHealth,
 }
 
 /// Our IOProc with raw pointers: Core Audio may pass NULL for buffer lists it does not use
@@ -732,7 +946,12 @@ unsafe extern "C-unwind" fn io_proc(
         channels,
         scratch,
         layout_mismatches,
+        health,
     } = context;
+    if health.failed() {
+        // E.g. the rate changed: pushing would play at the wrong pitch.
+        return NO_ERR;
+    }
     // SAFETY: every buffer's `mData` points to `mDataByteSize` readable bytes for the duration
     // of this call (Core Audio IOProc contract).
     let delivered = unsafe {
@@ -1082,6 +1301,32 @@ fn read_object_list(
     Ok(objects)
 }
 
+/// The name shown for a process: its app bundle's name, else a name from its bundle id, else
+/// its process name, else `pid <n>`.
+fn app_name(pid: u32, bundle_id: Option<&str>) -> String {
+    if let Some(name) = executable_path(pid).as_deref().and_then(app_bundle_name) {
+        return name.to_owned();
+    }
+    if let Some(name) = bundle_id_name(bundle_id) {
+        return name.to_owned();
+    }
+    process_name(pid).unwrap_or_else(|| format!("pid {pid}"))
+}
+
+/// The process's executable path (`proc_pidpath`), if the process exists.
+fn executable_path(pid: u32) -> Option<String> {
+    let pid = i32::try_from(pid).ok()?;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is writable for its full length; proc_pidpath writes at most that many
+    // bytes and returns the length written (<= 0 on failure).
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let len = usize::try_from(len)
+        .ok()
+        .filter(|&l| l > 0 && l <= buf.len())?;
+    let path = String::from_utf8_lossy(buf.get(..len)?).into_owned();
+    (!path.is_empty()).then_some(path)
+}
+
 /// The short process name (`proc_name`), if the process exists.
 fn process_name(pid: u32) -> Option<String> {
     let pid = i32::try_from(pid).ok()?;
@@ -1128,11 +1373,45 @@ fn format_from_asbd(asbd: &AudioStreamBasicDescription) -> Result<AudioFormat, C
     Ok(AudioFormat::new(rate.round() as u32, channels))
 }
 
-/// A friendly app name from a bundle id: its last dot-separated component
-/// (`com.apple.Safari` → `Safari`).
-fn app_display_name(bundle_id: Option<&str>) -> Option<&str> {
-    let last = bundle_id?.trim().rsplit('.').next()?.trim();
-    (!last.is_empty()).then_some(last)
+/// The name of the outermost app bundle in an executable path: what the user knows the app
+/// as, also for its helper processes (`/Applications/Google Chrome.app/Contents/Frameworks/…/
+/// Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper` → `Google Chrome`,
+/// `/Applications/Spotify.app/Contents/MacOS/Spotify` → `Spotify`).
+fn app_bundle_name(executable: &str) -> Option<&str> {
+    executable
+        .split('/')
+        .find_map(|component| component.strip_suffix(".app"))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// Bundle-id components that do not name an app on their own (`com.spotify.client`,
+/// `us.zoom.xos`, `com.google.Chrome.helper`, `com.apple.WebKit.GPU`).
+const GENERIC_BUNDLE_WORDS: &[&str] = &[
+    "agent", "app", "audio", "client", "daemon", "desktop", "gpu", "helper", "mac", "macos", "osx",
+    "plugin", "renderer", "service", "xos", "xpc",
+];
+
+/// A name from a bundle id, for processes outside an app bundle (XPC services, daemons): the
+/// last component, or the one before it when the last is generic (`com.apple.Safari` →
+/// `Safari`, `com.apple.WebKit.GPU` → `WebKit`, `us.zoom.xos` → `zoom`).
+fn bundle_id_name(bundle_id: Option<&str>) -> Option<&str> {
+    let parts: Vec<&str> = bundle_id?
+        .trim()
+        .split('.')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let generic = |p: &str| GENERIC_BUNDLE_WORDS.contains(&p.to_ascii_lowercase().as_str());
+    let (&last, rest) = parts.split_last()?;
+    if !generic(last) {
+        return Some(last);
+    }
+    // Skip the reverse-DNS prefix (`com`, `org`, `us`...): never a name.
+    match rest {
+        [_, .., before] if !generic(before) => Some(before),
+        _ => Some(last),
+    }
 }
 
 /// Sorts by name (case-insensitive) then pid, and drops duplicate pids.
@@ -1324,12 +1603,47 @@ mod tests {
     }
 
     #[test]
-    fn app_names_come_from_bundle_ids() {
-        assert_eq!(app_display_name(Some("com.apple.Safari")), Some("Safari"));
-        assert_eq!(app_display_name(Some("Spotify")), Some("Spotify"));
-        assert_eq!(app_display_name(Some("com.example.")), None);
-        assert_eq!(app_display_name(Some("")), None);
-        assert_eq!(app_display_name(None), None);
+    fn app_names_come_from_the_outermost_app_bundle() {
+        let chrome_helper = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome \
+                             Framework.framework/Versions/131.0/Helpers/Google Chrome Helper.app/\
+                             Contents/MacOS/Google Chrome Helper";
+        assert_eq!(app_bundle_name(chrome_helper), Some("Google Chrome"));
+        assert_eq!(
+            app_bundle_name("/Applications/Spotify.app/Contents/MacOS/Spotify"),
+            Some("Spotify")
+        );
+        assert_eq!(
+            app_bundle_name("/Applications/zoom.us.app/Contents/MacOS/zoom.us"),
+            Some("zoom.us")
+        );
+        assert_eq!(app_bundle_name("/usr/bin/afplay"), None);
+        assert_eq!(
+            app_bundle_name(
+                "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/\
+                 com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU"
+            ),
+            None
+        );
+        assert_eq!(app_bundle_name("/Applications/.app/x"), None);
+    }
+
+    #[test]
+    fn app_names_from_bundle_ids_skip_generic_words() {
+        assert_eq!(bundle_id_name(Some("com.apple.Safari")), Some("Safari"));
+        assert_eq!(bundle_id_name(Some("com.spotify.client")), Some("spotify"));
+        assert_eq!(bundle_id_name(Some("us.zoom.xos")), Some("zoom"));
+        assert_eq!(
+            bundle_id_name(Some("com.google.Chrome.helper")),
+            Some("Chrome")
+        );
+        assert_eq!(bundle_id_name(Some("com.apple.WebKit.GPU")), Some("WebKit"));
+        assert_eq!(bundle_id_name(Some("Spotify")), Some("Spotify"));
+        // Nothing better than the generic word: keep it rather than a reverse-DNS prefix.
+        assert_eq!(bundle_id_name(Some("com.helper")), Some("helper"));
+        assert_eq!(bundle_id_name(Some("helper")), Some("helper"));
+        assert_eq!(bundle_id_name(Some("com.example.")), Some("example"));
+        assert_eq!(bundle_id_name(Some("")), None);
+        assert_eq!(bundle_id_name(None), None);
     }
 
     #[test]
@@ -1459,6 +1773,38 @@ mod tests {
             Some("TAP-UUID")
         );
         assert_eq!(number(entry, kAudioSubTapDriftCompensationKey), Some(1));
+    }
+
+    #[test]
+    fn device_health_reports_the_first_failure() {
+        let health = |nominal_rate| DeviceHealth {
+            failure: AtomicU32::new(HEALTH_OK),
+            format: AudioFormat::new(48_000, 2),
+            nominal_rate,
+        };
+        let watched = health(Some(48_000.0));
+        assert_eq!(watched.failure(), None);
+        assert!(!watched.failed());
+        // Properties the watch does not care about change nothing.
+        watched.on_changed(SYSTEM_OBJECT, kAudioHardwarePropertyProcessObjectList);
+        assert!(!watched.failed());
+        watched.on_changed(SYSTEM_OBJECT, kAudioHardwarePropertyServiceRestarted);
+        assert!(watched.failed());
+        assert!(watched.failure().is_some_and(|r| r.contains("restarted")));
+        watched.fail(HEALTH_FORMAT_CHANGED);
+        assert!(
+            watched.failure().is_some_and(|r| r.contains("restarted")),
+            "the first reason is kept"
+        );
+        // A device that can no longer be asked whether it is alive is gone.
+        let gone = health(None);
+        gone.on_changed(kAudioObjectUnknown, kAudioDevicePropertyDeviceIsAlive);
+        assert!(gone.failure().is_some_and(|r| r.contains("went away")));
+        // A stream format that cannot be read is not taken for a change.
+        let unread = health(None);
+        unread.on_changed(kAudioObjectUnknown, kAudioStreamPropertyVirtualFormat);
+        unread.on_changed(kAudioObjectUnknown, kAudioDevicePropertyNominalSampleRate);
+        assert!(!unread.failed());
     }
 
     #[test]

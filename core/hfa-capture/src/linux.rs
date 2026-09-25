@@ -41,7 +41,31 @@
 //! - sandboxed (Flatpak, `pipewire.access = flatpak`) clients that only report a pid of their
 //!   own pid namespace: mapped to the host pid through `/proc/*/status` `NSpid` plus the
 //!   sandbox's Flatpak app id; streams that cannot be mapped unambiguously are not listed and
-//!   not matched by pid (system-excl still links them: they are never this process).
+//!   not matched by pid (system-excl still links them unless they are provably ours, below).
+//!
+//! **This process** (excluded by system-excl, never listed) is `std::process::id()`, plus two
+//! identities that matter when we run in a Flatpak sandbox ourselves (then that pid is
+//! namespace-local, e.g. 2): the kernel-verified `pipewire.sec.pid` of the client that owns
+//! our capture node (our host pid: our playback through the native socket carries it), and
+//! a sandboxed stream that reports our namespace-local pid **and** our Flatpak app id (from
+//! `/.flatpak-info`; our PulseAudio playback). A pid alone never makes a sandboxed stream ours
+//! (every Flatpak app has a pid 2), so one without an app id is captured.
+//!
+//! **Stall watchdog (linked modes):** a linked capture's node has been seen staying
+//! `suspended` (its `process` callback never called) while its links were `active` and the
+//! linked streams played, until the links were recreated. Every 100 ms the capture thread
+//! checks that the `process` callback ran; when it did not for 500 ms while a stream linked
+//! into it is running, it recreates its links, and if that does not help within a second, the
+//! whole stream (a new session and node). Further attempts back off (1 s, doubling to 30 s)
+//! and reset once audio flows again. Healthy captures never trigger it: a running linked
+//! stream always drives our node in the same graph.
+//!
+//! **Connection loss:** when the connection to the daemon breaks after the source opened
+//! (PipeWire restarted or crashed), the capture thread reconnects by itself: every 250 ms at
+//! first, backing off to every 2 s, for up to 30 s. Each new connection creates the same
+//! stream again (same mode and links, same reported format, the started sink kept), so the
+//! owner sees a short gap in the audio. If the daemon is not back within 30 s the thread
+//! ends and [`CaptureSource::error`] reports it.
 //!
 //! Real-time rules: stream callbacks run on the capture thread's main loop (no
 //! `RT_PROCESS`). The `process` callback only dequeues a buffer, converts little-endian `f32`
@@ -56,7 +80,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hfa_audio::AudioFormat;
 use pipewire as pw;
@@ -88,6 +112,22 @@ const SCRATCH_SAMPLES: usize = 4096 - 4096 % 24;
 const MAX_LINK_RETRIES: u32 = 3;
 /// Upper bound on the walk up the process tree (guards against cycles in `/proc` races).
 const MAX_PROCESS_DEPTH: usize = 64;
+/// How often a linked capture checks that it is scheduled ([`StallWatch`]).
+const STALL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+/// A linked capture whose `process` callback has not run for this long while a stream linked
+/// into it is running is stalled: its links are recreated.
+const STALL_AFTER: Duration = Duration::from_millis(500);
+/// Checks without progress needed before a stall action: a capture thread that was not
+/// scheduled for a while (a loaded machine) runs its timer and its `process` callback late,
+/// and must not take that for a stall.
+const STALL_CHECKS: u32 = 3;
+/// Relinks of a stalled capture before it recreates its whole stream (a new node) instead.
+const STALL_RELINKS: u32 = 1;
+/// The first wait after a stall action before the next one; doubles on every further
+/// attempt, up to [`STALL_BACKOFF_MAX`].
+const STALL_BACKOFF_FIRST: Duration = Duration::from_secs(1);
+/// The longest wait between two relinks of a capture that stays stalled.
+const STALL_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 const NOTES: &str = "PipeWire backend. \"system\" captures the monitor of the default sink \
 (it follows default-sink changes). \"system-excl\" and per-app capture link application playback \
@@ -97,8 +137,10 @@ linked because the applications feeding them are already captured directly; soun
 the sink only through such a relay without an application stream behind it (e.g. a microphone \
 loopback) or that is written straight to ALSA hardware is therefore missed. Per-app capture \
 includes child processes; sandboxed (Flatpak) PulseAudio clients are listed only when their host \
-pid can be determined. Requires a running PipeWire daemon (pipewire-pulse setups included) and \
-libpipewire-0.3 at run time.";
+pid can be determined. The captured audio keeps playing on this device's own speakers too; mute or \
+turn down this device's output to avoid an echo in the room (the capture is taken before the device \
+volume, so it is not affected). Requires a running PipeWire daemon (pipewire-pulse setups \
+included) and libpipewire-0.3 at run time.";
 
 // ---------------------------------------------------------------------------------------------
 // Platform-module interface
@@ -310,12 +352,30 @@ trait Procs {
     /// Host pid of the sandboxed process that reports `sandbox_pid` inside its own pid
     /// namespace (Flatpak app `app_id`, if known).
     fn host_pid(&self, sandbox_pid: u32, app_id: Option<&str>) -> Option<u32>;
+    /// Our own Flatpak app id when this process runs in a Flatpak sandbox (then our pid is
+    /// namespace-local too).
+    fn own_app_id(&self) -> Option<&str>;
 }
 
 /// [`Procs`] on `/proc`, caching sandbox-to-host pid mappings (re-validated on use).
 #[derive(Debug, Default)]
 struct ProcFs {
     sandbox_cache: RefCell<HashMap<(u32, Option<String>), u32>>,
+    /// Our Flatpak app id (`/.flatpak-info` exists only inside a Flatpak sandbox).
+    own_app_id: Option<String>,
+}
+
+impl ProcFs {
+    /// For this process: reads our own Flatpak app id, if any.
+    fn for_this_process() -> Self {
+        let own_app_id = std::fs::read_to_string("/.flatpak-info")
+            .ok()
+            .and_then(|info| parse_flatpak_info_app_id(&info).map(str::to_owned));
+        Self {
+            own_app_id,
+            ..Self::default()
+        }
+    }
 }
 
 /// Reads `/proc/<pid>/<file>`.
@@ -354,6 +414,10 @@ impl Procs for ProcFs {
         };
         found
     }
+
+    fn own_app_id(&self) -> Option<&str> {
+        self.own_app_id.as_deref()
+    }
 }
 
 /// Who owns a playback stream, as far as the graph tells.
@@ -383,6 +447,27 @@ impl Owner {
             Owner::Pending | Owner::Unknown => None,
         }
     }
+
+    /// Whether the stream belongs to this process. `own_pid` is `std::process::id()`
+    /// (namespace-local when we run in a Flatpak), `own_host_pid` our kernel-verified pid in
+    /// the daemon's namespace (from our own client), if known.
+    fn is_own(&self, own_pid: u32, own_host_pid: Option<u32>, procs: &dyn Procs) -> bool {
+        let ours = |pid: u32| pid == own_pid || Some(pid) == own_host_pid;
+        match self {
+            Owner::Pending | Owner::Unknown => false,
+            Owner::Host(pid) => ours(*pid),
+            Owner::Sandboxed { pid, app_id } => {
+                // A client of our own sandbox (our PulseAudio playback in a Flatpak) reports
+                // our namespace-local pid. A pid alone proves nothing (every Flatpak app has a
+                // pid 2): the app id must be ours too.
+                let our_sandbox = *pid == own_pid
+                    && app_id
+                        .as_deref()
+                        .is_some_and(|id| Some(id) == procs.own_app_id());
+                our_sandbox || self.host_pid(procs).is_some_and(ours)
+            }
+        }
+    }
 }
 
 /// Which application streams a linked capture takes.
@@ -395,16 +480,18 @@ enum NodeFilter {
 }
 
 impl NodeFilter {
-    fn matches(self, owner: &Owner, procs: &dyn Procs) -> bool {
+    /// `own_host_pid`: see [`Owner::is_own`] (only used by [`NodeFilter::AllExcept`]).
+    fn matches(self, owner: &Owner, procs: &dyn Procs, own_host_pid: Option<u32>) -> bool {
         match self {
             NodeFilter::AllExcept(excluded) => match owner {
                 Owner::Pending => false,
-                Owner::Host(pid) => *pid != excluded,
-                // A sandboxed stream belongs to another app even when its host pid is
-                // unknown (this process is not the sandboxed client).
-                Owner::Sandboxed { .. } => owner.host_pid(procs) != Some(excluded),
                 // Our own streams always carry a pid.
                 Owner::Unknown => true,
+                // A sandboxed stream whose host pid is unknown belongs to another app unless
+                // it is provably from our own sandbox.
+                Owner::Host(_) | Owner::Sandboxed { .. } => {
+                    !owner.is_own(excluded, own_host_pid, procs)
+                }
             },
             NodeFilter::ProcessTree(root) => match owner.host_pid(procs) {
                 Some(pid) => pid == root || is_descendant(pid, root, &|p| procs.parent_of(p)),
@@ -611,6 +698,8 @@ struct NodeModel {
     relay: bool,
     /// The node info (full properties) has arrived, so its pid can be trusted.
     info_seen: bool,
+    /// The node is running (node info state), i.e. it is being scheduled and plays.
+    running: bool,
 }
 
 impl NodeModel {
@@ -680,6 +769,8 @@ struct GraphModel {
     ports: BTreeMap<u32, PortModel>,
     /// `Audio/Sink` nodes and their owning client (`client.id`).
     sinks: BTreeMap<u32, Option<u32>>,
+    /// Capture stream nodes (`Stream/Input/Audio`, ours among them) and their client.
+    capture_nodes: BTreeMap<u32, Option<u32>>,
 }
 
 impl GraphModel {
@@ -774,6 +865,18 @@ impl GraphModel {
         apps
     }
 
+    /// Our pid in the daemon's pid namespace: the kernel-verified `pipewire.sec.pid` of the
+    /// client that owns our capture node `own_node` (differs from `std::process::id()` in a
+    /// Flatpak sandbox). Our playback through the native socket reports the same pid.
+    fn own_host_pid(&self, own_node: u32) -> Option<u32> {
+        let client = self.capture_nodes.get(&own_node).copied().flatten()?;
+        let client = self.clients.get(&client)?;
+        if client.is_pulse() {
+            return None;
+        }
+        client.sec_pid
+    }
+
     /// The links a linked capture into `own_node` should have right now.
     fn plan_links(
         &self,
@@ -791,11 +894,12 @@ impl GraphModel {
         if inputs.is_empty() {
             return planned;
         }
+        let own_host_pid = self.own_host_pid(own_node);
         for &node_id in self.nodes.keys() {
             if node_id == own_node || self.is_relay(node_id) {
                 continue;
             }
-            if !filter.matches(&self.node_owner(node_id), procs) {
+            if !filter.matches(&self.node_owner(node_id), procs, own_host_pid) {
                 continue;
             }
             let outputs = self
@@ -969,6 +1073,10 @@ struct LinkCapture {
     /// Where the links' listeners report [`LinkLost`].
     lost_tx: pw::channel::Sender<LinkLost>,
     next_serial: u64,
+    /// Calls of our stream's `process` callback so far (counted by the callback).
+    processed: Rc<std::cell::Cell<u64>>,
+    /// Kept across sessions, so the backoff survives a restart.
+    stall: Rc<std::cell::Cell<StallWatch>>,
 }
 
 impl LinkCapture {
@@ -976,6 +1084,8 @@ impl LinkCapture {
         core: pw::core::CoreRc,
         filter: NodeFilter,
         lost_tx: pw::channel::Sender<LinkLost>,
+        processed: Rc<std::cell::Cell<u64>>,
+        stall: Rc<std::cell::Cell<StallWatch>>,
     ) -> Self {
         Self {
             core,
@@ -985,6 +1095,8 @@ impl LinkCapture {
             lost_count: HashMap::new(),
             lost_tx,
             next_serial: 0,
+            processed,
+            stall,
         }
     }
 
@@ -1054,6 +1166,92 @@ impl LinkCapture {
     }
 }
 
+/// Detects a linked capture that PipeWire does not schedule although a stream linked into it
+/// is running (seen on some systems: links `active`, our node `suspended`, the `process`
+/// callback never called). The remedy is to recreate the links, and if that does not help,
+/// the whole stream (a new node).
+#[derive(Debug, Clone, Copy)]
+struct StallWatch {
+    /// `process` calls at the last progress.
+    seen: u64,
+    /// Since when there has been no progress while a linked stream runs.
+    since: Instant,
+    /// Checks since `since`.
+    quiet_checks: u32,
+    /// Stall actions taken since the last progress.
+    attempts: u32,
+    /// Wait after the next action.
+    backoff: Duration,
+    /// No action before this.
+    next_allowed: Instant,
+}
+
+/// What to do about a stalled linked capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallAction {
+    /// Destroy and recreate our links.
+    Relink,
+    /// End this session and start a new one right away (new connection, stream and links).
+    Restart,
+}
+
+impl StallWatch {
+    fn new(now: Instant) -> Self {
+        Self {
+            seen: 0,
+            since: now,
+            quiet_checks: 0,
+            attempts: 0,
+            backoff: STALL_BACKOFF_FIRST,
+            next_allowed: now,
+        }
+    }
+
+    /// A new session starts counting `process` calls from 0 again.
+    fn new_session(&mut self, now: Instant) {
+        self.seen = 0;
+        self.since = now;
+        self.quiet_checks = 0;
+    }
+
+    /// `processed`: `process` calls so far; `driven`: a stream linked into the capture is
+    /// running. Returns what to do now, if anything.
+    fn check(&mut self, now: Instant, processed: u64, driven: bool) -> Option<StallAction> {
+        if processed != self.seen {
+            self.seen = processed;
+            self.since = now;
+            self.quiet_checks = 0;
+            self.attempts = 0;
+            self.backoff = STALL_BACKOFF_FIRST;
+            self.next_allowed = now;
+            return None;
+        }
+        if !driven {
+            // Nothing linked plays: not being called is expected (or not our business).
+            self.since = now;
+            self.quiet_checks = 0;
+            return None;
+        }
+        self.quiet_checks = self.quiet_checks.saturating_add(1);
+        if now.saturating_duration_since(self.since) < STALL_AFTER
+            || self.quiet_checks < STALL_CHECKS
+            || now < self.next_allowed
+        {
+            return None;
+        }
+        self.since = now;
+        self.quiet_checks = 0;
+        self.next_allowed = now + self.backoff;
+        self.backoff = (self.backoff * 2).min(STALL_BACKOFF_MAX);
+        self.attempts += 1;
+        Some(if self.attempts <= STALL_RELINKS {
+            StallAction::Relink
+        } else {
+            StallAction::Restart
+        })
+    }
+}
+
 /// Registry mirror for one connection; with `capture` set it also maintains the links.
 struct Tracker {
     registry: pw::registry::RegistryRc,
@@ -1069,7 +1267,7 @@ impl Tracker {
         Rc::new(RefCell::new(Self {
             registry,
             model: GraphModel::default(),
-            procs: ProcFs::default(),
+            procs: ProcFs::for_this_process(),
             bound: HashMap::new(),
             link_factory: "link-factory".to_owned(),
             capture,
@@ -1158,12 +1356,14 @@ impl Tracker {
                             .add_listener_local()
                             .info(move |info| {
                                 let props = info.props();
+                                let running = matches!(info.state(), pw::node::NodeState::Running);
                                 with_tracker(&weak, |t| {
                                     if let Some(node) = t.model.nodes.get_mut(&id) {
                                         if let Some(props) = props {
                                             node.apply_props(|k| props.get(k));
                                         }
                                         node.info_seen = true;
+                                        node.running = running;
                                     }
                                     t.reconcile();
                                 });
@@ -1173,6 +1373,11 @@ impl Tracker {
                     }
                     Err(e) => tracing::debug!(id, error = %e, "cannot bind PipeWire node"),
                 }
+            }
+            ObjectType::Node if props.get("media.class") == Some("Stream/Input/Audio") => {
+                let client = props.get("client.id").and_then(|v| v.trim().parse().ok());
+                tracker.model.capture_nodes.insert(id, client);
+                tracker.reconcile();
             }
             ObjectType::Node
                 if props
@@ -1205,6 +1410,7 @@ impl Tracker {
         self.model.nodes.remove(&id);
         self.model.ports.remove(&id);
         self.model.sinks.remove(&id);
+        self.model.capture_nodes.remove(&id);
         self.bound.remove(&id);
         if let Some(capture) = self.capture.as_mut() {
             // The server already destroyed links touching a removed node/port; links to new
@@ -1252,6 +1458,42 @@ impl Tracker {
             tracing::debug!(key = ?lost.key, attempts = *count, "PipeWire capture link lost; relinking");
         }
         self.reconcile();
+    }
+
+    /// Acts on a capture that is not scheduled although a stream linked into it runs
+    /// ([`StallWatch`]): relinks it here, or returns [`StallAction::Restart`] for the caller.
+    fn check_stall(&mut self, now: Instant) -> Option<StallAction> {
+        let Tracker { model, capture, .. } = self;
+        let capture = capture.as_mut()?;
+        let driven = capture.links.keys().any(|link| {
+            model
+                .nodes
+                .get(&link.out_node)
+                .is_some_and(|node| node.running)
+        });
+        let mut stall = capture.stall.get();
+        let action = stall.check(now, capture.processed.get(), driven);
+        capture.stall.set(stall);
+        match action? {
+            StallAction::Relink => {
+                tracing::warn!(
+                    links = capture.links.len(),
+                    "PipeWire does not run the capture although linked streams play; \
+                     recreating its links"
+                );
+                // Dropping the proxies destroys the links; `reconcile` creates them again.
+                capture.links.clear();
+                self.reconcile();
+                None
+            }
+            StallAction::Restart => {
+                tracing::warn!(
+                    "PipeWire still does not run the capture after relinking; recreating the \
+                     capture stream"
+                );
+                Some(StallAction::Restart)
+            }
+        }
     }
 
     /// Creates missing links and removes unwanted ones (linked capture only).
@@ -1379,17 +1621,214 @@ enum Command {
     Stop,
 }
 
-type ReadySlot = Rc<RefCell<Option<SyncSender<Result<AudioFormat>>>>>;
+/// Where the open outcome goes, and what it was.
+enum Ready {
+    /// `open_*` is still waiting for the outcome.
+    Pending(SyncSender<Result<AudioFormat>>),
+    /// The source opened: a later connection loss is reconnected.
+    Opened,
+    /// Opening failed (reported to `open_*`).
+    Failed,
+}
 
-/// Reports the open outcome once (later calls are ignored).
+type ReadySlot = Rc<RefCell<Ready>>;
+
+/// Reports the open outcome once (later calls are ignored). Returns whether it was reported.
 fn signal_ready(slot: &ReadySlot, outcome: Result<AudioFormat>) -> bool {
-    let sender = slot.try_borrow_mut().ok().and_then(|mut s| s.take());
-    match sender {
-        Some(tx) => {
+    let Ok(mut state) = slot.try_borrow_mut() else {
+        return false;
+    };
+    let next = if outcome.is_ok() {
+        Ready::Opened
+    } else {
+        Ready::Failed
+    };
+    match std::mem::replace(&mut *state, next) {
+        Ready::Pending(tx) => {
             let _ = tx.try_send(outcome);
             true
         }
-        None => false,
+        previous => {
+            *state = previous;
+            false
+        }
+    }
+}
+
+/// Whether `open_*` is still waiting for the outcome.
+fn ready_pending(slot: &ReadySlot) -> bool {
+    slot.try_borrow()
+        .map(|s| matches!(*s, Ready::Pending(_)))
+        .unwrap_or(false)
+}
+
+/// Whether the source opened successfully.
+fn ready_opened(slot: &ReadySlot) -> bool {
+    slot.try_borrow()
+        .map(|s| matches!(*s, Ready::Opened))
+        .unwrap_or(false)
+}
+
+/// State of a capture thread that outlives one connection (session).
+struct CaptureState {
+    ready: ReadySlot,
+    /// Where captured audio goes; `None` until `start`.
+    sink: Rc<RefCell<Option<PcmSink>>>,
+    /// The format reported to `CaptureSource::format` (fixed once the source opened).
+    reported: Rc<std::cell::Cell<AudioFormat>>,
+    /// The command receiver, attached to the loop of whichever session runs.
+    commands: Option<pw::channel::Receiver<Command>>,
+    /// Stall detection of a linked capture, kept across sessions.
+    stall: Rc<std::cell::Cell<StallWatch>>,
+}
+
+/// How a capture session (one connection to the daemon) ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    /// `stop` was called.
+    Stopped,
+    /// The connection to the daemon broke.
+    ConnectionLost,
+    /// The linked capture stalled ([`StallAction::Restart`]): start a new session now.
+    Restart,
+}
+
+/// Reconnect delays after a lost connection: `first`, doubling up to `max`, and whether to
+/// keep trying `elapsed` after the loss (given up after `window`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconnectPolicy {
+    first: Duration,
+    max: Duration,
+    window: Duration,
+}
+
+impl ReconnectPolicy {
+    /// The delay before the attempt that follows one that waited `previous` (`None`: first).
+    fn next_delay(self, previous: Option<Duration>) -> Duration {
+        previous.map_or(self.first, |d| (d * 2).min(self.max))
+    }
+
+    /// Whether another attempt is still worth it `elapsed` after the connection was lost.
+    fn keep_trying(self, elapsed: Duration) -> bool {
+        elapsed < self.window
+    }
+}
+
+/// The default policy: a restarted daemon (`systemctl --user restart pipewire`, a crash
+/// that systemd restarts) is back within a second or two.
+const RECONNECT: ReconnectPolicy = ReconnectPolicy {
+    first: Duration::from_millis(250),
+    max: Duration::from_secs(2),
+    window: Duration::from_secs(30),
+};
+
+/// Body of the capture thread: runs sessions until stopped. A lost connection of an opened
+/// source is reconnected (same stream properties, same links, the sink kept) for up to
+/// `policy.window`; after that the thread ends, which [`CaptureSource::error`] reports.
+fn capture_thread(
+    mode: Mode,
+    remote: Option<String>,
+    commands: pw::channel::Receiver<Command>,
+    ready: ReadySlot,
+    policy: ReconnectPolicy,
+) {
+    let mut state = CaptureState {
+        ready,
+        sink: Rc::new(RefCell::new(None)),
+        reported: Rc::new(std::cell::Cell::new(REQUESTED_FORMAT)),
+        commands: Some(commands),
+        stall: Rc::new(std::cell::Cell::new(StallWatch::new(Instant::now()))),
+    };
+    let mut lost_at: Option<Instant> = None;
+    let mut delay = None;
+    loop {
+        let reconnecting = lost_at.is_some();
+        match run_capture(mode, remote.as_deref(), &mut state) {
+            Ok(SessionEnd::Stopped) => return,
+            Ok(SessionEnd::Restart) => continue,
+            Ok(SessionEnd::ConnectionLost) => {
+                if !ready_opened(&state.ready) {
+                    return; // `open_*` got the error
+                }
+                if reconnecting {
+                    tracing::debug!("PipeWire connection lost again while reconnecting");
+                } else {
+                    tracing::warn!("PipeWire connection lost; reconnecting the capture");
+                }
+                // A session that ran counts as a successful reconnect: a new window.
+                lost_at = Some(Instant::now());
+                delay = None;
+            }
+            Err(e) => {
+                if !ready_opened(&state.ready) {
+                    if !signal_ready(&state.ready, Err(e.clone())) {
+                        tracing::warn!(error = %e, "PipeWire capture thread failed");
+                    }
+                    return;
+                }
+                tracing::debug!(error = %e, "PipeWire reconnect attempt failed");
+                lost_at.get_or_insert_with(std::time::Instant::now);
+            }
+        }
+        let elapsed = lost_at.map_or(Duration::ZERO, |t| t.elapsed());
+        if !policy.keep_trying(elapsed) {
+            tracing::warn!(
+                secs = elapsed.as_secs(),
+                "PipeWire did not come back; the capture stops"
+            );
+            return;
+        }
+        let wait = policy.next_delay(delay);
+        delay = Some(wait);
+        if wait_for_retry(&mut state, wait) == SessionEnd::Stopped {
+            return;
+        }
+    }
+}
+
+/// Waits `delay` between two reconnect attempts while still obeying commands. Returns
+/// [`SessionEnd::Stopped`] if `stop` was called meanwhile.
+fn wait_for_retry(state: &mut CaptureState, delay: Duration) -> SessionEnd {
+    let Some(commands) = state.commands.take() else {
+        return SessionEnd::Stopped;
+    };
+    // A loop without a context: it needs no daemon.
+    let mainloop = match pw::main_loop::MainLoopRc::new(None) {
+        Ok(mainloop) => mainloop,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot create a PipeWire main loop; the capture stops");
+            return SessionEnd::Stopped;
+        }
+    };
+    let stopped = Rc::new(std::cell::Cell::new(false));
+    let attached = commands.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        let sink = Rc::clone(&state.sink);
+        let stopped = Rc::clone(&stopped);
+        move |command| match command {
+            Command::Start(new_sink) => {
+                if let Ok(mut slot) = sink.try_borrow_mut() {
+                    *slot = Some(new_sink);
+                }
+            }
+            Command::Stop => {
+                stopped.set(true);
+                mainloop.quit();
+            }
+        }
+    });
+    let timer = mainloop.loop_().add_timer({
+        let mainloop = mainloop.clone();
+        move |_| mainloop.quit()
+    });
+    let _ = timer.update_timer(Some(delay), None);
+    mainloop.run();
+    drop(timer);
+    state.commands = Some(attached.deattach());
+    if stopped.get() {
+        SessionEnd::Stopped
+    } else {
+        SessionEnd::ConnectionLost
     }
 }
 
@@ -1403,14 +1842,19 @@ struct StreamData {
     out_channels: usize,
     /// The format reported to `CaptureSource::format`.
     reported: AudioFormat,
+    /// Where `reported` is kept for the next session after a reconnect.
+    reported_shared: Rc<std::cell::Cell<AudioFormat>>,
     /// Preallocated conversion buffer (the process callback never allocates).
     scratch: Box<[f32]>,
     ready: ReadySlot,
     tracker: Option<Weak<RefCell<Tracker>>>,
+    /// Counts `process` calls (for [`StallWatch`]).
+    processed: Rc<std::cell::Cell<u64>>,
 }
 
 /// The `process` callback: real-time safe (no allocation, lock, log or syscall).
 fn on_process(stream: &pw::stream::Stream, data: &mut StreamData) {
+    data.processed.set(data.processed.get().wrapping_add(1));
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
@@ -1458,23 +1902,26 @@ fn stream_props(mode: Mode) -> pw::properties::PropertiesBox {
         Mode::Linked(_) => {
             props.insert("node.autoconnect", "false");
             props.insert("node.dont-reconnect", "true");
-            // Keep being scheduled (silence) while no application stream is linked.
+            // Ask to be scheduled (silence) while no application stream is linked. It needs a
+            // driver to join, so it is best effort: the consumer must treat "no frames" as
+            // silence either way.
             props.insert("node.always-process", "true");
         }
     }
     props
 }
 
-/// Body of the capture thread. Returns when stopped or on a fatal error.
-fn run_capture(
-    mode: Mode,
-    remote: Option<String>,
-    commands: pw::channel::Receiver<Command>,
-    ready: ReadySlot,
-) -> Result<()> {
-    let conn = Connection::open(remote.as_deref())?;
+/// One capture session: connects, runs the loop until stopped or the connection breaks.
+/// Errors are setup failures (no daemon, stream creation...).
+fn run_capture(mode: Mode, remote: Option<&str>, state: &mut CaptureState) -> Result<SessionEnd> {
+    let conn = Connection::open(remote)?;
+    let ready = Rc::clone(&state.ready);
 
     let (lost_tx, lost_rx) = pw::channel::channel::<LinkLost>();
+    let processed = Rc::new(std::cell::Cell::new(0u64));
+    let mut stall = state.stall.get();
+    stall.new_session(Instant::now());
+    state.stall.set(stall);
     let tracker = match mode {
         Mode::Monitor => None,
         Mode::Linked(filter) => {
@@ -1484,7 +1931,13 @@ fn run_capture(
                 .map_err(|e| backend("get registry", e))?;
             Some(Tracker::new(
                 registry,
-                Some(LinkCapture::new(conn.core.clone(), filter, lost_tx)),
+                Some(LinkCapture::new(
+                    conn.core.clone(),
+                    filter,
+                    lost_tx,
+                    Rc::clone(&processed),
+                    Rc::clone(&state.stall),
+                )),
             ))
         }
     };
@@ -1501,18 +1954,21 @@ fn run_capture(
         }
     });
 
-    let sink_slot: Rc<RefCell<Option<PcmSink>>> = Rc::new(RefCell::new(None));
+    let sink_slot = Rc::clone(&state.sink);
     let stream = pw::stream::StreamRc::new(conn.core.clone(), APP_NAME, stream_props(mode))
         .map_err(|e| backend("create stream", e))?;
-    let channels = usize::from(REQUESTED_FORMAT.channels);
+    let reported = state.reported.get();
+    let channels = usize::from(reported.channels);
     let data = StreamData {
         sink: Rc::clone(&sink_slot),
         in_channels: channels,
         out_channels: channels,
-        reported: REQUESTED_FORMAT,
+        reported,
+        reported_shared: Rc::clone(&state.reported),
         scratch: vec![0.0; SCRATCH_SAMPLES].into_boxed_slice(),
         ready: Rc::clone(&ready),
         tracker: tracker.as_ref().map(Rc::downgrade),
+        processed,
     };
     let _stream_listener = stream
         .add_local_listener_with_user_data(data)
@@ -1544,13 +2000,9 @@ fn run_capture(
             match parse_format_pod(param) {
                 Ok(format) => {
                     data.in_channels = usize::from(format.channels);
-                    let pending = data
-                        .ready
-                        .try_borrow()
-                        .map(|s| s.is_some())
-                        .unwrap_or(false);
-                    if pending {
+                    if ready_pending(&data.ready) {
                         data.reported = format;
+                        data.reported_shared.set(format);
                         data.out_channels = usize::from(format.channels);
                         signal_ready(&data.ready, Ok(format));
                         tracing::debug!(?format, "PipeWire capture format negotiated");
@@ -1585,16 +2037,24 @@ fn run_capture(
         .connect(spa::utils::Direction::Input, None, flags, &mut params)
         .map_err(|e| backend("connect stream", e))?;
 
-    let _commands = commands.attach(conn.mainloop.loop_(), {
+    let Some(commands) = state.commands.take() else {
+        return Ok(SessionEnd::Stopped);
+    };
+    let stopped = Rc::new(std::cell::Cell::new(false));
+    let commands = commands.attach(conn.mainloop.loop_(), {
         let mainloop = conn.mainloop.clone();
         let sink_slot = Rc::clone(&sink_slot);
+        let stopped = Rc::clone(&stopped);
         move |command| match command {
             Command::Start(sink) => {
                 if let Ok(mut slot) = sink_slot.try_borrow_mut() {
                     *slot = Some(sink);
                 }
             }
-            Command::Stop => mainloop.quit(),
+            Command::Stop => {
+                stopped.set(true);
+                mainloop.quit();
+            }
         }
     });
     let _core_listener = conn
@@ -1605,7 +2065,7 @@ fn run_capture(
             let ready = Rc::clone(&ready);
             move |id, _seq, res, message| {
                 if id == pw::core::PW_ID_CORE && is_connection_error(res) {
-                    tracing::warn!(res, message, "PipeWire connection lost; capture stops");
+                    tracing::debug!(res, message, "PipeWire connection lost");
                     signal_ready(
                         &ready,
                         Err(CaptureError::Backend(format!(
@@ -1628,13 +2088,37 @@ fn run_capture(
         }
     });
     let _ = grace.update_timer(Some(NEGOTIATION_GRACE), None);
+    let restart = Rc::new(std::cell::Cell::new(false));
+    let stall_timer = tracker.as_ref().map(|tracker| {
+        let weak = Rc::downgrade(tracker);
+        let mainloop = conn.mainloop.clone();
+        let restart = Rc::clone(&restart);
+        let timer = conn.mainloop.loop_().add_timer(move |_| {
+            let mut action = None;
+            with_tracker(&weak, |t| action = t.check_stall(Instant::now()));
+            if action == Some(StallAction::Restart) {
+                restart.set(true);
+                mainloop.quit();
+            }
+        });
+        let _ = timer.update_timer(Some(STALL_CHECK_INTERVAL), Some(STALL_CHECK_INTERVAL));
+        timer
+    });
 
     conn.mainloop.run();
 
+    drop(stall_timer);
+    state.commands = Some(commands.deattach());
     if let Err(e) = stream.disconnect() {
         tracing::debug!(error = %e, "PipeWire stream disconnect failed");
     }
-    Ok(())
+    Ok(if stopped.get() {
+        SessionEnd::Stopped
+    } else if restart.get() {
+        SessionEnd::Restart
+    } else {
+        SessionEnd::ConnectionLost
+    })
 }
 
 /// A running PipeWire capture (see the module docs).
@@ -1649,17 +2133,23 @@ struct PipeWireCapture {
 impl PipeWireCapture {
     /// Spawns the capture thread, connects the stream and waits for the negotiated format.
     fn open(mode: Mode, description: String, remote: Option<String>) -> Result<Self> {
+        Self::open_with(mode, description, remote, RECONNECT)
+    }
+
+    /// [`PipeWireCapture::open`] with a reconnect policy (tests use short ones).
+    fn open_with(
+        mode: Mode,
+        description: String,
+        remote: Option<String>,
+        policy: ReconnectPolicy,
+    ) -> Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<AudioFormat>>(1);
         let (commands, command_rx) = pw::channel::channel::<Command>();
         let thread = std::thread::Builder::new()
             .name("hfa-pw-capture".to_owned())
             .spawn(move || {
-                let ready: ReadySlot = Rc::new(RefCell::new(Some(ready_tx)));
-                if let Err(e) = run_capture(mode, remote, command_rx, Rc::clone(&ready)) {
-                    if !signal_ready(&ready, Err(e.clone())) {
-                        tracing::warn!(error = %e, "PipeWire capture thread failed");
-                    }
-                }
+                let ready: ReadySlot = Rc::new(RefCell::new(Ready::Pending(ready_tx)));
+                capture_thread(mode, remote, command_rx, ready, policy);
             })
             .map_err(|e| backend("spawn capture thread", e))?;
 
@@ -1750,6 +2240,8 @@ mod tests {
         parents: Vec<(u32, u32)>,
         /// ((sandbox pid, app id), host pid)
         sandboxes: Vec<((u32, Option<&'static str>), u32)>,
+        /// Our own Flatpak app id (we run sandboxed).
+        own_app_id: Option<&'static str>,
     }
 
     impl Procs for FakeProcs {
@@ -1765,6 +2257,10 @@ mod tests {
                 .iter()
                 .find(|((pid, id), _)| *pid == sandbox_pid && *id == app_id)
                 .map(|(_, host)| *host)
+        }
+
+        fn own_app_id(&self) -> Option<&str> {
+            self.own_app_id
         }
     }
 
@@ -1814,6 +2310,7 @@ mod tests {
         let procs = FakeProcs {
             parents: vec![(30, 20), (20, 10)],
             sandboxes: vec![((2, Some("org.example.App")), 30)],
+            own_app_id: None,
         };
         let host = Owner::Host;
         let sandboxed = |app_id: Option<&str>| Owner::Sandboxed {
@@ -1821,24 +2318,36 @@ mod tests {
             app_id: app_id.map(str::to_owned),
         };
         let all_but_5 = NodeFilter::AllExcept(5);
-        assert!(all_but_5.matches(&host(6), &procs));
-        assert!(!all_but_5.matches(&host(5), &procs));
-        assert!(!all_but_5.matches(&Owner::Pending, &procs));
-        assert!(all_but_5.matches(&Owner::Unknown, &procs));
+        assert!(all_but_5.matches(&host(6), &procs, None));
+        assert!(!all_but_5.matches(&host(5), &procs, None));
+        assert!(!all_but_5.matches(&Owner::Pending, &procs, None));
+        assert!(all_but_5.matches(&Owner::Unknown, &procs, None));
         // A sandboxed stream is another app even if its host pid is unknown ...
-        assert!(all_but_5.matches(&sandboxed(None), &procs));
+        assert!(all_but_5.matches(&sandboxed(None), &procs, None));
         // ... but it is excluded when it maps to the excluded pid.
-        assert!(!NodeFilter::AllExcept(30).matches(&sandboxed(Some("org.example.App")), &procs));
+        assert!(!NodeFilter::AllExcept(30).matches(
+            &sandboxed(Some("org.example.App")),
+            &procs,
+            None
+        ));
 
-        assert!(NodeFilter::ProcessTree(10).matches(&host(10), &procs));
-        assert!(NodeFilter::ProcessTree(10).matches(&host(30), &procs));
-        assert!(!NodeFilter::ProcessTree(20).matches(&host(10), &procs));
-        assert!(!NodeFilter::ProcessTree(10).matches(&Owner::Unknown, &procs));
-        assert!(!NodeFilter::ProcessTree(10).matches(&Owner::Pending, &procs));
+        assert!(NodeFilter::ProcessTree(10).matches(&host(10), &procs, None));
+        assert!(NodeFilter::ProcessTree(10).matches(&host(30), &procs, None));
+        assert!(!NodeFilter::ProcessTree(20).matches(&host(10), &procs, None));
+        assert!(!NodeFilter::ProcessTree(10).matches(&Owner::Unknown, &procs, None));
+        assert!(!NodeFilter::ProcessTree(10).matches(&Owner::Pending, &procs, None));
         // Sandboxed streams match by their host pid, never by the sandbox-internal one.
-        assert!(NodeFilter::ProcessTree(20).matches(&sandboxed(Some("org.example.App")), &procs));
-        assert!(!NodeFilter::ProcessTree(2).matches(&sandboxed(Some("org.example.App")), &procs));
-        assert!(!NodeFilter::ProcessTree(2).matches(&sandboxed(None), &procs));
+        assert!(NodeFilter::ProcessTree(20).matches(
+            &sandboxed(Some("org.example.App")),
+            &procs,
+            None
+        ));
+        assert!(!NodeFilter::ProcessTree(2).matches(
+            &sandboxed(Some("org.example.App")),
+            &procs,
+            None
+        ));
+        assert!(!NodeFilter::ProcessTree(2).matches(&sandboxed(None), &procs, None));
     }
 
     #[test]
@@ -1851,6 +2360,116 @@ mod tests {
         assert!(!is_connection_error(-libc::EINVAL));
         assert!(!is_connection_error(0));
         assert!(!is_connection_error(i32::MIN));
+    }
+
+    #[test]
+    fn reconnect_delays_double_up_to_a_cap_within_a_window() {
+        let policy = ReconnectPolicy {
+            first: Duration::from_millis(250),
+            max: Duration::from_secs(2),
+            window: Duration::from_secs(30),
+        };
+        let mut delay = None;
+        let delays: Vec<u64> = (0..6)
+            .map(|_| {
+                let d = policy.next_delay(delay);
+                delay = Some(d);
+                d.as_millis() as u64
+            })
+            .collect();
+        assert_eq!(delays, [250, 500, 1000, 2000, 2000, 2000]);
+        assert!(policy.keep_trying(Duration::ZERO));
+        assert!(policy.keep_trying(Duration::from_secs(29)));
+        assert!(!policy.keep_trying(Duration::from_secs(30)));
+        // The production policy gives a restarted daemon time to come back.
+        assert!(RECONNECT.window >= Duration::from_secs(10));
+        assert!(RECONNECT.first < Duration::from_secs(1));
+    }
+
+    /// Runs `watch` like the capture thread's timer (every 100 ms) from `from` to `to` ms
+    /// and returns the actions it took, with their times.
+    fn tick(
+        watch: &mut StallWatch,
+        t0: Instant,
+        (from, to): (u64, u64),
+        processed: impl Fn(u64) -> u64,
+        driven: bool,
+    ) -> Vec<(u64, StallAction)> {
+        (from..to)
+            .step_by(100)
+            .filter_map(|ms| {
+                let now = t0 + Duration::from_millis(ms);
+                watch.check(now, processed(ms), driven).map(|a| (ms, a))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_linked_capture_that_is_not_run_while_linked_streams_play_is_relinked_then_restarted() {
+        use StallAction::{Relink, Restart};
+        let t0 = Instant::now();
+        let mut watch = StallWatch::new(t0);
+        // Progress: never an action, however long it runs.
+        assert_eq!(tick(&mut watch, t0, (0, 5_000), |ms| ms / 10, true), []);
+        // No progress, but nothing linked plays (paused player, nothing linked): fine.
+        assert_eq!(tick(&mut watch, t0, (5_000, 10_000), |_| 499, false), []);
+        // A linked stream plays and `process` is not called: relink after 500 ms, restart
+        // (a new stream) 1 s later if that did not help, then back off (2 s, 4 s...).
+        assert_eq!(
+            tick(&mut watch, t0, (10_000, 20_000), |_| 499, true),
+            [
+                (10_400, Relink),
+                (11_400, Restart),
+                (13_400, Restart),
+                (17_400, Restart)
+            ]
+        );
+        // A new session counts `process` calls from 0 again: that is no progress.
+        watch.new_session(t0 + Duration::from_millis(20_000));
+        assert_eq!(tick(&mut watch, t0, (20_000, 25_000), |_| 0, true), []);
+        assert_eq!(
+            tick(&mut watch, t0, (25_000, 26_000), |_| 0, true),
+            [(25_400, Restart)]
+        );
+        // Progress resets everything: the next stall starts with a relink again, promptly.
+        assert_eq!(tick(&mut watch, t0, (26_000, 26_100), |_| 1, true), []);
+        assert_eq!(
+            tick(&mut watch, t0, (26_100, 27_000), |_| 1, true),
+            [(26_500, Relink)]
+        );
+    }
+
+    #[test]
+    fn a_late_check_on_a_starved_capture_thread_is_not_a_stall() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut watch = StallWatch::new(t0);
+        assert_eq!(watch.check(at(0), 1, true), None);
+        // The thread was not scheduled for 2 s: its timer runs before its `process`.
+        assert_eq!(watch.check(at(2_000), 1, true), None);
+        assert_eq!(watch.check(at(2_010), 2, true), None);
+    }
+
+    #[test]
+    fn the_open_outcome_is_reported_once_and_remembered() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let slot: ReadySlot = Rc::new(RefCell::new(Ready::Pending(tx)));
+        assert!(ready_pending(&slot) && !ready_opened(&slot));
+        assert!(signal_ready(&slot, Ok(REQUESTED_FORMAT)));
+        assert_eq!(rx.try_recv().expect("outcome"), Ok(REQUESTED_FORMAT));
+        assert!(ready_opened(&slot) && !ready_pending(&slot));
+        // A later connection loss does not turn an opened source into a failed open.
+        let lost = CaptureError::Backend("lost".into());
+        assert!(!signal_ready(&slot, Err(lost.clone())));
+        assert!(ready_opened(&slot));
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let slot: ReadySlot = Rc::new(RefCell::new(Ready::Pending(tx)));
+        assert!(signal_ready(&slot, Err(lost.clone())));
+        assert_eq!(rx.try_recv().expect("outcome"), Err(lost));
+        assert!(!ready_opened(&slot) && !ready_pending(&slot));
+        assert!(!signal_ready(&slot, Ok(REQUESTED_FORMAT)));
+        assert!(!ready_opened(&slot));
     }
 
     #[test]
@@ -1944,6 +2563,7 @@ mod tests {
             node_name: Some("node".into()),
             relay: false,
             info_seen: true,
+            running: false,
         }
     }
 
@@ -2083,6 +2703,7 @@ mod tests {
         let procs = FakeProcs {
             parents: vec![(7001, 7000)],
             sandboxes: vec![((2, Some("org.mozilla.firefox")), 7001)],
+            own_app_id: None,
         };
         assert_eq!(
             g.apps(4242, &procs),
@@ -2104,6 +2725,74 @@ mod tests {
         assert!(g
             .plan_links(50, NodeFilter::ProcessTree(2), &procs)
             .is_empty());
+    }
+
+    /// Running as a Flatpak: our pid is namespace-local (2), our PulseAudio playback reports
+    /// that pid from our sandbox, and our native-socket streams carry our host pid.
+    #[test]
+    fn a_flatpak_build_excludes_its_own_streams_from_system_excl() {
+        const OURS: &str = "io.github.shdavlatbek.hfa";
+        let mut g = GraphModel::default();
+        let flatpak_pulse = |app_id: &str| {
+            let mut c = pulse_client();
+            c.apply_props(|k| match k {
+                "pipewire.access" => Some("flatpak"),
+                "pipewire.access.portal.app_id" => Some(app_id),
+                _ => None,
+            });
+            c
+        };
+        // Our capture node 50 belongs to our native client 1 (host pid 9000, sandboxed).
+        let mut own_client = client(Some(9000), Some(2), "headphone-for-all");
+        own_client.apply_props(|k| match k {
+            "pipewire.access" => Some("flatpak"),
+            "pipewire.access.portal.app_id" => Some(OURS),
+            _ => None,
+        });
+        g.clients.insert(1, own_client);
+        g.capture_nodes.insert(50, Some(1));
+        g.clients.insert(2, flatpak_pulse(OURS)); // our hub playback through pulse
+        g.clients.insert(3, flatpak_pulse("org.mozilla.firefox")); // also pid 2 in its sandbox
+        g.clients.insert(4, client(Some(400), Some(400), "mpv"));
+        g.nodes
+            .insert(20, stream_node(2, Some(2), Some("headphone-for-all")));
+        g.nodes.insert(21, stream_node(3, Some(2), Some("Firefox")));
+        g.nodes.insert(22, stream_node(1, None, None)); // our playback through the native socket
+        g.nodes.insert(23, stream_node(4, None, Some("mpv")));
+        for (id, p) in [
+            (500, port(50, false, "FL")),
+            (200, port(20, true, "FL")),
+            (210, port(21, true, "FL")),
+            (220, port(22, true, "FL")),
+            (230, port(23, true, "FL")),
+        ] {
+            g.ports.insert(id, p);
+        }
+        assert_eq!(g.own_host_pid(50), Some(9000));
+        let sandboxed = FakeProcs {
+            own_app_id: Some(OURS),
+            ..FakeProcs::default()
+        };
+        assert_eq!(
+            g.plan_links(50, NodeFilter::AllExcept(2), &sandboxed),
+            BTreeSet::from([link(21, 210, 500), link(23, 230, 500)]),
+            "our own pulse and native streams are excluded, Firefox (pid 2 too) is not"
+        );
+        // Not sandboxed ourselves: a sandboxed pid 2 is never us.
+        let host = FakeProcs::default();
+        assert!(g
+            .plan_links(50, NodeFilter::AllExcept(2), &host)
+            .contains(&link(20, 200, 500)));
+        // A sandboxed stream without an app id cannot be proven ours: it is captured.
+        let anonymous = Owner::Sandboxed {
+            pid: 2,
+            app_id: None,
+        };
+        assert!(!anonymous.is_own(2, Some(9000), &sandboxed));
+        assert!(NodeFilter::AllExcept(2).matches(&anonymous, &sandboxed, Some(9000)));
+        // Our kernel-verified host pid is excluded wherever it shows up.
+        assert!(!NodeFilter::AllExcept(2).matches(&Owner::Host(9000), &sandboxed, Some(9000)));
+        assert!(NodeFilter::AllExcept(2).matches(&Owner::Host(9001), &sandboxed, Some(9000)));
     }
 
     #[test]
@@ -3004,6 +3693,162 @@ mod tests {
                 "late stream not linked ({} frames captured)",
                 left.len()
             );
+        }
+
+        /// A private PipeWire daemon (`PIPEWIRE_CORE=<name>`, no session manager) that the
+        /// test can kill and restart without touching the shared test daemon.
+        struct PrivateDaemon {
+            name: &'static str,
+            child: Option<Child>,
+        }
+
+        impl PrivateDaemon {
+            fn start(name: &'static str) -> Self {
+                let mut daemon = Self { name, child: None };
+                daemon.restart();
+                daemon
+            }
+
+            fn restart(&mut self) {
+                self.kill();
+                let child = Process::new("pipewire")
+                    .env("PIPEWIRE_CORE", self.name)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn pipewire");
+                self.child = Some(child);
+                let t0 = Instant::now();
+                while Connection::open(Some(self.name)).is_err() {
+                    assert!(
+                        t0.elapsed() < Duration::from_secs(5),
+                        "daemon did not start"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            fn kill(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+
+            /// Whether our capture stream is a node of this daemon.
+            fn has_capture_node(&self) -> bool {
+                Process::new("pw-dump")
+                    .args(["-r", self.name])
+                    .output()
+                    .is_ok_and(|out| {
+                        String::from_utf8_lossy(&out.stdout)
+                            .contains(&format!("\"node.name\": \"{APP_NAME}\""))
+                    })
+            }
+        }
+
+        impl Drop for PrivateDaemon {
+            fn drop(&mut self) {
+                self.kill();
+            }
+        }
+
+        fn wait_until(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
+            let t0 = Instant::now();
+            while !done() {
+                assert!(t0.elapsed() < timeout, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        #[test]
+        #[ignore = "needs a running PipeWire daemon (see module docs)"]
+        fn live_capture_reconnects_after_a_daemon_restart_and_reports_a_lost_daemon() {
+            let _serial = serial();
+            let mut daemon = PrivateDaemon::start("hfa-test-reconnect");
+            let policy = ReconnectPolicy {
+                first: Duration::from_millis(50),
+                max: Duration::from_millis(200),
+                window: Duration::from_secs(2),
+            };
+            let mut source = PipeWireCapture::open_with(
+                Mode::Linked(NodeFilter::AllExcept(std::process::id())),
+                "reconnect test".into(),
+                Some(daemon.name.into()),
+                policy,
+            )
+            .expect("open");
+            source.start(pcm_ring(1024).0).expect("start");
+            wait_until("the capture node", Duration::from_secs(3), || {
+                daemon.has_capture_node()
+            });
+
+            // The daemon restarts: the capture comes back by itself and reports no error.
+            daemon.kill();
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(source.error(), None, "reconnecting is not an error");
+            daemon.restart();
+            wait_until(
+                "the reconnected capture node",
+                Duration::from_secs(3),
+                || daemon.has_capture_node(),
+            );
+            assert_eq!(source.error(), None);
+
+            // The daemon stays away: after the reconnect window the capture reports it.
+            daemon.kill();
+            wait_until("the capture error", Duration::from_secs(5), || {
+                source.error().is_some()
+            });
+            assert!(source.error().is_some_and(|e| e.contains("PipeWire")));
+            source.stop();
+        }
+
+        #[test]
+        #[ignore = "needs a running PipeWire daemon (see module docs)"]
+        fn live_a_linked_capture_that_stops_being_run_recovers() {
+            let _serial = serial();
+            let wanted = Player::start(440.0);
+            std::thread::sleep(Duration::from_millis(500));
+            let mut source = open_process(wanted.pid()).expect("open process");
+            let (sink, mut ring) = pcm_ring(RATE as usize * 2 * 10);
+            source.start(sink).expect("start");
+            std::thread::sleep(Duration::from_millis(1000));
+            assert!(tone_amplitude(&left_tail(&drain(&mut ring)), 440.0) > 0.1);
+
+            // Pause our node from outside while its links stay: the graph no longer runs it
+            // although the linked player plays (like a node left suspended).
+            let own_nodes: Vec<u32> = pw_objects("Node")
+                .into_iter()
+                .filter(|(_, p)| p.get("node.name").map(String::as_str) == Some(APP_NAME))
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(own_nodes.len(), 1, "{own_nodes:?}");
+            let status = Process::new("pw-cli")
+                .args(["send-command", &own_nodes[0].to_string(), "Pause", "{}"])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("pw-cli send-command");
+            assert!(status.success());
+            std::thread::sleep(Duration::from_millis(1000));
+            let stalled = drain(&mut ring).len() / 2;
+            assert!(
+                stalled < RATE as usize / 2,
+                "the pause did not stall: {stalled} frames"
+            );
+
+            // Relinked, then recreated: the audio comes back without anyone calling `start`.
+            std::thread::sleep(Duration::from_millis(3000));
+            let after = drain(&mut ring);
+            source.stop();
+            assert!(
+                after.len() / 2 > RATE as usize / 2,
+                "{} frames",
+                after.len() / 2
+            );
+            let a440 = tone_amplitude(&left_tail(&after), 440.0);
+            assert!(a440 > 0.1, "stalled capture did not recover: {a440}");
+            assert_eq!(source.error(), None);
         }
     }
 }
