@@ -67,7 +67,8 @@ enum HfaShared {
 /// decodes the file and replaces `data_dir` with the directory it computes itself
 /// (`forSender(fileData:dataDir:)`) before passing the JSON to Rust.
 struct BroadcastConfig: Codable, Equatable {
-  /// Hub host name or address; empty = find `hubDeviceId` over mDNS.
+  /// Hub host name or address. Required: the app refuses an empty one (`writeBroadcastConfig`),
+  /// since mDNS discovery needs the restricted multicast entitlement on iOS.
   var hubHost: String
   /// Hub UDP/TCP port; 0 = the port in the shared settings.
   var hubPort: Int

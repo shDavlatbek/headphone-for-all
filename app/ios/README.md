@@ -25,9 +25,9 @@ broadcast upload extension streams what the phone plays).
 
 | Method | Behaviour |
 |---|---|
-| `getDataDir` | `<App Group group.io.github.shdavlatbek.hfa>/hfa` (created); fallback Application Support `/hfa` when the App Group is missing (unsigned build: the extension then cannot share the pairing) |
+| `getDataDir` | `<App Group>/hfa` (created). Without the App Group (a build not signed with the App Groups capability) `FlutterError("NO_APP_GROUP")`, which the app shows as a start-up error: a private directory would hide the pairings from the extension. Only Simulator builds fall back to Application Support `/hfa` |
 | `startHubService` / `stopHubService` | `AVAudioSession` category `.playback` with `.mixWithOthers`, `setActive(true)` / `setActive(false, .notifyOthersOnDeactivation)`; errors → `FlutterError("AUDIO_SESSION")` |
-| `writeBroadcastConfig` | `{hubHost, hubPort, hubDeviceId?, hubKey?, label}` → `<container>/broadcast_config.json` with the C ABI keys plus `data_dir` (`FlutterError("NO_APP_GROUP")` without the App Group) |
+| `writeBroadcastConfig` | `{hubHost, hubPort, hubDeviceId?, hubKey?, label}` → `<container>/broadcast_config.json` with the C ABI keys plus `data_dir`. `hubHost` is required (`BAD_ARGS`: the extension cannot look for hubs, see Known limitations); `FlutterError("NO_APP_GROUP")` without the App Group |
 | `captureSupport` | `{supported: true, reason: "broadcast"}` |
 | `startSystemCapture` | `false` (the user starts the broadcast with the picker) |
 | `stopSystemCapture`, `acquireMulticastLock`, `releaseMulticastLock` | no-op |

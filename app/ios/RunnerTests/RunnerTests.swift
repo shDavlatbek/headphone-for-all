@@ -1,5 +1,6 @@
 // RunnerTests.swift - unit tests of the iOS native code that can run without a device:
-// the App Group file formats (HfaShared.swift, compiled into Runner) and the ReplayKit PCM
+// the data directory policy of the platform channel, the App Group file formats
+// (HfaShared.swift, compiled into Runner) and the ReplayKit PCM
 // conversion of the broadcast extension (PcmInterleaver.swift is compiled into this test target
 // too, since an app extension cannot be a test host).
 //
@@ -8,9 +9,54 @@
 
 import AudioToolbox
 import CoreMedia
+import Flutter
 import XCTest
 
 @testable import Runner
+
+final class DataDirTests: XCTestCase {
+  private struct Failure: Error {}
+
+  func testUsesTheAppGroupDirectory() {
+    let dir = URL(fileURLWithPath: "/private/var/group/hfa")
+    let result = HfaPlatformChannel.resolveDataDir(
+      shared: { dir },
+      privateFallback: {
+        XCTFail("the fallback must not be used when the App Group exists")
+        return dir
+      })
+    XCTAssertEqual(result as? String, dir.path)
+  }
+
+  /// A device build without the App Group must not start on a private directory (the broadcast
+  /// extension could not see its pairings): the Dart bootstrap turns this into a start-up error.
+  func testMissingAppGroupIsAnError() {
+    let result = HfaPlatformChannel.resolveDataDir(shared: { nil }, privateFallback: nil)
+    let error = result as? FlutterError
+    XCTAssertEqual(error?.code, "NO_APP_GROUP")
+    XCTAssertEqual(error?.message, HfaPlatformChannel.noAppGroupMessage)
+    XCTAssertTrue(HfaPlatformChannel.noAppGroupMessage.contains(HfaShared.appGroupId))
+  }
+
+  func testPrivateFallbackWhenAllowed() {
+    let result = HfaPlatformChannel.resolveDataDir(
+      shared: { nil }, privateFallback: { URL(fileURLWithPath: "/support/hfa") })
+    XCTAssertEqual(result as? String, "/support/hfa")
+  }
+
+  func testIoFailureIsDataDirError() {
+    let result = HfaPlatformChannel.resolveDataDir(shared: { throw Failure() }, privateFallback: nil)
+    XCTAssertEqual((result as? FlutterError)?.code, "DATA_DIR")
+  }
+
+  func testPrivateFallbackOnlyInTheSimulator() {
+    #if targetEnvironment(simulator)
+      XCTAssertTrue(HfaPlatformChannel.allowsPrivateDataDir)
+    #else
+      XCTAssertFalse(HfaPlatformChannel.allowsPrivateDataDir)
+    #endif
+  }
+}
 
 final class BroadcastConfigTests: XCTestCase {
   func testEncodesTheRustConfigKeysWithNulls() throws {

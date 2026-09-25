@@ -1558,6 +1558,20 @@ the Swift side logs failures with `os.Logger`. (3) `mdns-sd` on iOS needs the re
 `com.apple.developer.networking.multicast` entitlement, so iOS should pass an explicit `hubHost` (and a
 native `NWBrowser` discovery remains to be done, ARCHITECTURE.md).
 
+### 8.9.1 Refinements made by `fix/apple` (the code in `app/ios` and `app/macos` is authoritative; overrides §8.3 and §8.9 where they differ)
+
+**iOS `getDataDir` is strict.** `<App Group container>/hfa` as before, but without the App Group (a device build
+not signed with the App Groups capability) the answer is `FlutterError("NO_APP_GROUP", <what to sign and how>)`
+instead of a private Application Support directory, so the Dart bootstrap's strict iOS rule (§8.7) shows the
+start-up error. Only Simulator builds (`targetEnvironment(simulator)`) keep the Application Support `/hfa` fallback.
+`DATA_DIR` stays the I/O error. The policy is `HfaPlatformChannel.resolveDataDir(shared:privateFallback:)`
+(RunnerTests `DataDirTests`).
+
+**`writeBroadcastConfig` requires `hubHost`** (`BAD_ARGS` "The hub's address is unknown ... Add the hub by address
+or scan its QR code."): the extension cannot discover a hub by id (mDNS needs the restricted multicast
+entitlement), so a host-less configuration could only fail after the broadcast started. `hubDeviceId` stays
+optional. `writeBroadcastConfig`'s `NO_APP_GROUP` uses the same message as `getDataDir`.
+
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 
 **Windows runner** (`app/windows/runner/`; names in `app_identity.h`, shared with `packaging/windows/hfa.iss`).

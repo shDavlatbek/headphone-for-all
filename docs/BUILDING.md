@@ -313,8 +313,9 @@ git status                             # commit everything it changed
   `group.io.github.shdavlatbek.hfa`. To install on a device: give both App IDs
   (`io.github.shdavlatbek.hfa`, `io.github.shdavlatbek.hfa.broadcast`) the App Groups capability with
   that group, select your team for **both** targets in `app/ios/Runner.xcworkspace`, then
-  `flutter run --release` or `flutter build ipa`. Without the App Group (unsigned builds) the app falls
-  back to its own container and the extension cannot use the app's pairing.
+  `flutter run --release` or `flutter build ipa`. A device build without the App Group stops at start-up
+  with an error (`NO_APP_GROUP`): a private container would hide the pairings from the extension. Only
+  Simulator builds fall back to the app's own container.
 - ReplayKit broadcasts do not run in the Simulator; audio from DRM-protected apps is silent. The
   extension must stay under ~50 MB of memory.
 - The Xcode project is edited only by the committed Ruby scripts in `app/ios/scripts/`

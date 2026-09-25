@@ -11,7 +11,7 @@ import os
 ///
 /// | Method | iOS behaviour |
 /// |---|---|
-/// | `getDataDir` | `<App Group container>/hfa` (fallback: Application Support `/hfa`) |
+/// | `getDataDir` | `<App Group container>/hfa`; `NO_APP_GROUP` without the App Group (Simulator: Application Support `/hfa`) |
 /// | `startHubService` / `stopHubService` | `AVAudioSession` `.playback` + `.mixWithOthers`, (de)activated |
 /// | `writeBroadcastConfig` | writes `broadcast_config.json` into the App Group container |
 /// | `captureSupport` | `{supported: true, reason: "broadcast"}` |
@@ -23,7 +23,8 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   /// Name of the event channel.
   static let eventChannelName = "hfa/platform/events"
 
-  private static let log = Logger(subsystem: "io.github.shdavlatbek.hfa", category: "platform")
+  private static let log = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "headphone-for-all", category: "platform")
 
   private let methodChannel: FlutterMethodChannel
   private let eventChannel: FlutterEventChannel
@@ -78,26 +79,68 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     }
   }
 
-  /// `<App Group container>/hfa`, or Application Support `/hfa` when the App Group is not
-  /// available (the broadcast extension then cannot share the pairing).
+  /// `<App Group container>/hfa` (see `resolveDataDir(shared:privateFallback:)`).
   private func dataDirResult() -> Any {
+    let fallback: (() throws -> URL)? = Self.allowsPrivateDataDir ? Self.privateDataDir : nil
+    return Self.resolveDataDir(shared: HfaShared.sharedDataDir, privateFallback: fallback)
+  }
+
+  /// Message of the `NO_APP_GROUP` errors (shown by the app's start-up error screen).
+  static var noAppGroupMessage: String {
+    "The App Group \(HfaShared.appGroupId) is not available, so the broadcast extension could not "
+      + "use this app's pairings. Sign the Runner and HfaBroadcast targets with a team whose App IDs "
+      + "have this App Group (set HFA_BUNDLE_ID in ios/Identity.xcconfig for your own team)."
+  }
+
+  /// Whether a build without the App Group may keep its data in the app's own container. Only
+  /// the Simulator, where builds are usually unsigned (and ReplayKit broadcasts do not run).
+  static var allowsPrivateDataDir: Bool {
+    #if targetEnvironment(simulator)
+      return true
+    #else
+      return false
+    #endif
+  }
+
+  /// The data directory answer of `getDataDir`: the path from `shared` (the App Group's `hfa`
+  /// directory), else the path from `privateFallback`, else `FlutterError("NO_APP_GROUP")`.
+  ///
+  /// Without the App Group a device build must not start on a private directory: identity and
+  /// pairings stored there are invisible to the broadcast extension, so every broadcast would
+  /// fail later. The error makes the Dart bootstrap show its start-up error instead
+  /// (docs/CONTRACTS.md §8.7: on iOS a `PlatformException` from `getDataDir` is fatal).
+  /// I/O failures → `FlutterError("DATA_DIR")`.
+  static func resolveDataDir(shared: () throws -> URL?, privateFallback: (() throws -> URL)?)
+    -> Any
+  {
     do {
-      if let shared = try HfaShared.sharedDataDir() {
-        return shared.path
+      if let dir = try shared() {
+        return dir.path
       }
-      Self.log.warning(
-        "App Group \(HfaShared.appGroupId, privacy: .public) unavailable; using Application Support (the broadcast extension cannot share the pairing)"
+      guard let privateFallback else {
+        log.error(
+          "App Group \(HfaShared.appGroupId, privacy: .public) unavailable: check the signing and entitlements"
+        )
+        return FlutterError(code: "NO_APP_GROUP", message: noAppGroupMessage, details: nil)
+      }
+      log.warning(
+        "App Group \(HfaShared.appGroupId, privacy: .public) unavailable; using Application Support (Simulator)"
       )
-      let support = try FileManager.default.url(
-        for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-      let dir = support.appendingPathComponent(HfaShared.dataDirName, isDirectory: true)
-      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-      return dir.path
+      return try privateFallback().path
     } catch {
       return FlutterError(
         code: "DATA_DIR", message: "cannot create the data directory: \(error.localizedDescription)",
         details: nil)
     }
+  }
+
+  /// Application Support `/hfa`, created if needed (Simulator builds without the App Group).
+  private static func privateDataDir() throws -> URL {
+    let support = try FileManager.default.url(
+      for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+    let dir = support.appendingPathComponent(HfaShared.dataDirName, isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
   }
 
   /// Hub mode: a `.playback` session that mixes with other apps keeps the hub playing in the
@@ -134,9 +177,14 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     guard (0...65_535).contains(hubPort) else {
       return FlutterError(code: "BAD_ARGS", message: "hubPort out of range: \(hubPort)", details: nil)
     }
-    guard !hubHost.isEmpty || hubDeviceId != nil else {
+    // The extension cannot look for the hub: mDNS needs the restricted multicast entitlement
+    // on iOS, so a configuration without an address could only fail after the broadcast started.
+    guard !hubHost.isEmpty else {
       return FlutterError(
-        code: "BAD_ARGS", message: "hubHost or hubDeviceId is required", details: nil)
+        code: "BAD_ARGS",
+        message:
+          "The hub's address is unknown, and this device cannot look for hubs on the network. Add the hub by address or scan its QR code.",
+        details: nil)
     }
     let dataDir: URL
     let configURL: URL
@@ -146,7 +194,7 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
       else {
         return FlutterError(
           code: "NO_APP_GROUP",
-          message: "the App Group \(HfaShared.appGroupId) is not available (check the entitlements and signing)",
+          message: Self.noAppGroupMessage,
           details: nil)
       }
       dataDir = dir
