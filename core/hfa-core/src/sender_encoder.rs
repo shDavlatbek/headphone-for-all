@@ -90,7 +90,8 @@ pub(crate) enum EncoderEvent {
 pub(crate) struct EncoderShared {
     /// Set to stop the thread.
     pub stop: AtomicBool,
-    /// RMS level of the last captured frame, dBFS (`f32` bits).
+    /// RMS level of the last captured frame, dBFS (`f32` bits); silence while the capture
+    /// delivers nothing.
     level_db: AtomicU32,
     /// Audio datagrams sent (all streams).
     pub packets_sent: AtomicU64,
@@ -433,9 +434,16 @@ impl EncoderThread {
         }
     }
 
-    /// Enters DTX when the capture stalled, and sends due keep-alives.
+    /// Enters DTX when the capture stalled, and sends due keep-alives. A stalled capture
+    /// also sets the level to silence (with or without a stream), so the meter does not
+    /// freeze at the last captured frame.
     fn dtx_housekeeping(&mut self, now: Instant) {
         let stalled = now.saturating_duration_since(self.last_input) > DTX_AFTER;
+        if stalled {
+            self.shared
+                .level_db
+                .store(hfa_audio::meter::SILENCE_DB.to_bits(), Ordering::Relaxed);
+        }
         let Some(st) = self.stream.as_mut() else {
             return;
         };
@@ -604,5 +612,51 @@ mod tests {
             prev_primary = Some(p.primary.to_vec());
         }
         assert!(checked >= 50, "{checked} redundant packets checked");
+    }
+
+    /// A capture that stops delivering (WASAPI loopback while nothing plays) reads as
+    /// silence on the meter, instead of freezing at the last captured level.
+    #[test]
+    fn a_stalled_capture_meters_as_silence() {
+        let input = AudioFormat::INTERNAL;
+        let (mut sink, source) = hfa_capture::pcm_ring_with_channels(48_000, 2);
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (ev_tx, _ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(EncoderShared::new());
+        let mut worker = EncoderThread::new(
+            source,
+            input,
+            EncoderParams {
+                frame_ms: 10,
+                fec: false,
+            },
+            Arc::clone(&shared),
+            cmd_rx,
+            ev_tx,
+        )
+        .expect("worker");
+        let mut tone = SineGenerator::new(440.0, 0.25, input);
+        let mut block = vec![0.0f32; 960];
+        for _ in 0..5 {
+            tone.fill(&mut block);
+            sink.push(&block);
+            worker.step();
+        }
+        let playing = shared.level_db();
+        assert!((-20.0..-6.0).contains(&playing), "tone level {playing}");
+
+        // Nothing arrives any more: shortly after the stall the level is still the tone's...
+        assert!(!worker.step());
+        worker.dtx_housekeeping(worker.last_input + DTX_AFTER / 2);
+        assert_eq!(shared.level_db(), playing);
+        // ...and once the stall counts as silence (the DTX delay), the meter shows silence.
+        worker.dtx_housekeeping(worker.last_input + DTX_AFTER * 2);
+        assert_eq!(shared.level_db(), hfa_audio::meter::SILENCE_DB);
+
+        // Audio again: the meter follows at once.
+        tone.fill(&mut block);
+        sink.push(&block);
+        worker.step();
+        assert!(shared.level_db() > -20.0);
     }
 }
