@@ -24,10 +24,20 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Headphone for All sends what this Mac plays to your headphone hub, so you hear it in your headphones together with your other devices.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_hfa._tcp</string>
+	</array>
 	<key>NSHumanReadableCopyright</key>
 	<string>$(PRODUCT_COPYRIGHT)</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Headphone for All finds the headphone hub on your network and streams audio to it (or receives audio when this Mac is the hub).</string>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Headphone for All never records your microphone. macOS may ask because capturing this Mac's audio uses an audio input device.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>
