@@ -928,6 +928,12 @@ Modules:
   works, or an outage) is reported as **`hub::NO_MEDIA_LOSS_PCT` (100 %)** instead of 0 %. After
   `NO_MEDIA_REPORTS = 3` such reports in a row the sender emits `SenderEvent::Error("the hub receives no audio from
   this device (is UDP port N blocked by a firewall …?)")` (once per stream); `SenderStatus.loss_pct` shows 100.
+- **Mixer output pacing.** The underrun-driven `extra` fill **now shrinks**: after `EXTRA_FILL_DECAY_AFTER = 30`
+  refreshes (30 s) in a row without an output underrun it drops by `EXTRA_FILL_DECAY_MS = 5` ms (down to 0), and it
+  is reset to 0 whenever the output is (re)opened (`configure`). An output that is up but has not taken audio for
+  `OUTPUT_STALL = 300 ms` without reporting `has_error()` (a suspended device) is treated like a stopped one: the
+  streams are consumed at wall-clock pace and the mix is discarded until it pulls again, so the jitter buffers do
+  not overflow.
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

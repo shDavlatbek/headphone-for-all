@@ -25,7 +25,9 @@
 //! The thread is paced by the output ring: while the ring holds less than the target
 //! (`2 × MIX_FRAME_MS` + the output's latency, at most [`MAX_PACING_LATENCY_MS`] of it, +
 //! an extra fill that grows by [`UNDERRUN_STEP_MS`] whenever the output ran dry, up to
-//! [`MAX_EXTRA_FILL_MS`]) it produces one tick, otherwise it sleeps a quarter tick. The
+//! [`MAX_EXTRA_FILL_MS`]; it shrinks again by [`EXTRA_FILL_DECAY_MS`] after every
+//! [`EXTRA_FILL_DECAY_AFTER`] seconds without an underrun and is dropped when the output is
+//! reopened) it produces one tick, otherwise it sleeps a quarter tick. The
 //! output's latency and the ring's underrun counter are re-read every [`OUTPUT_REFRESH`]:
 //! a real device only measures its latency once it runs, and a device period larger than
 //! the target shows up as underruns. The published latency after the mixer is the ring
@@ -36,7 +38,9 @@
 //! restart is reported once per outage) — unless it is not
 //! [restartable](AudioOutput::restartable) (a WAV file would be truncated), then it stays
 //! stopped; meanwhile the mixer keeps consuming the jitter buffers at wall-clock pace and
-//! discards the mix.
+//! discards the mix. It does the same while an output that is up has not pulled any audio for
+//! [`OUTPUT_STALL`] (a device that stops without reporting an error), so the jitter buffers do
+//! not overflow.
 //!
 //! After warm-up a tick does not allocate (buffers are preallocated; the input list is a
 //! fixed array); packet payloads are freed here after decoding and a copy of the next packet
@@ -82,6 +86,16 @@ const MAX_PACING_LATENCY_MS: f32 = 40.0;
 const UNDERRUN_STEP_MS: f32 = 10.0;
 /// Most extra ring fill.
 const MAX_EXTRA_FILL_MS: f32 = 200.0;
+/// Extra ring fill given back after [`EXTRA_FILL_DECAY_AFTER`] without an underrun.
+const EXTRA_FILL_DECAY_MS: f32 = 5.0;
+/// Refreshes ([`OUTPUT_REFRESH`] apart) without an output underrun before the extra fill
+/// shrinks by [`EXTRA_FILL_DECAY_MS`] (30 s).
+const EXTRA_FILL_DECAY_AFTER: u32 = 30;
+/// An output that is up but has not pulled audio for this long (without reporting an error:
+/// e.g. a suspended device) is treated like a stopped one: the mixer consumes the streams at
+/// wall-clock pace and discards the mix, so the jitter buffers do not overflow. Longer than
+/// any fill target (at most 260 ms), so a device with a large period is never mistaken for it.
+pub(crate) const OUTPUT_STALL: Duration = Duration::from_millis(300);
 /// How often the output's latency and the ring's underruns are re-read.
 pub(crate) const OUTPUT_REFRESH: Duration = Duration::from_secs(1);
 /// Pause between two attempts to restart a failed output.
@@ -382,8 +396,10 @@ struct OutputStage {
     /// Underrun count at the last refresh (`None` right after a (re)start: start-up
     /// underruns before the first tick do not count).
     seen_underruns: Option<u64>,
-    /// Extra fill target after output underruns (ms, only grows).
+    /// Extra fill target after output underruns (ms; grows fast, decays slowly).
     extra_ms: f32,
+    /// Refreshes in a row without an underrun (see [`EXTRA_FILL_DECAY_AFTER`]).
+    quiet_refreshes: u32,
     format: AudioFormat,
     mapped: Vec<f32>,
     resampler: Option<StreamResampler>,
@@ -416,6 +432,7 @@ impl OutputStage {
             underruns,
             seen_underruns: None,
             extra_ms: 0.0,
+            quiet_refreshes: 0,
             mapped: Vec::new(),
             resampler: None,
             converted: Vec::new(),
@@ -428,9 +445,13 @@ impl OutputStage {
         stage
     }
 
-    /// (Re)builds the converter and the fill target for the output's current format.
+    /// (Re)builds the converter and the fill target for the output's current format. The
+    /// extra fill learnt from the previous device's underruns is dropped (a reopened output
+    /// may be another device with another period).
     fn configure(&mut self) {
         self.seen_underruns = None;
+        self.extra_ms = 0.0;
+        self.quiet_refreshes = 0;
         self.format = self.output.format();
         let rate = self.format.sample_rate.max(1);
         let ch = usize::from(self.format.channels.max(1));
@@ -474,8 +495,10 @@ impl OutputStage {
 
     /// Periodic refresh (every [`OUTPUT_REFRESH`]): an output that ran dry since the last
     /// refresh (its period is larger than the fill target, or the thread was descheduled)
-    /// gets [`UNDERRUN_STEP_MS`] more fill, up to [`MAX_EXTRA_FILL_MS`]; then the target
-    /// follows the output's current latency.
+    /// gets [`UNDERRUN_STEP_MS`] more fill, up to [`MAX_EXTRA_FILL_MS`]; after
+    /// [`EXTRA_FILL_DECAY_AFTER`] refreshes in a row without one it gets
+    /// [`EXTRA_FILL_DECAY_MS`] less (a one-off hiccup does not add latency for good); then
+    /// the target follows the output's current latency.
     fn refresh(&mut self) {
         if self.sink.is_none() {
             return;
@@ -483,6 +506,13 @@ impl OutputStage {
         let count = self.underruns.count();
         if self.seen_underruns.is_some_and(|seen| count > seen) {
             self.extra_ms = (self.extra_ms + UNDERRUN_STEP_MS).min(MAX_EXTRA_FILL_MS);
+            self.quiet_refreshes = 0;
+        } else if self.seen_underruns.is_some() {
+            self.quiet_refreshes += 1;
+            if self.quiet_refreshes >= EXTRA_FILL_DECAY_AFTER {
+                self.quiet_refreshes = 0;
+                self.extra_ms = (self.extra_ms - EXTRA_FILL_DECAY_MS).max(0.0);
+            }
         }
         self.seen_underruns = Some(count);
         self.update_target();
@@ -620,6 +650,9 @@ impl MixerThread {
         let nap = tick / 4;
         let mut wall_next = Instant::now();
         let mut next_refresh = wall_next + OUTPUT_REFRESH;
+        // Last time the output took audio (a tick was produced for it).
+        let mut last_pull = wall_next;
+        let mut stalled = false;
         while !self.stop.load(Ordering::Acquire) {
             self.handle_commands();
             let now = Instant::now();
@@ -628,6 +661,7 @@ impl MixerThread {
                 self.output.refresh();
                 next_refresh = now + OUTPUT_REFRESH;
             }
+            let mut discard = !self.output.is_up();
             if self.output.is_up() {
                 let mut ticks = 0;
                 while self.output.needs_audio() && ticks < MAX_TICKS_PER_WAKE {
@@ -636,9 +670,30 @@ impl MixerThread {
                     output.write(mix);
                     ticks += 1;
                 }
-                wall_next = now + tick;
-            } else if now >= wall_next {
-                // No output: keep the streams flowing at wall-clock pace, discard the mix.
+                if ticks > 0 {
+                    last_pull = now;
+                    if stalled {
+                        stalled = false;
+                        tracing::info!("the audio output takes audio again");
+                    }
+                }
+                if now.saturating_duration_since(last_pull) < OUTPUT_STALL {
+                    wall_next = now + tick;
+                } else {
+                    if !stalled {
+                        stalled = true;
+                        tracing::warn!(
+                            "the audio output has not taken audio for {} ms; consuming the \
+                             streams without it",
+                            OUTPUT_STALL.as_millis()
+                        );
+                    }
+                    discard = true;
+                }
+            }
+            if discard && now >= wall_next {
+                // No (or a stalled) output: keep the streams flowing at wall-clock pace,
+                // discard the mix.
                 self.tick();
                 wall_next += tick;
                 if wall_next + tick * 10 < now {
@@ -1166,6 +1221,102 @@ mod tests {
         }
         let max_ms = 2.0 * MIX_FRAME_MS as f32 + MAX_PACING_LATENCY_MS + MAX_EXTRA_FILL_MS;
         assert_eq!(stage.target_frames, 48 * max_ms as usize);
+    }
+
+    /// The extra fill added after an underrun is given back slowly once the output runs
+    /// cleanly, and dropped when the output is reopened.
+    #[test]
+    fn the_extra_fill_decays_and_is_dropped_on_reopen() {
+        let (mut stage, fake) = fake_stage(AudioFormat::INTERNAL);
+        let base = stage.target_frames;
+        let underrun = |fake: &Fake| {
+            let mut guard = fake.source.lock();
+            let src = guard.as_mut().expect("started");
+            let mut buf = vec![0.0; 48_000];
+            src.pull(&mut buf);
+        };
+        stage.refresh();
+        for _ in 0..3 {
+            underrun(&fake);
+            stage.refresh();
+        }
+        assert_eq!(stage.target_frames, base + 48 * 30, "3 steps of 10 ms");
+        // 29 s without an underrun: nothing yet; at 30 s: 5 ms less.
+        for _ in 0..(EXTRA_FILL_DECAY_AFTER - 1) {
+            stage.refresh();
+        }
+        assert_eq!(stage.target_frames, base + 48 * 30);
+        stage.refresh();
+        assert_eq!(stage.target_frames, base + 48 * 25);
+        // An underrun restarts the count (and adds a step).
+        underrun(&fake);
+        stage.refresh();
+        assert_eq!(stage.target_frames, base + 48 * 35);
+        // Down to nothing, never below.
+        for _ in 0..(EXTRA_FILL_DECAY_AFTER * 10) {
+            stage.refresh();
+        }
+        assert_eq!(stage.target_frames, base);
+        // Reopening the output forgets what the previous device needed.
+        underrun(&fake);
+        stage.refresh();
+        assert!(stage.target_frames > base);
+        let (events, _rx) = broadcast::channel(8);
+        fake.error.store(true, Ordering::Relaxed);
+        let t0 = Instant::now();
+        stage.check_health(t0, &events);
+        stage.check_health(t0 + OUTPUT_RETRY, &events);
+        assert!(stage.is_up());
+        assert_eq!(stage.target_frames, base);
+    }
+
+    /// An output that is up but stops taking audio without reporting an error: the streams
+    /// are still consumed at wall-clock pace, so their jitter buffers never overflow.
+    #[test]
+    fn a_stalled_output_does_not_overflow_the_jitter_buffers() {
+        let (stage, fake) = fake_stage(AudioFormat::INTERNAL);
+        // Hand the stage's parts to a real mixer thread (the fake never pulls).
+        let OutputStage {
+            output,
+            sink,
+            underruns,
+            latency_ms,
+            ..
+        } = stage;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (events, _) = broadcast::channel(8);
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn(
+            output,
+            sink.expect("up"),
+            underruns,
+            rx,
+            events,
+            Arc::clone(&stop),
+            latency_ms,
+        )
+        .expect("spawn");
+        let (shared, mix) = stream(10);
+        tx.send(MixerCommand::Add(mix)).expect("add");
+        let pkts = packets(150, false);
+        let t0 = Instant::now();
+        for (seq, p) in pkts.iter().enumerate() {
+            shared.state.lock().on_datagram(
+                &header(0, seq as u32),
+                p.clone(),
+                t0.elapsed().as_micros() as u64,
+                Instant::now(),
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Release);
+        handle.join().expect("join");
+        assert!(fake.source.lock().is_none(), "stopped");
+        let st = shared.state.lock();
+        let jb = st.jb.stats();
+        assert_eq!(jb.overflowed, 0, "{jb:?}");
+        assert!(st.jb.buffered_ms() < 200.0, "{}", st.jb.buffered_ms());
+        assert!(st.mix.played > 80, "{:?}", st.mix);
     }
 
     #[test]
