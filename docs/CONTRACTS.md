@@ -217,6 +217,61 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
 - `wav`: `WavWriter::{create(&Path, AudioFormat) -> Result<Self>, write(&[f32]) -> Result<()>, finalize(self) -> Result<()>}`,
   `read_wav(&Path) -> Result<(AudioFormat, Vec<f32>)>` (32-bit float files written; int/float read).
 
+### 4.2 Refinements made by `feat/audio` (the code and module docs in `core/hfa-audio` are authoritative)
+
+- `opus`: `frame_ms` must be one of 5, 10, 20, 40, 60 (2.5 ms is valid for libopus but not expressible in the
+  integer field). Encoder: VBR, `ENCODER_COMPLEXITY` (10 on desktop, 7 on Android/iOS), `OPUS_SET_INBAND_FEC(1)` +
+  `OPUS_SET_PACKET_LOSS_PERC(expected_loss_pct)` when `fec` (loss 0 otherwise). libopus only carries in-band FEC in
+  SILK/hybrid packets; at music bitrates it stays in CELT until the expected loss is high (≈ 8 % for music), and
+  `decode_fec` on a CELT packet falls back to PLC — it always returns the requested frame count. **New**
+  `OpusEncoder::lookahead(&mut self) -> Result<usize>` (codec delay in samples per channel, 312 at 48 kHz).
+  `decode(&[])` is an `Opus{OPUS_BAD_ARG}` error (use `conceal`). `decode_fec`/`conceal` need `out.len()/channels`
+  to be a non-zero multiple of 2.5 ms (`BufferSize` otherwise). `set_bitrate`/`set_expected_loss` reject out-of-range
+  values with `Opus{OPUS_BAD_ARG}` and leave `config()` unchanged. Encoder and decoder implement `Debug`.
+- `jitter` (full semantics in the module docs):
+  - **`PushResult::Overflow` now drops the *oldest* buffered slots** (the new packet is stored) when the buffer holds
+    `capacity` packets or the packet would widen the window past `capacity` sequence numbers (a jump ahead);
+    leading gaps are then skipped. (Before the first pop, a packet more than `capacity` behind is itself dropped.)
+  - Before the first pop, packets older than the first buffered one are accepted (start-up reordering). After that,
+    anything at or before the last played/skipped `seq` is `TooLate`.
+  - When priming completes (buffered ≥ target), leading never-received slots are skipped, so playout (and re-priming
+    after an `Underrun`) starts on a real packet instead of a run of `Missing`.
+  - `JitterStats.lost` counts `Missing` frames plus slots skipped at priming or dropped by an overflow.
+  - Target: rises immediately to `frame_ms + 3·J`, decays with time constant `TARGET_DECAY_MS = 8000` ms of pushed
+    audio, clamped to `min..=max` and to `capacity · frame_ms`. Duplicates do not update `J`; late packets do.
+  - `reset()` keeps the statistics **and the jitter estimate / target** (they describe the network).
+- `drift`: **defaults are now `kp = 5e-5`, `ki = 1e-6`** (`max_ppm = 2000`): `ωn ≈ 0.032 rad/s`, `ζ ≈ 0.8`. The
+  error is low-pass filtered (`MEASUREMENT_TAU_S = 2.0` s) before the PI law; anti-windup clamps the integral term to
+  `±max_ppm` and freezes the integrator while saturated. Non-finite input or `dt_s <= 0` leaves the state untouched.
+  **New** `ppm()` (ratio deviation in ppm). Ratio convention (also in `resample`): ratio = output frames per input
+  frame multiplier; buffer too full → ratio < 1 → the consumer drains its input faster.
+- `resample`: `rubato::Async` sinc (128 taps, Blackman-Harris², cubic), **fixed input chunk** of `chunk_frames`
+  (output appears once a whole chunk is buffered: feed one 10 ms frame per call with `chunk_frames` = that frame for
+  zero staging latency). Relative ratio range `1/MAX_RELATIVE_RATIO..=MAX_RELATIVE_RATIO` (`MAX_RELATIVE_RATIO =
+  1.05`); ratio changes are ramped over one chunk. `reset()` keeps the relative ratio. **New** getters
+  `ratio_relative()`, `pending_frames()`, `output_delay()` (filter delay in output frames). Verified no allocation in
+  `process` after warm-up when `out` has capacity (`tests/no_alloc.rs`).
+- `mixer`: new sources fade in from silence over their first block. With `limiter: false` the output is hard-clamped
+  to [-1, 1] (never exceeds full scale either way; NaN/inf inputs become 0). The limiter is a stereo-linked peak
+  limiter (instant attack, `LIMITER_RELEASE_MS = 80`, `LIMITER_THRESHOLD = 0.966`). The ducking detector uses the
+  post-gain RMS of unmuted priority sources in the current block. `levels()` are after gain, mute and ducking. Inputs
+  for unknown ids are ignored; short inputs are padded with silence. **New** `duck_gain()`, `source_ids()`,
+  `MAX_GAIN = 4.0`.
+- `meter`: `amplitude_to_db(0 | NaN) = SILENCE_DB`, `amplitude_to_db(inf) = f32::MAX` (always finite);
+  `db_to_amplitude(<= SILENCE_DB) = 0`.
+- `convert`: `f32_to_i16` scales by 32768 with rounding and saturation (exact inverse of `i16_to_f32`; NaN → 0).
+  `to_stereo` fold-down for n > 2: `L = (c0 + w·Σc[2..]) / (1 + w·(n−2))`, same for R with c1, `w = 1/√2`.
+- `wav`: `read_wav` also accepts 8-bit and 32-bit integer files.
+- Workspace (`core/Cargo.toml`, scaffold-owned): `[profile.dev.package.rubato] opt-level = 3` so debug builds/tests
+  (the 10-minute drift simulation) run the sinc resampler at full speed.
+- **Hub per-stream recipe** (for `feat/core-engine`; exercised by `core/hfa-audio/tests/drift_sim.rs`): on receive,
+  `jb.push(seq, timestamp, arrival_us, payload)`. Each mixer tick, while the stream's output FIFO holds less than one
+  frame: `match jb.pop()` — `Packet(p)` → `dec.decode(&p)`; `Missing{next: Some(n)}` → `dec.decode_fec(&n)` (the next
+  pop returns `n` itself, decoded normally); `Missing{next: None}` → `dec.conceal()`; then `rs.process(pcm, &mut
+  fifo)`; `Underrun` → contribute silence this tick (stop popping). Take one frame from the FIFO for the mixer. Then,
+  **while `jb.is_primed()`**, `let r = drift.update(jb.buffered_ms(), jb.target_ms(), frame_ms / 1000.0);
+  rs.set_ratio_relative(r)`. On `FLAG_RESET`: `jb.reset()`, `dec.reset()`, `rs.reset()`, `drift.reset()`.
+
 ## 5. `hfa-capture` (OS audio I/O)
 
 ```rust
