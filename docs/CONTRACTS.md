@@ -715,22 +715,35 @@ Modules:
     (`hfa_proto::sanitize_name`; empty → the device id), `platform`/`app_version` truncated to 64 chars.
   - **Pairing message order:** sender `PairStart{method}` → hub `begin_attempt` → hub `PairSpake` (or
     `PairResult{ok:false, reason}` when `begin_attempt` returns `None`) → sender `PairSpake` + `PairConfirm` → hub
-    verifies, saves the sender in its `TrustStore`, `attempt.succeed()`, then `PairConfirm` + `PairResult{ok:true}` →
-    sender verifies the hub MAC and saves the hub. The sender waits for the hub's `PairSpake` before sending its own, so a
+    verifies, **`attempt.succeed()` (now `-> bool`, see Pairing below; `false` → `PairResult{ok:false,"pairing was
+    cancelled on the hub"}` + `PairingFailed`, nobody trusted)**, saves the sender in its `TrustStore`, then
+    `PairConfirm` + `PairResult{ok:true}` → sender verifies the hub MAC and saves the hub. The sender waits for the hub's `PairSpake` before sending its own, so a
     refused `PairStart` never leaves unread bytes (a close with unread data becomes a TCP reset that can swallow the
     reason). Wrong secret → `PairResult{ok:false,"wrong PIN or token"}` and `PairingFailed` on both sides. A hub that
     fails to prove the secret → sender `Bye` + `PairingFailed`, nothing trusted. Invalid `PairStart.method` →
     `Protocol`. A sender `Bye` instead of `PairStart` → hub `PairingRequired`.
   - `HANDSHAKE_TIMEOUT` is one deadline around the whole phase (TCP connect included), so every step is bounded
-    (`Timeout`). Error mapping: I/O → `Io`, EOF → `Closed`, Noise/framing → `Proto`, unexpected message → `Protocol`.
-    Trust-store writes run in `spawn_blocking` (any tokio runtime works).
+    (`Timeout`) — **except the trust-store save after a successful pairing** (review fix): it starts only after the
+    one-time secret was consumed and always completes (a `spawn_blocking` write cannot be cancelled, so a deadline in
+    the middle used to leave the peer trusted on disk while the call reported `Timeout` and the secret stayed valid);
+    the hub's `PairConfirm` + `PairResult` after it get the remaining time, at least 2 s. If those cannot be delivered
+    the sender (which proved the secret) stays trusted on the hub and `accept` returns the error; the sender pairs
+    again next time. Error mapping: I/O → `Io`, EOF → `Closed`, Noise/framing → `Proto`, unexpected message →
+    `Protocol`. Trust-store writes run in `spawn_blocking` (any tokio runtime works).
   - `ControlChannel` extras: `close(self, reason).await` (best-effort `Bye` within 2 s + shutdown), `peer_addr()`,
     `remote_static()`, `handshake_hash()`, `is_closed()`; `RECORD_PREFIX_LEN = 2`. **Every error from `send`/`recv` is
     fatal** (later calls return it again or `Closed`), except an unencodable message in `send` (nothing written). A
-    `send` future dropped mid-write marks the channel closed (next call → `Closed`). `recv` skips frames that decode to no
-    known message (logged) and closes on a poisoned `FrameDecoder` (`Proto(FrameTooLarge)`). The single-task
+    `send` future dropped mid-write marks the channel closed (next call → `Closed`). `recv` closes on a poisoned
+    `FrameDecoder` (`Proto(FrameTooLarge)`). **Undecodable frames (review fix):** fatal (`Protocol`) during
+    `connect`/`accept`; afterwards skipped (a newer peer's unknown variant), logged at most once per 5 s with a count,
+    and more than **`pub const MAX_SKIPPED_FRAMES: u32 = 64`** in a row close the channel (`Protocol`). A transport
+    record with an empty plaintext is fatal (`Protocol`). The record reader consumes records with an offset and
+    compacts once per socket read (no per-record memmove). The single-task
     `tokio::select!` pattern (recv as branch future, `send` awaited in branch bodies) is a doc example in `control.rs`.
-- **Pairing:** `PairingManager::with_clock(hub_id, name, port, UnixClock)` with `pub type UnixClock = Arc<dyn Fn() -> u64
+- **Pairing:** **`PairingAttempt::succeed(self) -> bool`** (`#[must_use]`, review fix): atomically checks that the
+  attempt's window is still the current, unexpired one (not `cancel()`ed, not replaced by `start()`), and only then
+  closes it and returns `true`; `false` means the pairing must be refused. `cancel()`/`start()` therefore really stop
+  an attempt that is in flight. `PairingManager::with_clock(hub_id, name, port, UnixClock)` with `pub type UnixClock = Arc<dyn Fn() -> u64
   + Send + Sync>` (unix seconds; tests expire windows with it). `start(ttl)` rounds `ttl` up to whole seconds and builds
   the URI with `PairingUri::new(lan_ipv4() or 127.0.0.1, port, hub_id, token, name)`; if that fails (manager built with
   port 0) `uri` is `""` (warning logged) and the PIN still works — the hub engine must create the manager with its
@@ -743,7 +756,10 @@ Modules:
   atomically (temp + rename); a failed save leaves the in-memory store unchanged. New `FILE_FORMAT_VERSION = 1`,
   `TrustedPeer::new(public_key, name)` (id = fingerprint, `paired_at` = now). `TrustStore::add` rejects a `device_id`
   that is not the key's fingerprint (`Config`); `load` drops such entries and rejects other file versions (`Config`).
-  `TrustStore` has a manual `Debug` (path + count).
+  `TrustStore` has a manual `Debug` (path + count). **Readers never wait for disk I/O (review fix):** writers
+  (`add`/`remove`) are serialized by a separate save lock held during write + fsync; the peer-list lock is held only
+  to copy the list and to swap in the saved one, so `is_trusted`/`get`/`peers` are safe on async workers. `add` and
+  `remove` still block — call them from `spawn_blocking` or a non-async thread.
 - **Settings:** new `Settings::validate() -> Result<()>` (`Config`): device name non-blank, ≤ 256 bytes, no control
   characters; `frame_ms` ∈ `FRAME_MS_CHOICES = [10, 20]`; `bitrate` ∈ `MIN_BITRATE = 6000 ..= MAX_BITRATE = 510000`;
   `1 <= jitter_min_ms <= jitter_max_ms <= MAX_JITTER_MS = 2000`; every port (0 = any free port). `load_or_default`
@@ -751,7 +767,10 @@ Modules:
   `save` validates first and writes atomically (temp + fsync + rename).
 - **Media:** `MediaSender` sends through a duplicated, non-blocking std handle of the tokio socket (fallback:
   `try_send_to`), so it never depends on reactor readiness (the first packet from the encoder thread goes out) and
-  never blocks; extra `dest()`, `set_dest(addr)` (e.g. `StreamAccepted.udp_port`; key and seq continue),
+  never blocks. **`send` returns `Ok(false)` (packet dropped, `seq` consumed) for transient errors (review fix):**
+  `WouldBlock`, `ENOBUFS` (how macOS/iOS and some Wi-Fi drivers report a full queue; `WSAENOBUFS` on Windows),
+  host/network unreachable or down, `EHOSTDOWN`, connection refused, interrupted. Any other `Err` is fatal for the
+  stream. Extra `dest()`, `set_dest(addr)` (e.g. `StreamAccepted.udp_port`; key and seq continue),
   `MAX_MEDIA_PAYLOAD = MAX_DATAGRAM − 32` (larger payloads → `Proto(FrameTooLarge)`, no seq consumed). Announce each
   sender's key in exactly one `StreamStart`. `MediaDemux::open` rejects, cheapest first: bad header/size, unknown
   stream, **`seq` outside the stream's window** — more than **`MAX_SEQ_JUMP = 32768`** above the highest accepted seq
