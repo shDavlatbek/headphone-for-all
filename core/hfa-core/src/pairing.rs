@@ -113,7 +113,8 @@ impl PairingManager {
 
     /// Opens (or replaces) a pairing window valid for `ttl` (rounded up to whole seconds),
     /// with a fresh PIN and token and a zero attempt counter. A replaced window's in-flight
-    /// attempt can no longer succeed or touch the new window.
+    /// attempt can no longer succeed ([`PairingAttempt::succeed`] returns `false`) or touch
+    /// the new window.
     ///
     /// The URI's host is the hub's best LAN IPv4 address (see [`lan_ipv4`]), or `127.0.0.1`
     /// if there is none. If the URI cannot be built (the manager was created with port 0),
@@ -150,7 +151,8 @@ impl PairingManager {
         info
     }
 
-    /// Closes the current window.
+    /// Closes the current window. An attempt in flight can no longer succeed
+    /// ([`PairingAttempt::succeed`] returns `false`).
     pub fn cancel(&self) {
         self.state.lock().window = None;
     }
@@ -170,9 +172,9 @@ impl PairingManager {
     /// no other attempt is in flight and that fewer than [`MAX_FAILED_ATTEMPTS`] attempts were
     /// made, then **counts the attempt**. Returns `None` otherwise (and for
     /// `PairMethod::Unspecified`, which does not count). Call [`PairingAttempt::succeed`] when
-    /// the peer's confirmation MAC verified; dropping the guard in any other way (wrong
-    /// secret, error, disconnect, timeout) is a failed attempt, and the window closes once
-    /// the limit is reached.
+    /// the peer's confirmation MAC verified (and trust the peer only if it returns `true`);
+    /// dropping the guard in any other way (wrong secret, error, disconnect, timeout) is a
+    /// failed attempt, and the window closes once the limit is reached.
     pub fn begin_attempt(&self, method: PairMethod) -> Option<PairingAttempt<'_>> {
         let now = (self.clock)();
         let mut state = self.state.lock();
@@ -192,7 +194,7 @@ impl PairingManager {
             manager: self,
             generation: window.generation,
             secret,
-            succeeded: false,
+            finished: false,
         })
     }
 
@@ -210,8 +212,8 @@ impl PairingManager {
         });
     }
 
-    /// Ends the attempt of window `generation`.
-    fn finish_attempt(&self, generation: u64, succeeded: bool) {
+    /// Ends the attempt of window `generation` as a failure (no-op for a stale generation).
+    fn fail_attempt(&self, generation: u64) {
         let mut state = self.state.lock();
         let Some(window) = state.window.as_mut() else {
             return;
@@ -221,20 +223,37 @@ impl PairingManager {
             return;
         }
         window.in_flight = false;
-        if succeeded || window.attempts >= MAX_FAILED_ATTEMPTS {
-            // Success: PIN and token are one-time. Failure: guess budget used up.
+        if window.attempts >= MAX_FAILED_ATTEMPTS {
+            // Guess budget used up.
             state.window = None;
+        }
+    }
+
+    /// Commits a successful attempt of window `generation`: `true` and the window closes if
+    /// it is still the current, unexpired window; `false` (nothing changes) otherwise.
+    fn commit_attempt(&self, generation: u64) -> bool {
+        let now = (self.clock)();
+        let mut state = self.state.lock();
+        close_if_expired(&mut state, now);
+        match &state.window {
+            Some(window) if window.generation == generation => {
+                // PIN and token are one-time.
+                state.window = None;
+                true
+            }
+            _ => false,
         }
     }
 }
 
 /// One in-flight pairing attempt (see [`PairingManager::begin_attempt`]). Dropping it
-/// without calling [`PairingAttempt::succeed`] records a failure.
+/// without a successful [`PairingAttempt::succeed`] records a failure.
 pub struct PairingAttempt<'a> {
     manager: &'a PairingManager,
     generation: u64,
     secret: String,
-    succeeded: bool,
+    /// Set once `succeed` ran (whatever its outcome), so `Drop` does nothing more.
+    finished: bool,
 }
 
 impl PairingAttempt<'_> {
@@ -243,16 +262,23 @@ impl PairingAttempt<'_> {
         &self.secret
     }
 
-    /// The peer proved knowledge of the secret: closes the window (one-time secrets).
-    pub fn succeed(mut self) {
-        self.succeeded = true;
-        // Drop runs `finish_attempt(.., true)`.
+    /// The peer proved knowledge of the secret: atomically (under the window lock) checks
+    /// that this attempt's window is still open — not cancelled, replaced by a new
+    /// [`PairingManager::start`] or expired — and if so closes it (one-time secrets) and
+    /// returns `true`. Returns `false` otherwise: the pairing must then be refused (the user
+    /// withdrew the secret while the attempt was running), and nothing else changes.
+    #[must_use = "a `false` result means the pairing was cancelled and must be refused"]
+    pub fn succeed(mut self) -> bool {
+        self.finished = true;
+        self.manager.commit_attempt(self.generation)
     }
 }
 
 impl Drop for PairingAttempt<'_> {
     fn drop(&mut self) {
-        self.manager.finish_attempt(self.generation, self.succeeded);
+        if !self.finished {
+            self.manager.fail_attempt(self.generation);
+        }
     }
 }
 
@@ -436,7 +462,7 @@ mod tests {
     #[test]
     fn success_closes_the_window() {
         let m = manager_with_window(300);
-        m.begin_attempt(PairMethod::Token).expect("open").succeed();
+        assert!(m.begin_attempt(PairMethod::Token).expect("open").succeed());
         assert!(m.current().is_none());
         assert!(m.begin_attempt(PairMethod::Pin).is_none());
     }
@@ -462,7 +488,8 @@ mod tests {
             expires_at_unix: unix_now() + 300,
         });
         let fresh = m.begin_attempt(PairMethod::Pin).expect("new window");
-        stale.succeed(); // must not close the new window or clear its in-flight flag
+        // Must fail, and must not close the new window or clear its in-flight flag.
+        assert!(!stale.succeed());
         assert!(m.current().is_some());
         assert!(
             m.begin_attempt(PairMethod::Pin).is_none(),
@@ -470,6 +497,40 @@ mod tests {
         );
         drop(fresh);
         assert!(m.begin_attempt(PairMethod::Pin).is_some());
+    }
+
+    #[test]
+    fn cancelled_or_expired_attempt_cannot_succeed() {
+        let m = manager_with_window(300);
+        let attempt = m.begin_attempt(PairMethod::Pin).expect("open");
+        m.cancel();
+        assert!(!attempt.succeed(), "cancel withdraws the secret");
+        assert!(m.current().is_none());
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let now = Arc::new(AtomicU64::new(1_000));
+        let clock = Arc::clone(&now);
+        let m = PairingManager::with_clock(
+            [7; 32],
+            "Desk".into(),
+            47810,
+            Arc::new(move || clock.load(Ordering::SeqCst)),
+        );
+        m.start(Duration::from_secs(60));
+        let attempt = m.begin_attempt(PairMethod::Pin).expect("open");
+        now.store(1_060, Ordering::SeqCst);
+        assert!(!attempt.succeed(), "the window expired mid-attempt");
+
+        // A replaced window: the old attempt fails, the new window stays open and usable.
+        let m = manager_with_window(300);
+        let attempt = m.begin_attempt(PairMethod::Pin).expect("open");
+        let fresh = m.start(DEFAULT_PAIRING_TTL);
+        assert!(!attempt.succeed());
+        assert_eq!(m.current(), Some(fresh));
+        assert!(m
+            .begin_attempt(PairMethod::Pin)
+            .expect("new window")
+            .succeed());
     }
 
     #[test]

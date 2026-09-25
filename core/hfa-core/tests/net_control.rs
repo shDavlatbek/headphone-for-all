@@ -319,8 +319,8 @@ async fn sender_that_forgot_the_hub_pairs_again() {
 }
 
 // ---------------------------------------------------------------------------------------
-// A hand-written peer speaking the raw wire protocol (records + Noise), to test the
-// sender against a misbehaving hub.
+// A hand-written peer speaking the raw wire protocol (records + Noise), to test either side
+// against a misbehaving peer.
 
 async fn write_record(s: &mut TcpStream, payload: &[u8]) {
     let len = u16::try_from(payload.len()).expect("fits");
@@ -336,15 +336,56 @@ async fn read_record(s: &mut TcpStream) -> Vec<u8> {
     buf
 }
 
-struct RawHub {
+struct RawPeer {
     stream: TcpStream,
     transport: NoiseTransport,
     keys: StaticKeypair,
 }
 
-impl RawHub {
+impl RawPeer {
+    /// Connects to a hub and runs the initiator side of the Noise handshake (a raw sender).
+    async fn connect(addr: SocketAddr, keys: StaticKeypair) -> RawPeer {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut hs = NoiseHandshake::initiator(&keys).expect("initiator");
+        let m1 = hs.write_message(&[]).expect("m1");
+        write_record(&mut stream, &m1).await;
+        hs.read_message(&read_record(&mut stream).await)
+            .expect("m2");
+        let m3 = hs.write_message(&[]).expect("m3");
+        write_record(&mut stream, &m3).await;
+        RawPeer {
+            stream,
+            transport: hs.into_transport().expect("transport"),
+            keys,
+        }
+    }
+
+    /// As a raw sender: sends a sender `Hello` and returns the hub's.
+    async fn sender_hello(&mut self, pairing_required: bool) -> Hello {
+        let hello = Hello {
+            protocol_version: 0,
+            device_id: hfa_proto::fingerprint(&self.keys.public),
+            device_name: "Raw sender".into(),
+            platform: "test".into(),
+            app_version: "0".into(),
+            role: Role::Sender as i32,
+            pairing_required,
+        };
+        self.send(&Body::Hello(hello).into()).await;
+        let Some(Body::Hello(hub_hello)) = self.recv().await.body else {
+            panic!("expected the hub's Hello");
+        };
+        hub_hello
+    }
+
+    /// Encrypts `plain` as one record and writes it.
+    async fn send_plain(&mut self, plain: &[u8]) {
+        let record = self.transport.encrypt(plain).expect("encrypt");
+        write_record(&mut self.stream, &record).await;
+    }
+
     /// Accepts one connection and runs the responder side of the Noise handshake.
-    async fn accept(listener: &TcpListener, keys: StaticKeypair) -> RawHub {
+    async fn accept(listener: &TcpListener, keys: StaticKeypair) -> RawPeer {
         let (mut stream, _) = listener.accept().await.expect("accept");
         let mut hs = NoiseHandshake::responder(&keys).expect("responder");
         hs.read_message(&read_record(&mut stream).await)
@@ -353,7 +394,7 @@ impl RawHub {
         write_record(&mut stream, &m2).await;
         hs.read_message(&read_record(&mut stream).await)
             .expect("m3");
-        RawHub {
+        RawPeer {
             stream,
             transport: hs.into_transport().expect("transport"),
             keys,
@@ -402,7 +443,7 @@ async fn sender_refuses_an_untrusted_hub_that_claims_no_pairing_is_needed() {
     let sender = device("Laptop");
     let rogue = tokio::spawn(async move {
         let keys = StaticKeypair::generate().expect("keys");
-        let mut raw = RawHub::accept(&listener, keys).await;
+        let mut raw = RawPeer::accept(&listener, keys).await;
         let hello = raw.hello(false).await;
         // The sender tells the hub up front that it does not trust it...
         assert!(hello.pairing_required);
@@ -426,7 +467,7 @@ async fn rogue_hub_without_the_secret_cannot_complete_pairing() {
     let sender = device("Laptop");
     let rogue = tokio::spawn(async move {
         let keys = StaticKeypair::generate().expect("keys");
-        let mut raw = RawHub::accept(&listener, keys).await;
+        let mut raw = RawPeer::accept(&listener, keys).await;
         raw.hello(false).await;
         let Some(Body::PairStart(_)) = raw.recv().await.body else {
             panic!("expected PairStart");
@@ -472,7 +513,7 @@ async fn rogue_hub_without_the_secret_cannot_complete_pairing() {
 }
 
 /// A sender that trusts `keys` and is connected to a raw hub.
-async fn sender_with_raw_hub() -> (Device, ControlChannel, RawHub) {
+async fn sender_with_raw_hub() -> (Device, ControlChannel, RawPeer) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let keys = StaticKeypair::generate().expect("keys");
@@ -482,7 +523,7 @@ async fn sender_with_raw_hub() -> (Device, ControlChannel, RawHub) {
         .add(TrustedPeer::new(keys.public, "Raw hub"))
         .expect("trust");
     let raw = tokio::spawn(async move {
-        let mut raw = RawHub::accept(&listener, keys).await;
+        let mut raw = RawPeer::accept(&listener, keys).await;
         let hello = raw.hello(false).await;
         assert!(!hello.pairing_required);
         raw
@@ -722,4 +763,182 @@ async fn silent_peer_times_out() {
     let result = connect(&sender, addr, None, None).await;
     assert!(matches!(result, Err(CoreError::Timeout(_))), "{result:?}");
     silent_hub.abort();
+}
+
+/// Runs a raw sender through SPAKE2 with the right PIN, lets `interfere` act on the hub's
+/// pairing manager right before the sender's confirmation MAC, and returns the hub's reply.
+async fn pair_raw_sender_with_interference(
+    hub: &Hub,
+    pin: &str,
+    interfere: impl FnOnce(&PairingManager),
+) -> (ControlMessage, Accepted) {
+    let accepted = hub.accept_one();
+    let keys = StaticKeypair::generate().expect("keys");
+    let mut raw = RawPeer::connect(hub.addr, keys).await;
+    assert!(raw.sender_hello(true).await.pairing_required);
+    raw.send(
+        &Body::PairStart(hfa_proto::control::PairStart {
+            method: PairMethod::Pin as i32,
+        })
+        .into(),
+    )
+    .await;
+    // The hub answers only after `begin_attempt`, so the attempt is in flight now.
+    let Some(Body::PairSpake(hub_msg)) = raw.recv().await.body else {
+        panic!("expected PairSpake");
+    };
+    let (session, msg) = hfa_proto::PairingSession::start(pin, &raw.transport.handshake_hash());
+    raw.send(&Body::PairSpake(hfa_proto::control::PairSpake { msg }).into())
+        .await;
+    let key = session.finish(&hub_msg.msg).expect("finish");
+    interfere(&hub.pairing);
+    raw.send(
+        &Body::PairConfirm(hfa_proto::control::PairConfirm {
+            mac: key.confirm_mac(hfa_proto::PairingRole::Sender).to_vec(),
+        })
+        .into(),
+    )
+    .await;
+    let reply = raw.recv().await;
+    (reply, accepted.await.expect("join"))
+}
+
+#[tokio::test]
+async fn cancel_or_new_window_mid_pairing_trusts_nobody() {
+    for replace in [false, true] {
+        let hub = hub().await;
+        let info = hub.pairing.start(DEFAULT_PAIRING_TTL);
+        let (reply, accepted) = pair_raw_sender_with_interference(&hub, &info.pin, |p| {
+            if replace {
+                p.start(DEFAULT_PAIRING_TTL);
+            } else {
+                p.cancel();
+            }
+        })
+        .await;
+        assert!(
+            matches!(&reply.body, Some(Body::PairResult(r)) if !r.ok),
+            "{reply:?}"
+        );
+        assert!(
+            matches!(accepted, Err(CoreError::PairingFailed(_))),
+            "{accepted:?}"
+        );
+        assert!(
+            hub.dev.trust.peers().is_empty(),
+            "nothing trusted in memory"
+        );
+        assert!(
+            TrustStore::load(&hub.dev.path)
+                .expect("reload")
+                .peers()
+                .is_empty(),
+            "nothing trusted on disk"
+        );
+        // A replacement window is untouched; a cancelled one stays closed.
+        assert_eq!(hub.pairing.current().is_some(), replace);
+    }
+}
+
+#[tokio::test]
+async fn right_pin_with_the_window_still_open_pairs_the_raw_sender() {
+    // Control case for the test above: the same raw sender without interference pairs.
+    let hub = hub().await;
+    let info = hub.pairing.start(DEFAULT_PAIRING_TTL);
+    let (reply, accepted) = pair_raw_sender_with_interference(&hub, &info.pin, |_| {}).await;
+    assert!(
+        matches!(reply.body, Some(Body::PairConfirm(_))),
+        "{reply:?}"
+    );
+    let (_ch, peer) = accepted.expect("paired");
+    assert!(peer.newly_paired);
+    assert!(hub.dev.trust.is_trusted(&peer.public_key));
+    assert!(hub.pairing.current().is_none(), "one-time secret consumed");
+}
+
+/// `n` empty-body frames (`00 00 00 00` each), which decode to no message.
+fn empty_frames(n: usize) -> Vec<u8> {
+    vec![0u8; n * hfa_proto::control::FRAME_PREFIX_LEN]
+}
+
+#[tokio::test]
+async fn undecodable_frames_during_the_handshake_are_fatal() {
+    // Hub side: a raw sender sends garbage frames instead of its Hello.
+    let hub = hub().await;
+    let accepted = hub.accept_one();
+    let mut raw = RawPeer::connect(hub.addr, StaticKeypair::generate().expect("keys")).await;
+    raw.send_plain(&empty_frames(16_000)).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), accepted)
+        .await
+        .expect("rejected right away, not at the handshake timeout")
+        .expect("join");
+    assert!(matches!(result, Err(CoreError::Protocol(_))), "{result:?}");
+
+    // Sender side: a raw hub answers the Hello with a garbage frame.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let sender = device("Laptop");
+    let rogue = tokio::spawn(async move {
+        let mut raw = RawPeer::accept(&listener, StaticKeypair::generate().expect("keys")).await;
+        let _ = raw.recv().await; // the sender's Hello
+        raw.send_plain(&empty_frames(1)).await;
+        raw
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        connect(&sender, addr, None, Some("123456")),
+    )
+    .await
+    .expect("rejected right away");
+    assert!(matches!(result, Err(CoreError::Protocol(_))), "{result:?}");
+    drop(rogue.await.expect("rogue"));
+}
+
+#[tokio::test]
+async fn a_few_undecodable_frames_are_skipped_but_a_flood_closes_the_channel() {
+    let (_sender, mut ch, mut raw) = sender_with_raw_hub().await;
+    // A few unknown frames (e.g. from a newer peer) are skipped.
+    let mut plain = empty_frames(hfa_core::control::MAX_SKIPPED_FRAMES as usize);
+    plain.extend(
+        hfa_proto::encode_frame(&Body::Ping(Ping { nonce: 5, t_us: 0 }).into()).expect("frame"),
+    );
+    raw.send_plain(&plain).await;
+    assert_eq!(
+        ch.recv().await.expect("ping after skipped frames").body,
+        Some(Body::Ping(Ping { nonce: 5, t_us: 0 }))
+    );
+    // The counter restarts after a good frame; a flood in one record closes the channel.
+    raw.send_plain(&empty_frames(16_000)).await;
+    let err = ch.recv().await.expect_err("flood");
+    assert!(matches!(err, CoreError::Protocol(_)), "{err:?}");
+    assert!(ch.is_closed());
+}
+
+#[tokio::test]
+async fn empty_records_close_the_channel() {
+    let (_sender, mut ch, mut raw) = sender_with_raw_hub().await;
+    for _ in 0..3 {
+        raw.send_plain(&[]).await;
+    }
+    let err = ch.recv().await.expect_err("empty record");
+    assert!(matches!(err, CoreError::Protocol(_)), "{err:?}");
+    assert!(ch.is_closed());
+}
+
+#[tokio::test]
+async fn many_small_records_in_one_read_arrive_in_order() {
+    let (_sender, mut ch, mut raw) = sender_with_raw_hub().await;
+    let mut wire = Vec::new();
+    for nonce in 0..2_000u64 {
+        let record = raw.seal(&Body::Ping(Ping { nonce, t_us: 0 }).into());
+        wire.extend_from_slice(&u16::try_from(record.len()).expect("len").to_be_bytes());
+        wire.extend_from_slice(&record);
+    }
+    raw.stream.write_all(&wire).await.expect("write");
+    for nonce in 0..2_000u64 {
+        assert_eq!(
+            ch.recv().await.expect("ping").body,
+            Some(Body::Ping(Ping { nonce, t_us: 0 }))
+        );
+    }
 }

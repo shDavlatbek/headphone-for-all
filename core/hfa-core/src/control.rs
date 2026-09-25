@@ -30,14 +30,18 @@
 //!        PairStart{method}          ─────▶      begin_attempt(method)
 //!                                   ◀─────      PairSpake{hub msg}   (or PairResult{ok:false})
 //!        PairSpake{sender msg}      ─────▶
-//!        PairConfirm{sender mac}    ─────▶      verify sender mac, trust sender
+//!        PairConfirm{sender mac}    ─────▶      verify sender mac, attempt.succeed(),
+//!                                               trust sender
 //!                                   ◀─────      PairConfirm{hub mac} + PairResult{ok:true}
 //!        verify hub mac, trust hub                (or PairResult{ok:false, reason})
 //!      ```
 //!      The hub obtains the secret only through [`PairingManager::begin_attempt`], which
 //!      counts the attempt *before* SPAKE2 runs and allows one attempt in flight per window;
 //!      if it returns `None` (no window, expired, budget used, another attempt in flight)
-//!      the hub answers `PairResult{ok: false}`. The sender waits for the hub's `PairSpake`
+//!      the hub answers `PairResult{ok: false}`. After the sender's MAC verified, the hub
+//!      commits the attempt with [`crate::pairing::PairingAttempt::succeed`], which consumes
+//!      the one-time secret and fails if the window was cancelled, replaced or expired
+//!      meanwhile (then `PairResult{ok: false}` and nobody is trusted). The sender waits for the hub's `PairSpake`
 //!      before sending its own, so a rejected `PairStart` never leaves unread data behind
 //!      (which could turn the hub's close into a TCP reset that swallows the reason). On
 //!      success both sides add each other to their [`TrustStore`].
@@ -48,7 +52,12 @@
 //!    carrying exactly one [`hfa_proto::encode_frame`] payload.
 //!
 //! Steps 1–3 (including the TCP connect) are bounded by [`HANDSHAKE_TIMEOUT`] as a whole,
-//! so every single step is bounded too ([`crate::CoreError::Timeout`]). Every failure is a
+//! so every single step is bounded too ([`crate::CoreError::Timeout`]), except the
+//! trust-store save after a successful pairing: once the secret is consumed and the save has
+//! started it always completes (a deadline in the middle would leave the peer trusted on
+//! disk while the call reported a failure); the hub's two confirmation messages after it
+//! get the remaining time, but at least 2 s. During steps 1–3 any undecodable frame is fatal
+//! ([`crate::CoreError::Protocol`]). Every failure is a
 //! typed [`crate::CoreError`]: I/O → `Io`, peer closed → `Closed`, Noise/decoding →
 //! `Proto`, unexpected message → `Protocol`, wrong secret or refused attempt →
 //! `PairingFailed`, missing secret → `PairingRequired`, pinned key differs → `KeyMismatch`.
@@ -101,7 +110,8 @@ use hfa_proto::control::{
     Body, Bye, Hello, PairConfirm, PairMethod, PairResult, PairSpake, PairStart, Role,
 };
 use hfa_proto::{
-    ControlMessage, FrameDecoder, NoiseHandshake, NoiseTransport, PairingRole, PairingSession,
+    ControlMessage, FrameDecoder, NoiseHandshake, NoiseTransport, PairingKey, PairingRole,
+    PairingSession,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -122,6 +132,11 @@ const READ_CHUNK: usize = 16 * 1024;
 /// Longest `platform` / `app_version` string accepted from a peer's `Hello` (longer values
 /// are truncated).
 const MAX_HELLO_FIELD: usize = 64;
+/// After the handshake, how many undecodable frames in a row [`ControlChannel::recv`] skips
+/// before it closes the channel ([`crate::CoreError::Protocol`]).
+pub const MAX_SKIPPED_FRAMES: u32 = 64;
+/// Minimum time between two log lines about skipped control frames.
+const SKIP_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// What we learned about the peer during the handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,9 +160,13 @@ pub struct PeerInfo {
 /// A TCP stream carrying `u16`-length-prefixed records, with a cancel-safe reader.
 struct RecordStream {
     stream: TcpStream,
-    /// Bytes read from the socket that do not form a complete record yet. Filled only with
-    /// the cancel-safe `read_buf`, consumed only synchronously.
+    /// Bytes read from the socket; `rx[pos..]` do not form a complete record yet. Filled
+    /// only with the cancel-safe `read_buf`, consumed only synchronously.
     rx: Vec<u8>,
+    /// Start of the unconsumed bytes in `rx`. Consuming a record only moves this offset;
+    /// the consumed prefix is dropped once per socket read (never once per record, which
+    /// would make many small records in one read quadratic).
+    pos: usize,
 }
 
 impl RecordStream {
@@ -155,15 +174,21 @@ impl RecordStream {
         Self {
             stream,
             rx: Vec::with_capacity(READ_CHUNK),
+            pos: 0,
         }
     }
 
     /// Removes and returns the first complete record from the buffer, if any.
     fn take_record(&mut self) -> Option<Vec<u8>> {
-        let (prefix, rest) = self.rx.split_first_chunk::<RECORD_PREFIX_LEN>()?;
+        let pending = self.rx.get(self.pos..)?;
+        let (prefix, rest) = pending.split_first_chunk::<RECORD_PREFIX_LEN>()?;
         let len = usize::from(u16::from_be_bytes(*prefix));
         let record = rest.get(..len)?.to_vec();
-        self.rx.drain(..RECORD_PREFIX_LEN + len);
+        self.pos += RECORD_PREFIX_LEN + len;
+        if self.pos == self.rx.len() {
+            self.rx.clear();
+            self.pos = 0;
+        }
         Some(record)
     }
 
@@ -172,6 +197,11 @@ impl RecordStream {
         loop {
             if let Some(record) = self.take_record() {
                 return Ok(record);
+            }
+            if self.pos > 0 {
+                // Compact before reading more (synchronous, so still cancel-safe).
+                self.rx.drain(..self.pos);
+                self.pos = 0;
             }
             self.rx.reserve(READ_CHUNK);
             let n = self.stream.read_buf(&mut self.rx).await?;
@@ -214,6 +244,15 @@ pub struct ControlChannel {
     /// `true` while a `send` is writing; still `true` at the next call if that `send` was
     /// cancelled mid-write.
     writing: bool,
+    /// `true` until `connect`/`accept` hand the channel out: during the handshake every
+    /// undecodable frame is fatal.
+    strict: bool,
+    /// Undecodable frames skipped since the last decodable one.
+    skipped_in_a_row: u32,
+    /// Skipped frames not yet reported in the log.
+    skipped_unlogged: u64,
+    /// When a skipped frame was last logged.
+    last_skip_log: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for ControlChannel {
@@ -238,6 +277,10 @@ impl ControlChannel {
             peer_addr,
             failed: None,
             writing: false,
+            strict: true,
+            skipped_in_a_row: 0,
+            skipped_unlogged: 0,
+            last_skip_log: None,
         }
     }
 
@@ -263,22 +306,16 @@ impl ControlChannel {
         pairing_secret: Option<String>,
     ) -> Result<(ControlChannel, PeerInfo)> {
         let secret = pairing_secret.map(Zeroizing::new);
-        let result = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            connect_inner(
-                addr,
-                identity,
-                trust,
-                expected_hub_key,
-                secret.as_ref().map(|s| s.as_str()),
-            ),
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+        let result = connect_procedure(
+            addr,
+            identity,
+            trust,
+            expected_hub_key,
+            secret.as_ref().map(|s| s.as_str()),
+            deadline,
         )
-        .await
-        .unwrap_or_else(|_| {
-            Err(CoreError::Timeout(format!(
-                "control handshake with {addr} took longer than {HANDSHAKE_TIMEOUT:?}"
-            )))
-        });
+        .await;
         if let Err(e) = &result {
             tracing::debug!(%addr, error = %e, "control connect failed");
         }
@@ -301,16 +338,8 @@ impl ControlChannel {
         pairing: &PairingManager,
     ) -> Result<(ControlChannel, PeerInfo)> {
         let addr = stream.peer_addr()?;
-        let result = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            accept_inner(stream, addr, identity, trust, pairing),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(CoreError::Timeout(format!(
-                "control handshake with {addr} took longer than {HANDSHAKE_TIMEOUT:?}"
-            )))
-        });
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+        let result = accept_procedure(stream, addr, identity, trust, pairing, deadline).await;
         if let Err(e) = &result {
             tracing::debug!(%addr, error = %e, "control accept failed");
         }
@@ -348,23 +377,31 @@ impl ControlChannel {
     /// buffered, so dropping the future (e.g. when another `tokio::select!` branch wins)
     /// loses no bytes and never desynchronizes the Noise receive nonce.
     ///
-    /// A frame that decodes to no known message (e.g. a variant added by a newer peer) is
-    /// skipped with a warning. A frame length above `MAX_CONTROL_FRAME` poisons the frame
-    /// decoder; the channel is then closed and the error returned.
+    /// A frame that decodes to no known message (e.g. a variant added by a newer peer, or
+    /// malformed protobuf) is skipped; skips are logged at most once per 5 s (with a count),
+    /// and more than [`MAX_SKIPPED_FRAMES`] of them in a row close the channel
+    /// ([`crate::CoreError::Protocol`]), so a peer cannot flood the log or keep the task busy
+    /// with garbage. During `connect`/`accept` (before the channel is handed out) an
+    /// undecodable frame is fatal right away. A transport record with an empty plaintext
+    /// (never produced by this implementation) is fatal too. A frame length above
+    /// `MAX_CONTROL_FRAME` poisons the frame decoder; the channel is then closed and the
+    /// error returned.
     ///
     /// # Errors
     /// I/O or Noise errors, [`crate::CoreError::Proto`] for a poisoned framing,
+    /// [`crate::CoreError::Protocol`] for too many undecodable frames or an empty record,
     /// [`crate::CoreError::Closed`] on EOF or after an earlier fatal error. All are fatal.
     pub async fn recv(&mut self) -> Result<ControlMessage> {
         loop {
             self.check_usable()?;
             while let Some(item) = self.decoder.next() {
                 match item {
-                    Ok(msg) => return Ok(msg),
-                    Err(e) if self.decoder.is_poisoned() => return Err(self.fail(e.into())),
-                    Err(e) => {
-                        tracing::warn!(peer = %self.peer_addr, error = %e, "skipping an undecodable control frame");
+                    Ok(msg) => {
+                        self.skipped_in_a_row = 0;
+                        return Ok(msg);
                     }
+                    Err(e) if self.decoder.is_poisoned() => return Err(self.fail(e.into())),
+                    Err(e) => self.skip_frame(&e)?,
                 }
             }
             let record = match self.io.read_record().await {
@@ -372,10 +409,45 @@ impl ControlChannel {
                 Err(e) => return Err(self.fail(e)),
             };
             match self.transport.decrypt(&record) {
+                Ok(plain) if plain.is_empty() => {
+                    return Err(self.fail(CoreError::Protocol("empty control record".into())))
+                }
                 Ok(plain) => self.decoder.push(&plain),
                 Err(e) => return Err(self.fail(e.into())),
             }
         }
+    }
+
+    /// Handles one undecodable (but correctly framed) frame: fatal while `strict` or past
+    /// the [`MAX_SKIPPED_FRAMES`] limit, otherwise skipped with a rate-limited log line.
+    fn skip_frame(&mut self, err: &hfa_proto::ProtoError) -> Result<()> {
+        if self.strict {
+            return Err(self.fail(CoreError::Protocol(format!(
+                "undecodable control frame during the handshake: {err}"
+            ))));
+        }
+        self.skipped_in_a_row += 1;
+        if self.skipped_in_a_row > MAX_SKIPPED_FRAMES {
+            return Err(self.fail(CoreError::Protocol(format!(
+                "more than {MAX_SKIPPED_FRAMES} undecodable control frames in a row"
+            ))));
+        }
+        self.skipped_unlogged += 1;
+        let now = std::time::Instant::now();
+        if self
+            .last_skip_log
+            .is_none_or(|last| now.duration_since(last) >= SKIP_LOG_INTERVAL)
+        {
+            tracing::warn!(
+                peer = %self.peer_addr,
+                error = %err,
+                skipped = self.skipped_unlogged,
+                "skipping undecodable control frames"
+            );
+            self.skipped_unlogged = 0;
+            self.last_skip_log = Some(now);
+        }
+        Ok(())
     }
 
     /// Sends `Bye{reason}` (best effort, at most 2 s) and shuts the connection down.
@@ -453,14 +525,119 @@ impl ControlChannel {
     }
 }
 
-/// The sender side of the procedure (without the timeout).
+/// Runs `fut` until `deadline`, mapping expiry to [`CoreError::Timeout`].
+async fn within<T>(
+    deadline: tokio::time::Instant,
+    addr: SocketAddr,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout_at(deadline, fut)
+        .await
+        .unwrap_or_else(|_| {
+            Err(CoreError::Timeout(format!(
+                "control handshake with {addr} took longer than {HANDSHAKE_TIMEOUT:?}"
+            )))
+        })
+}
+
+/// Deadline for the short steps after a trust-store save, which is not bounded by the
+/// handshake deadline: the remaining handshake time, but at least [`CLOSE_TIMEOUT`].
+fn after_save_deadline(deadline: tokio::time::Instant) -> tokio::time::Instant {
+    deadline.max(tokio::time::Instant::now() + CLOSE_TIMEOUT)
+}
+
+/// The sender side of the procedure: [`connect_inner`] within `deadline`, then the trust
+/// save (see [`accept_procedure`] for why the save is outside the deadline).
+async fn connect_procedure(
+    addr: SocketAddr,
+    identity: &Identity,
+    trust: &TrustStore,
+    expected_hub_key: Option<[u8; 32]>,
+    secret: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<(ControlChannel, PeerInfo)> {
+    let (mut ch, mut peer, paired) = within(
+        deadline,
+        addr,
+        connect_inner(addr, identity, trust, expected_hub_key, secret),
+    )
+    .await?;
+    if paired {
+        if let Err(e) =
+            add_trusted(trust, TrustedPeer::new(peer.public_key, peer.name.clone())).await
+        {
+            let _ = within(after_save_deadline(deadline), addr, async {
+                ch.send_bye("the sender could not save the pairing").await;
+                Ok(())
+            })
+            .await;
+            return Err(e);
+        }
+        peer.newly_paired = true;
+        tracing::info!(hub = %peer.device_id, name = %peer.name, "paired with hub");
+    }
+    ch.strict = false;
+    Ok((ch, peer))
+}
+
+/// The hub side of the procedure: [`accept_inner`] within `deadline`, then — after a
+/// successful pairing — the trust save and the hub's confirmation.
+///
+/// The save deliberately runs **outside** the deadline: it starts only after
+/// [`crate::pairing::PairingAttempt::succeed`] consumed the one-time secret, and a
+/// `spawn_blocking` write cannot be stopped anyway, so cancelling it at the deadline would
+/// leave a peer trusted on disk while `accept` reported a failure. The two confirmation
+/// messages that follow get the remaining time (at least [`CLOSE_TIMEOUT`]). If they cannot
+/// be delivered, the sender (which proved the secret) stays trusted on the hub, and `accept`
+/// returns the error; the sender then does not trust the hub and pairs again next time.
+async fn accept_procedure(
+    stream: TcpStream,
+    addr: SocketAddr,
+    identity: &Identity,
+    trust: &TrustStore,
+    pairing: &PairingManager,
+    deadline: tokio::time::Instant,
+) -> Result<(ControlChannel, PeerInfo)> {
+    let (mut ch, mut peer, paired) = within(
+        deadline,
+        addr,
+        accept_inner(stream, addr, identity, trust, pairing),
+    )
+    .await?;
+    if let Some(key) = paired {
+        if let Err(e) =
+            add_trusted(trust, TrustedPeer::new(peer.public_key, peer.name.clone())).await
+        {
+            let _ = within(after_save_deadline(deadline), addr, async {
+                ch.send_pair_failure("the hub could not save the pairing")
+                    .await;
+                Ok(())
+            })
+            .await;
+            return Err(e);
+        }
+        within(
+            after_save_deadline(deadline),
+            addr,
+            hub_confirm(&mut ch, &key),
+        )
+        .await?;
+        peer.newly_paired = true;
+        tracing::info!(sender = %peer.device_id, name = %peer.name, "paired with sender");
+    }
+    ch.strict = false;
+    Ok((ch, peer))
+}
+
+/// The sender side up to (not including) the trust save. Returns `true` as the third
+/// element if pairing succeeded and the hub must be saved.
 async fn connect_inner(
     addr: SocketAddr,
     identity: &Identity,
     trust: &TrustStore,
     expected_hub_key: Option<[u8; 32]>,
     secret: Option<&str>,
-) -> Result<(ControlChannel, PeerInfo)> {
+) -> Result<(ControlChannel, PeerInfo, bool)> {
     let stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
     let peer_addr = stream.peer_addr().unwrap_or(addr);
@@ -490,7 +667,7 @@ async fn connect_inner(
             return Err(e);
         }
     };
-    let mut peer = peer_info(&hub_hello, hub_key, peer_addr);
+    let peer = peer_info(&hub_hello, hub_key, peer_addr);
 
     if !trusts_hub || hub_hello.pairing_required {
         let Some(secret) = secret else {
@@ -498,21 +675,20 @@ async fn connect_inner(
             return Err(CoreError::PairingRequired);
         };
         sender_pair(&mut ch, secret).await?;
-        add_trusted(trust, TrustedPeer::new(hub_key, peer.name.clone())).await?;
-        peer.newly_paired = true;
-        tracing::info!(hub = %peer.device_id, name = %peer.name, "paired with hub");
+        return Ok((ch, peer, true));
     }
-    Ok((ch, peer))
+    Ok((ch, peer, false))
 }
 
-/// The hub side of the procedure (without the timeout).
+/// The hub side up to (not including) the trust save. Returns the pairing key as the third
+/// element if the sender proved the secret and the window committed the attempt.
 async fn accept_inner(
     stream: TcpStream,
     addr: SocketAddr,
     identity: &Identity,
     trust: &TrustStore,
     pairing: &PairingManager,
-) -> Result<(ControlChannel, PeerInfo)> {
+) -> Result<(ControlChannel, PeerInfo, Option<PairingKey>)> {
     stream.set_nodelay(true)?;
     let mut io = RecordStream::new(stream);
 
@@ -531,16 +707,15 @@ async fn accept_inner(
             return Err(e);
         }
     };
-    let mut peer = peer_info(&sender_hello, sender_key, addr);
+    let peer = peer_info(&sender_hello, sender_key, addr);
     let needs_pairing = !trust.is_trusted(&sender_key) || sender_hello.pairing_required;
     ch.send(&hello(identity, Role::Hub, needs_pairing)).await?;
 
     if needs_pairing {
         match ch.recv().await?.body {
             Some(Body::PairStart(start)) => {
-                hub_pair(&mut ch, start, pairing, trust, &peer).await?;
-                peer.newly_paired = true;
-                tracing::info!(sender = %peer.device_id, name = %peer.name, "paired with sender");
+                let key = hub_pair(&mut ch, start, pairing).await?;
+                return Ok((ch, peer, Some(key)));
             }
             Some(Body::Bye(_)) => return Err(CoreError::PairingRequired),
             other => {
@@ -553,7 +728,7 @@ async fn accept_inner(
             }
         }
     }
-    Ok((ch, peer))
+    Ok((ch, peer, None))
 }
 
 /// Sender side of SPAKE2 pairing (see the module docs for the message order).
@@ -604,14 +779,13 @@ async fn sender_pair(ch: &mut ControlChannel, secret: &str) -> Result<()> {
     }
 }
 
-/// Hub side of SPAKE2 pairing, after the sender's `PairStart`.
+/// Hub side of SPAKE2 pairing, after the sender's `PairStart`, up to the verified sender
+/// MAC and the committed attempt. Returns the key for [`hub_confirm`].
 async fn hub_pair(
     ch: &mut ControlChannel,
     start: PairStart,
     pairing: &PairingManager,
-    trust: &TrustStore,
-    peer: &PeerInfo,
-) -> Result<()> {
+) -> Result<PairingKey> {
     let method = PairMethod::try_from(start.method).unwrap_or(PairMethod::Unspecified);
     if method == PairMethod::Unspecified {
         ch.send_pair_failure("invalid pairing method").await;
@@ -649,12 +823,19 @@ async fn hub_pair(
         ch.send_pair_failure("wrong PIN or token").await;
         return Err(CoreError::PairingFailed("wrong PIN or token".into()));
     }
-    if let Err(e) = add_trusted(trust, TrustedPeer::new(peer.public_key, peer.name.clone())).await {
-        ch.send_pair_failure("the hub could not save the pairing")
-            .await;
-        return Err(e);
+    // Atomically consume the one-time secret, unless the user cancelled or replaced the
+    // window (or it expired) while this attempt was running.
+    if !attempt.succeed() {
+        const REASON: &str = "pairing was cancelled on the hub";
+        ch.send_pair_failure(REASON).await;
+        return Err(CoreError::PairingFailed(REASON.into()));
     }
-    attempt.succeed();
+    Ok(key)
+}
+
+/// The hub's confirmation after the sender was saved: `PairConfirm{hub mac}` +
+/// `PairResult{ok: true}`.
+async fn hub_confirm(ch: &mut ControlChannel, key: &PairingKey) -> Result<()> {
     ch.send(
         &Body::PairConfirm(PairConfirm {
             mac: key.confirm_mac(PairingRole::Hub).to_vec(),
