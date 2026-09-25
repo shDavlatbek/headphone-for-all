@@ -41,7 +41,15 @@
 //! - sandboxed (Flatpak, `pipewire.access = flatpak`) clients that only report a pid of their
 //!   own pid namespace: mapped to the host pid through `/proc/*/status` `NSpid` plus the
 //!   sandbox's Flatpak app id; streams that cannot be mapped unambiguously are not listed and
-//!   not matched by pid (system-excl still links them: they are never this process).
+//!   not matched by pid (system-excl still links them unless they are provably ours, below).
+//!
+//! **This process** (excluded by system-excl, never listed) is `std::process::id()`, plus two
+//! identities that matter when we run in a Flatpak sandbox ourselves (then that pid is
+//! namespace-local, e.g. 2): the kernel-verified `pipewire.sec.pid` of the client that owns
+//! our capture node (our host pid: our playback through the native socket carries it), and
+//! a sandboxed stream that reports our namespace-local pid **and** our Flatpak app id (from
+//! `/.flatpak-info`; our PulseAudio playback). A pid alone never makes a sandboxed stream ours
+//! (every Flatpak app has a pid 2), so one without an app id is captured.
 //!
 //! **Stall watchdog (linked modes):** a linked capture's node has been seen staying
 //! `suspended` (its `process` callback never called) while its links were `active` and the
@@ -342,12 +350,30 @@ trait Procs {
     /// Host pid of the sandboxed process that reports `sandbox_pid` inside its own pid
     /// namespace (Flatpak app `app_id`, if known).
     fn host_pid(&self, sandbox_pid: u32, app_id: Option<&str>) -> Option<u32>;
+    /// Our own Flatpak app id when this process runs in a Flatpak sandbox (then our pid is
+    /// namespace-local too).
+    fn own_app_id(&self) -> Option<&str>;
 }
 
 /// [`Procs`] on `/proc`, caching sandbox-to-host pid mappings (re-validated on use).
 #[derive(Debug, Default)]
 struct ProcFs {
     sandbox_cache: RefCell<HashMap<(u32, Option<String>), u32>>,
+    /// Our Flatpak app id (`/.flatpak-info` exists only inside a Flatpak sandbox).
+    own_app_id: Option<String>,
+}
+
+impl ProcFs {
+    /// For this process: reads our own Flatpak app id, if any.
+    fn for_this_process() -> Self {
+        let own_app_id = std::fs::read_to_string("/.flatpak-info")
+            .ok()
+            .and_then(|info| parse_flatpak_info_app_id(&info).map(str::to_owned));
+        Self {
+            own_app_id,
+            ..Self::default()
+        }
+    }
 }
 
 /// Reads `/proc/<pid>/<file>`.
@@ -386,6 +412,10 @@ impl Procs for ProcFs {
         };
         found
     }
+
+    fn own_app_id(&self) -> Option<&str> {
+        self.own_app_id.as_deref()
+    }
 }
 
 /// Who owns a playback stream, as far as the graph tells.
@@ -415,6 +445,27 @@ impl Owner {
             Owner::Pending | Owner::Unknown => None,
         }
     }
+
+    /// Whether the stream belongs to this process. `own_pid` is `std::process::id()`
+    /// (namespace-local when we run in a Flatpak), `own_host_pid` our kernel-verified pid in
+    /// the daemon's namespace (from our own client), if known.
+    fn is_own(&self, own_pid: u32, own_host_pid: Option<u32>, procs: &dyn Procs) -> bool {
+        let ours = |pid: u32| pid == own_pid || Some(pid) == own_host_pid;
+        match self {
+            Owner::Pending | Owner::Unknown => false,
+            Owner::Host(pid) => ours(*pid),
+            Owner::Sandboxed { pid, app_id } => {
+                // A client of our own sandbox (our PulseAudio playback in a Flatpak) reports
+                // our namespace-local pid. A pid alone proves nothing (every Flatpak app has a
+                // pid 2): the app id must be ours too.
+                let our_sandbox = *pid == own_pid
+                    && app_id
+                        .as_deref()
+                        .is_some_and(|id| Some(id) == procs.own_app_id());
+                our_sandbox || self.host_pid(procs).is_some_and(ours)
+            }
+        }
+    }
 }
 
 /// Which application streams a linked capture takes.
@@ -427,16 +478,18 @@ enum NodeFilter {
 }
 
 impl NodeFilter {
-    fn matches(self, owner: &Owner, procs: &dyn Procs) -> bool {
+    /// `own_host_pid`: see [`Owner::is_own`] (only used by [`NodeFilter::AllExcept`]).
+    fn matches(self, owner: &Owner, procs: &dyn Procs, own_host_pid: Option<u32>) -> bool {
         match self {
             NodeFilter::AllExcept(excluded) => match owner {
                 Owner::Pending => false,
-                Owner::Host(pid) => *pid != excluded,
-                // A sandboxed stream belongs to another app even when its host pid is
-                // unknown (this process is not the sandboxed client).
-                Owner::Sandboxed { .. } => owner.host_pid(procs) != Some(excluded),
                 // Our own streams always carry a pid.
                 Owner::Unknown => true,
+                // A sandboxed stream whose host pid is unknown belongs to another app unless
+                // it is provably from our own sandbox.
+                Owner::Host(_) | Owner::Sandboxed { .. } => {
+                    !owner.is_own(excluded, own_host_pid, procs)
+                }
             },
             NodeFilter::ProcessTree(root) => match owner.host_pid(procs) {
                 Some(pid) => pid == root || is_descendant(pid, root, &|p| procs.parent_of(p)),
@@ -714,6 +767,8 @@ struct GraphModel {
     ports: BTreeMap<u32, PortModel>,
     /// `Audio/Sink` nodes and their owning client (`client.id`).
     sinks: BTreeMap<u32, Option<u32>>,
+    /// Capture stream nodes (`Stream/Input/Audio`, ours among them) and their client.
+    capture_nodes: BTreeMap<u32, Option<u32>>,
 }
 
 impl GraphModel {
@@ -808,6 +863,18 @@ impl GraphModel {
         apps
     }
 
+    /// Our pid in the daemon's pid namespace: the kernel-verified `pipewire.sec.pid` of the
+    /// client that owns our capture node `own_node` (differs from `std::process::id()` in a
+    /// Flatpak sandbox). Our playback through the native socket reports the same pid.
+    fn own_host_pid(&self, own_node: u32) -> Option<u32> {
+        let client = self.capture_nodes.get(&own_node).copied().flatten()?;
+        let client = self.clients.get(&client)?;
+        if client.is_pulse() {
+            return None;
+        }
+        client.sec_pid
+    }
+
     /// The links a linked capture into `own_node` should have right now.
     fn plan_links(
         &self,
@@ -825,11 +892,12 @@ impl GraphModel {
         if inputs.is_empty() {
             return planned;
         }
+        let own_host_pid = self.own_host_pid(own_node);
         for &node_id in self.nodes.keys() {
             if node_id == own_node || self.is_relay(node_id) {
                 continue;
             }
-            if !filter.matches(&self.node_owner(node_id), procs) {
+            if !filter.matches(&self.node_owner(node_id), procs, own_host_pid) {
                 continue;
             }
             let outputs = self
@@ -1197,7 +1265,7 @@ impl Tracker {
         Rc::new(RefCell::new(Self {
             registry,
             model: GraphModel::default(),
-            procs: ProcFs::default(),
+            procs: ProcFs::for_this_process(),
             bound: HashMap::new(),
             link_factory: "link-factory".to_owned(),
             capture,
@@ -1304,6 +1372,11 @@ impl Tracker {
                     Err(e) => tracing::debug!(id, error = %e, "cannot bind PipeWire node"),
                 }
             }
+            ObjectType::Node if props.get("media.class") == Some("Stream/Input/Audio") => {
+                let client = props.get("client.id").and_then(|v| v.trim().parse().ok());
+                tracker.model.capture_nodes.insert(id, client);
+                tracker.reconcile();
+            }
             ObjectType::Node
                 if props
                     .get("media.class")
@@ -1335,6 +1408,7 @@ impl Tracker {
         self.model.nodes.remove(&id);
         self.model.ports.remove(&id);
         self.model.sinks.remove(&id);
+        self.model.capture_nodes.remove(&id);
         self.bound.remove(&id);
         if let Some(capture) = self.capture.as_mut() {
             // The server already destroyed links touching a removed node/port; links to new
@@ -2164,6 +2238,8 @@ mod tests {
         parents: Vec<(u32, u32)>,
         /// ((sandbox pid, app id), host pid)
         sandboxes: Vec<((u32, Option<&'static str>), u32)>,
+        /// Our own Flatpak app id (we run sandboxed).
+        own_app_id: Option<&'static str>,
     }
 
     impl Procs for FakeProcs {
@@ -2179,6 +2255,10 @@ mod tests {
                 .iter()
                 .find(|((pid, id), _)| *pid == sandbox_pid && *id == app_id)
                 .map(|(_, host)| *host)
+        }
+
+        fn own_app_id(&self) -> Option<&str> {
+            self.own_app_id
         }
     }
 
@@ -2228,6 +2308,7 @@ mod tests {
         let procs = FakeProcs {
             parents: vec![(30, 20), (20, 10)],
             sandboxes: vec![((2, Some("org.example.App")), 30)],
+            own_app_id: None,
         };
         let host = Owner::Host;
         let sandboxed = |app_id: Option<&str>| Owner::Sandboxed {
@@ -2235,24 +2316,36 @@ mod tests {
             app_id: app_id.map(str::to_owned),
         };
         let all_but_5 = NodeFilter::AllExcept(5);
-        assert!(all_but_5.matches(&host(6), &procs));
-        assert!(!all_but_5.matches(&host(5), &procs));
-        assert!(!all_but_5.matches(&Owner::Pending, &procs));
-        assert!(all_but_5.matches(&Owner::Unknown, &procs));
+        assert!(all_but_5.matches(&host(6), &procs, None));
+        assert!(!all_but_5.matches(&host(5), &procs, None));
+        assert!(!all_but_5.matches(&Owner::Pending, &procs, None));
+        assert!(all_but_5.matches(&Owner::Unknown, &procs, None));
         // A sandboxed stream is another app even if its host pid is unknown ...
-        assert!(all_but_5.matches(&sandboxed(None), &procs));
+        assert!(all_but_5.matches(&sandboxed(None), &procs, None));
         // ... but it is excluded when it maps to the excluded pid.
-        assert!(!NodeFilter::AllExcept(30).matches(&sandboxed(Some("org.example.App")), &procs));
+        assert!(!NodeFilter::AllExcept(30).matches(
+            &sandboxed(Some("org.example.App")),
+            &procs,
+            None
+        ));
 
-        assert!(NodeFilter::ProcessTree(10).matches(&host(10), &procs));
-        assert!(NodeFilter::ProcessTree(10).matches(&host(30), &procs));
-        assert!(!NodeFilter::ProcessTree(20).matches(&host(10), &procs));
-        assert!(!NodeFilter::ProcessTree(10).matches(&Owner::Unknown, &procs));
-        assert!(!NodeFilter::ProcessTree(10).matches(&Owner::Pending, &procs));
+        assert!(NodeFilter::ProcessTree(10).matches(&host(10), &procs, None));
+        assert!(NodeFilter::ProcessTree(10).matches(&host(30), &procs, None));
+        assert!(!NodeFilter::ProcessTree(20).matches(&host(10), &procs, None));
+        assert!(!NodeFilter::ProcessTree(10).matches(&Owner::Unknown, &procs, None));
+        assert!(!NodeFilter::ProcessTree(10).matches(&Owner::Pending, &procs, None));
         // Sandboxed streams match by their host pid, never by the sandbox-internal one.
-        assert!(NodeFilter::ProcessTree(20).matches(&sandboxed(Some("org.example.App")), &procs));
-        assert!(!NodeFilter::ProcessTree(2).matches(&sandboxed(Some("org.example.App")), &procs));
-        assert!(!NodeFilter::ProcessTree(2).matches(&sandboxed(None), &procs));
+        assert!(NodeFilter::ProcessTree(20).matches(
+            &sandboxed(Some("org.example.App")),
+            &procs,
+            None
+        ));
+        assert!(!NodeFilter::ProcessTree(2).matches(
+            &sandboxed(Some("org.example.App")),
+            &procs,
+            None
+        ));
+        assert!(!NodeFilter::ProcessTree(2).matches(&sandboxed(None), &procs, None));
     }
 
     #[test]
@@ -2608,6 +2701,7 @@ mod tests {
         let procs = FakeProcs {
             parents: vec![(7001, 7000)],
             sandboxes: vec![((2, Some("org.mozilla.firefox")), 7001)],
+            own_app_id: None,
         };
         assert_eq!(
             g.apps(4242, &procs),
@@ -2629,6 +2723,74 @@ mod tests {
         assert!(g
             .plan_links(50, NodeFilter::ProcessTree(2), &procs)
             .is_empty());
+    }
+
+    /// Running as a Flatpak: our pid is namespace-local (2), our PulseAudio playback reports
+    /// that pid from our sandbox, and our native-socket streams carry our host pid.
+    #[test]
+    fn a_flatpak_build_excludes_its_own_streams_from_system_excl() {
+        const OURS: &str = "io.github.shdavlatbek.hfa";
+        let mut g = GraphModel::default();
+        let flatpak_pulse = |app_id: &str| {
+            let mut c = pulse_client();
+            c.apply_props(|k| match k {
+                "pipewire.access" => Some("flatpak"),
+                "pipewire.access.portal.app_id" => Some(app_id),
+                _ => None,
+            });
+            c
+        };
+        // Our capture node 50 belongs to our native client 1 (host pid 9000, sandboxed).
+        let mut own_client = client(Some(9000), Some(2), "headphone-for-all");
+        own_client.apply_props(|k| match k {
+            "pipewire.access" => Some("flatpak"),
+            "pipewire.access.portal.app_id" => Some(OURS),
+            _ => None,
+        });
+        g.clients.insert(1, own_client);
+        g.capture_nodes.insert(50, Some(1));
+        g.clients.insert(2, flatpak_pulse(OURS)); // our hub playback through pulse
+        g.clients.insert(3, flatpak_pulse("org.mozilla.firefox")); // also pid 2 in its sandbox
+        g.clients.insert(4, client(Some(400), Some(400), "mpv"));
+        g.nodes
+            .insert(20, stream_node(2, Some(2), Some("headphone-for-all")));
+        g.nodes.insert(21, stream_node(3, Some(2), Some("Firefox")));
+        g.nodes.insert(22, stream_node(1, None, None)); // our playback through the native socket
+        g.nodes.insert(23, stream_node(4, None, Some("mpv")));
+        for (id, p) in [
+            (500, port(50, false, "FL")),
+            (200, port(20, true, "FL")),
+            (210, port(21, true, "FL")),
+            (220, port(22, true, "FL")),
+            (230, port(23, true, "FL")),
+        ] {
+            g.ports.insert(id, p);
+        }
+        assert_eq!(g.own_host_pid(50), Some(9000));
+        let sandboxed = FakeProcs {
+            own_app_id: Some(OURS),
+            ..FakeProcs::default()
+        };
+        assert_eq!(
+            g.plan_links(50, NodeFilter::AllExcept(2), &sandboxed),
+            BTreeSet::from([link(21, 210, 500), link(23, 230, 500)]),
+            "our own pulse and native streams are excluded, Firefox (pid 2 too) is not"
+        );
+        // Not sandboxed ourselves: a sandboxed pid 2 is never us.
+        let host = FakeProcs::default();
+        assert!(g
+            .plan_links(50, NodeFilter::AllExcept(2), &host)
+            .contains(&link(20, 200, 500)));
+        // A sandboxed stream without an app id cannot be proven ours: it is captured.
+        let anonymous = Owner::Sandboxed {
+            pid: 2,
+            app_id: None,
+        };
+        assert!(!anonymous.is_own(2, Some(9000), &sandboxed));
+        assert!(NodeFilter::AllExcept(2).matches(&anonymous, &sandboxed, Some(9000)));
+        // Our kernel-verified host pid is excluded wherever it shows up.
+        assert!(!NodeFilter::AllExcept(2).matches(&Owner::Host(9000), &sandboxed, Some(9000)));
+        assert!(NodeFilter::AllExcept(2).matches(&Owner::Host(9001), &sandboxed, Some(9000)));
     }
 
     #[test]
