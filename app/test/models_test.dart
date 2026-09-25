@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/models/hub_target.dart';
 import 'package:headphone_for_all/src/models/source_choice.dart';
+import 'package:headphone_for_all/src/screens/pairing_sheet.dart';
 import 'package:headphone_for_all/src/util/format.dart';
 import 'package:headphone_for_all/src/widgets/level_meter.dart';
 
@@ -289,5 +290,17 @@ void main() {
       currentHubTarget(manual, discovered: {'hub1': hub}, peers: const [peer]),
       same(manual),
     );
+  });
+
+  test('the hub address is read from a pairing URI', () {
+    expect(
+      pairingUriAddress('hfa://pair?v=0&h=192.168.1.5&p=47810&id=x&t=y&n=D'),
+      '192.168.1.5:47810',
+    );
+    expect(
+      pairingUriAddress('hfa://pair?v=0&h=fe80::1&p=1&id=x'),
+      '[fe80::1]:1',
+    );
+    expect(pairingUriAddress('hfa://pair?v=0&id=x'), isNull);
   });
 }

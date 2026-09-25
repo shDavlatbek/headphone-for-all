@@ -20,6 +20,9 @@ enum PairingPhase {
 
   /// The window could not be opened.
   failed,
+
+  /// The hub stopped (which closes the window) while it was shown.
+  hubStopped,
 }
 
 /// State of the "Pair a device" sheet.
@@ -116,10 +119,11 @@ class PairingController extends Notifier<PairingState> {
     }
   }
 
-  /// Forgets the state without calling the core (the hub stopped).
+  /// The hub stopped: its window is gone (no core call). A sheet that is
+  /// still open says so instead of waiting forever.
   void reset() {
     _generation++;
-    state = const PairingState();
+    state = const PairingState(phase: PairingPhase.hubStopped);
   }
 
   /// A sender paired.

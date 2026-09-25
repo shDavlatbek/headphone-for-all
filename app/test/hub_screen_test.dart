@@ -143,6 +143,13 @@ void main() {
       find.textContaining(RegExp(r'Expires in [45]:\d\d')),
       findsOneWidget,
     );
+    // For "Add by address" where the QR code cannot be used.
+    expect(
+      tester
+          .widget<SelectableText>(find.byKey(const Key('pairing-address')))
+          .data,
+      '192.168.1.10:${fake.settings.port}',
+    );
 
     fake.emitHubEvent(const HubEventDto.pairingFailed(reason: 'wrong PIN'));
     await tester.pumpAndSettle();
@@ -170,6 +177,27 @@ void main() {
     await tester.pumpAndSettle();
     expect(fake.calls, contains('hubCancelPairing'));
     expect(fake.pairing, isNull);
+    await unmount(tester);
+  });
+
+  testWidgets('a hub stopped while pairing ends the sheet\'s wait', (
+    tester,
+  ) async {
+    final fake = fakeWithSources();
+    final container = await pumpApp(tester, fake, section: AppSection.hub);
+    await startHub(tester);
+    await tester.tap(find.byKey(const Key('pair-button')));
+    await tester.pumpAndSettle();
+    expect(find.text('482 913'), findsOneWidget);
+
+    // E.g. from the desktop tray.
+    await container.read(hubControllerProvider.notifier).stop();
+    await tester.pumpAndSettle();
+    expect(find.text('The hub stopped'), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
+    expect(find.text('The hub stopped'), findsNothing);
     await unmount(tester);
   });
 
