@@ -221,12 +221,17 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
 
 - `opus`: `frame_ms` must be one of 5, 10, 20, 40, 60 (2.5 ms is valid for libopus but not expressible in the
   integer field). Encoder: VBR, `ENCODER_COMPLEXITY` (10 on desktop, 7 on Android/iOS), `OPUS_SET_INBAND_FEC(1)` +
-  `OPUS_SET_PACKET_LOSS_PERC(expected_loss_pct)` when `fec` (loss 0 otherwise). libopus only carries in-band FEC in
-  SILK/hybrid packets; at music bitrates it stays in CELT until the expected loss is high (≈ 8 % for music), and
-  `decode_fec` on a CELT packet falls back to PLC — it always returns the requested frame count. **New**
-  `OpusEncoder::lookahead(&mut self) -> Result<usize>` (codec delay in samples per channel, 312 at 48 kHz).
-  `decode(&[])` is an `Opus{OPUS_BAD_ARG}` error (use `conceal`). `decode_fec`/`conceal` need `out.len()/channels`
-  to be a non-zero multiple of 2.5 ms (`BufferSize` otherwise). `set_bitrate`/`set_expected_loss` reject out-of-range
+  `OPUS_SET_PACKET_LOSS_PERC(expected_loss_pct)` when `fec` (loss 0 otherwise). **In-band FEC is content
+  dependent:** libopus only carries it (SILK LBRR) in SILK/hybrid packets. For music-like/stationary input it codes
+  CELT at our bitrates *whatever the expected loss* (measured: LBRR only in the ~300 ms encoder start-up, at
+  32–128 kbit/s and 5–30 % loss), so **raising `expected_loss_pct` does not buy FEC for music** — do not build a
+  loss-adaptation loop on that premise; real protection for music needs application-level redundancy. Speech-like
+  input gets hybrid + LBRR once the expected loss is ≳ 10 %. `decode_fec` on a packet without LBRR falls back to
+  PLC — it always returns the requested frame count. **New** `packet_has_fec(&[u8]) -> bool` (LBRR present).
+  **New** `OpusEncoder::lookahead(&mut self) -> Result<usize>` (codec delay in samples per channel, 312 at 48 kHz).
+  `decode(&[])` (a `FLAG_DTX` keep-alive's empty payload) conceals one frame like `conceal` (libopus treats
+  `len == 0` as a lost frame; after silent input the result is silence). `decode(&[])`/`decode_fec`/`conceal` need
+  `out.len()/channels` to be a non-zero multiple of 2.5 ms (`BufferSize` otherwise). `set_bitrate`/`set_expected_loss` reject out-of-range
   values with `Opus{OPUS_BAD_ARG}` and leave `config()` unchanged. Encoder and decoder implement `Debug`.
 - `jitter` (full semantics in the module docs):
   - **`PushResult::Overflow` now drops the *oldest* buffered slots** (the new packet is stored) when the buffer holds
@@ -239,7 +244,15 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
   - `JitterStats.lost` counts `Missing` frames plus slots skipped at priming or dropped by an overflow.
   - Target: rises immediately to `frame_ms + 3·J`, decays with time constant `TARGET_DECAY_MS = 8000` ms of pushed
     audio, clamped to `min..=max` and to `capacity · frame_ms`. Duplicates do not update `J`; late packets do.
-  - `reset()` keeps the statistics **and the jitter estimate / target** (they describe the network).
+  - `reset()` keeps the statistics **and the jitter estimate / target** (they describe the network). It also keeps
+    a **sequence floor**: afterwards every packet at or before the highest `seq` ever pushed is `TooLate` (seq is
+    never reused, so it predates the reset). **New** `reset_at(first_seq)`: same, but the floor is exactly
+    `first_seq − 1` (pass the `FLAG_RESET` packet's seq), so a reordered pre-reset straggler is never played after
+    the reset packet, while `first_seq` and later packets may still arrive in any order.
+  - **New `Pop::Stretch`** (and `JitterStats.stretched`, `#[serde(default)]`): while primed, when `target_ms −
+    buffered_ms > STRETCH_THRESHOLD_FRAMES (2) · frame_ms`, `pop()` asks for one synthesized frame *without*
+    consuming a packet, at most once every `STRETCH_MIN_INTERVAL = 10` pops. This lets the buffer follow a risen
+    target within about a second (the drift controller alone manages ≤ 2 ms/s).
 - `drift`: **defaults are now `kp = 5e-5`, `ki = 1e-6`** (`max_ppm = 2000`): `ωn ≈ 0.032 rad/s`, `ζ ≈ 0.8`. The
   error is low-pass filtered (`MEASUREMENT_TAU_S = 2.0` s) before the PI law; anti-windup clamps the integral term to
   `±max_ppm` and freezes the integrator while saturated. Non-finite input or `dt_s <= 0` leaves the state untouched.
@@ -251,7 +264,8 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
   1.05`); ratio changes are ramped over one chunk. `reset()` keeps the relative ratio. **New** getters
   `ratio_relative()`, `pending_frames()`, `output_delay()` (filter delay in output frames). Verified no allocation in
   `process` after warm-up when `out` has capacity (`tests/no_alloc.rs`).
-- `mixer`: new sources fade in from silence over their first block. With `limiter: false` the output is hard-clamped
+- `mixer`: new sources fade in from silence over their first block, and so does a source resuming after a tick in
+  which it had no input slice (the hub leaves a not-yet-primed or underrunning stream out of `inputs`). With `limiter: false` the output is hard-clamped
   to [-1, 1] (never exceeds full scale either way; NaN/inf inputs become 0). The limiter is a stereo-linked peak
   limiter (instant attack, `LIMITER_RELEASE_MS = 80`, `LIMITER_THRESHOLD = 0.966`). The ducking detector uses the
   post-gain RMS of unmuted priority sources in the current block. `levels()` are after gain, mute and ducking. Inputs
@@ -266,11 +280,14 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
   (the 10-minute drift simulation) run the sinc resampler at full speed.
 - **Hub per-stream recipe** (for `feat/core-engine`; exercised by `core/hfa-audio/tests/drift_sim.rs`): on receive,
   `jb.push(seq, timestamp, arrival_us, payload)`. Each mixer tick, while the stream's output FIFO holds less than one
-  frame: `match jb.pop()` — `Packet(p)` → `dec.decode(&p)`; `Missing{next: Some(n)}` → `dec.decode_fec(&n)` (the next
-  pop returns `n` itself, decoded normally); `Missing{next: None}` → `dec.conceal()`; then `rs.process(pcm, &mut
-  fifo)`; `Underrun` → contribute silence this tick (stop popping). Take one frame from the FIFO for the mixer. Then,
-  **while `jb.is_primed()`**, `let r = drift.update(jb.buffered_ms(), jb.target_ms(), frame_ms / 1000.0);
-  rs.set_ratio_relative(r)`. On `FLAG_RESET`: `jb.reset()`, `dec.reset()`, `rs.reset()`, `drift.reset()`.
+  frame: `match jb.pop()` — `Packet(p)` → `dec.decode(&p)` (an empty `p` is a DTX keep-alive and is concealed, see
+  `opus`); `Missing{next: Some(n)}` → `dec.decode_fec(&n)` (the next pop returns `n` itself, decoded normally);
+  `Missing{next: None}` and `Stretch` → `dec.conceal()`; then `rs.process(pcm, &mut fifo)`; `Underrun` → no audio
+  this tick (stop popping; leave the stream out of the mixer's `inputs` so it fades back in later). Take one frame
+  from the FIFO for the mixer. Then, **while `jb.is_primed()`**, `let r = drift.update(jb.buffered_ms(),
+  jb.target_ms(), frame_ms / 1000.0); rs.set_ratio_relative(r)`. On a `FLAG_RESET` packet with seq `R`:
+  `jb.reset_at(R)` before pushing it, then `dec.reset()`, `rs.reset()`, `drift.reset()` (these belong to the
+  mixer-side state; reset them before the first frame after the reset is decoded).
 
 ## 5. `hfa-capture` (OS audio I/O)
 
