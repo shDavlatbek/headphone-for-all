@@ -23,6 +23,10 @@
 //!   and both fit one datagram.
 //! - Fatal send errors (anything but a transient drop) end the stream and are reported to
 //!   the control task, which reconnects. The thread itself never logs.
+//! - About every 100 ms it asks the capture whether it failed for good
+//!   ([`CaptureSource::error`]) and reports that once ([`EncoderEvent::CaptureFailed`]); the
+//!   control task then stops the sender with that reason instead of sending keep-alives for a
+//!   dead capture forever.
 //!
 //! After warm-up the loop allocates only when a new stream starts or DTX ends (a new Opus
 //! encoder).
@@ -50,6 +54,9 @@ pub(crate) const SILENCE_DB: f32 = -70.0;
 pub(crate) const DTX_AFTER: Duration = Duration::from_millis(200);
 /// Interval between two DTX keep-alives.
 pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(100);
+/// How often the thread asks the capture whether it failed for good
+/// ([`CaptureSource::error`]).
+const CAPTURE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// Input read per step, in ms of capture audio.
 const READ_BLOCK_MS: u32 = 20;
 /// The 48 kHz FIFO never holds more than this many frames (older audio is dropped; only
@@ -83,6 +90,9 @@ pub(crate) enum EncoderEvent {
     },
     /// A non-fatal problem worth reporting (encoder errors...).
     Warning(String),
+    /// The capture failed for good ([`CaptureSource::error`]); it will deliver nothing any
+    /// more. Sent once.
+    CaptureFailed(String),
 }
 
 /// State shared with the engine (lock-free).
@@ -187,7 +197,7 @@ pub(crate) fn spawn(
     thread::Builder::new()
         .name("hfa-encoder".into())
         .spawn(move || {
-            worker.run();
+            worker.run(capture.as_ref());
             capture.stop();
         })
         .map_err(|e| CoreError::Io(format!("cannot start the encoder thread: {e}")))
@@ -234,11 +244,24 @@ impl EncoderThread {
         })
     }
 
-    fn run(&mut self) {
+    fn run(&mut self, capture: &dyn CaptureSource) {
         let idle = Duration::from_millis(u64::from(self.params.frame_ms)) / 4;
+        let mut next_check = Instant::now() + CAPTURE_CHECK_INTERVAL;
+        let mut capture_failed = false;
         while !self.shared.stop.load(Ordering::Acquire) {
             if !self.step() {
                 thread::sleep(idle);
+            }
+            if !capture_failed {
+                let now = Instant::now();
+                if now >= next_check {
+                    next_check = now + CAPTURE_CHECK_INTERVAL;
+                    // A dead capture looks like silence to `step` (DTX keep-alives forever).
+                    if let Some(reason) = capture.error() {
+                        capture_failed = true;
+                        let _ = self.events.send(EncoderEvent::CaptureFailed(reason));
+                    }
+                }
             }
         }
         self.stream = None;

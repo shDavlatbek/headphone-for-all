@@ -53,6 +53,20 @@ struct Report {
     late: u64,
     /// Tick of the last underrun after playout started (0 = none).
     last_underrun_tick: u64,
+    /// Slots the buffer discarded to cut latency (`JitterStats::skipped`).
+    skipped: u64,
+    /// `(second, buffered_ms − target_ms)` sampled once per simulated second.
+    excess_per_second: Samples,
+}
+
+/// Per-second samples (`Debug` prints only their number, to keep reports readable).
+#[derive(Default)]
+struct Samples(Vec<(u64, f64)>);
+
+impl std::fmt::Debug for Samples {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{} samples]", self.0.len())
+    }
 }
 
 /// Arrival jitter: uniform in `[0, before_us)` until `step_tick`, then `[0, after_us)`.
@@ -63,6 +77,9 @@ struct Jitter {
     after_us: f64,
     /// `false` emulates a hub that ignores `Pop::Stretch` (pops again instead), as a control.
     honor_stretch: bool,
+    /// `(from_us, until_us)`: every packet that would arrive in this window is held back
+    /// and released at `until_us` in one burst (Wi-Fi power save, a channel scan).
+    hold: Option<(f64, f64)>,
 }
 
 impl Jitter {
@@ -72,6 +89,7 @@ impl Jitter {
             step_tick: u64::MAX,
             after_us: max_us,
             honor_stretch: true,
+            hold: None,
         }
     }
 }
@@ -120,7 +138,12 @@ fn simulate(
             } else {
                 jitter.before_us
             };
-            let arrival = sent + 1_000.0 + rng.next_f64() * max_jitter_us;
+            let mut arrival = sent + 1_000.0 + rng.next_f64() * max_jitter_us;
+            if let Some((from, until)) = jitter.hold {
+                if arrival >= from && arrival < until {
+                    arrival = until;
+                }
+            }
             in_flight.push(Reverse((arrival as u64, next_send)));
             next_send += 1;
         }
@@ -144,11 +167,14 @@ fn simulate(
             match jb.pop() {
                 Pop::Packet(p) => {
                     let idx = u64::from_le_bytes(p[..8].try_into().unwrap());
+                    let skipped = jb.stats().skipped;
                     if let Some(e) = expected_idx {
-                        if idx != e {
+                        // Discarding slots to cut latency moves forward by exactly that many.
+                        if idx != e + (skipped - report.skipped) {
                             report.out_of_order += 1;
                         }
                     }
+                    report.skipped = skipped;
                     expected_idx = Some(idx + 1);
                     started = true;
                     pcm.fill(0.1);
@@ -183,6 +209,12 @@ fn simulate(
 
         let buffered = jb.buffered_ms();
         let target = jb.target_ms();
+        if tick % 100 == 0 {
+            report
+                .excess_per_second
+                .0
+                .push((tick / 100, buffered - target));
+        }
         if jb.is_primed() {
             let ratio = drift.update(buffered, target, 0.01);
             rs.set_ratio_relative(ratio).unwrap();
@@ -236,6 +268,7 @@ fn check(sender_ppm: f64, max_jitter_us: f64, extra_band_frames: f64, seed: u64)
     assert_eq!(r.late, 0, "late packets: {r:?}");
     assert_eq!(r.missing, 0, "missing frames: {r:?}");
     assert_eq!(r.out_of_order, 0, "{r:?}");
+    assert_eq!(r.skipped, 0, "nothing discarded in steady state: {r:?}");
     assert_eq!(
         r.stretched_after_convergence, 0,
         "stretching in steady state: {r:?}"
@@ -292,8 +325,10 @@ fn without_correction_the_buffer_drifts_away() {
     let slow = simulate(-300.0, 300, Jitter::constant(8_000.0), 7, off);
     // The draining buffer runs dry (the target is too low for stretching to kick in).
     assert!(slow.underruns_after_start > 0, "{slow:?}");
+    // The filling buffer is only held near its target by discarding audio (shrinking),
+    // which the controller avoids.
     let fast = simulate(300.0, 300, Jitter::constant(8_000.0), 8, off);
-    assert!(fast.worst_avg_error_ms > 40.0, "{fast:?}");
+    assert!(fast.skipped > 0, "{fast:?}");
 }
 
 /// A sudden jitter increase (2 ms → 40 ms after 30 s) raises the target at once. The first
@@ -309,6 +344,7 @@ fn jitter_step_is_followed_by_stretching_without_repeated_underruns() {
         step_tick,
         after_us: 40_000.0,
         honor_stretch: true,
+        hold: None,
     };
     let seeds = [
         0xA5A5_5A5A_1234_4321,
@@ -348,4 +384,59 @@ fn jitter_step_is_followed_by_stretching_without_repeated_underruns() {
         3 * total < control_total,
         "glitches with stretching: {total}, without: {control_total}"
     );
+}
+
+/// Reviewer scenario: after 10 s the network holds every packet for 500 ms and then releases
+/// them in one burst. The drift controller alone (≤ 2 ms/s) left the stream about 0.5 s late
+/// for about 4 minutes; the jitter buffer now discards the excess within a few seconds and
+/// the level then keeps tracking the target without underruns.
+#[test]
+fn a_hold_and_release_burst_does_not_leave_the_stream_late() {
+    for (ppm, seed) in [
+        (300.0, 0x4242_1111_2222_3333),
+        (-300.0, 0x0102_0304_0506_0708),
+    ] {
+        let jitter = Jitter {
+            hold: Some((10_000_000.0, 10_500_000.0)),
+            ..Jitter::constant(8_000.0)
+        };
+        let r = simulate(ppm, 120, jitter, seed, DriftConfig::default());
+        let excess = |second: u64| {
+            r.excess_per_second
+                .0
+                .iter()
+                .find(|(s, _)| *s == second)
+                .map(|(_, e)| *e)
+                .expect("sampled")
+        };
+        eprintln!(
+            "burst {ppm:+} ppm: skipped {}, excess at 11/13/20/60/120 s: {:.0} {:.0} {:.0} {:.0} {:.0}",
+            r.skipped,
+            excess(11),
+            excess(13),
+            excess(20),
+            excess(60),
+            excess(120)
+        );
+        assert!(r.skipped > 0, "{ppm}: nothing was discarded");
+        assert_eq!(r.out_of_order, 0, "{ppm}");
+        // Within 3 s of the burst the level is back near the target (the reviewer measured
+        // 470 ms of excess at 20 s and 390 ms at 60 s): within the shrink tolerance while the
+        // burst-inflated target decays, then within 2 frames.
+        for (second, e) in &r.excess_per_second.0 {
+            let limit = match second {
+                0..=12 => continue,
+                13..=44 => 4.0 * FRAME_MS,
+                _ => 2.0 * FRAME_MS,
+            };
+            assert!(*e <= limit, "{ppm}: {e} ms over the target at {second} s");
+        }
+        // ...and playout does not keep running dry afterwards (the stall itself underruns).
+        assert!(
+            r.last_underrun_tick < 12 * 100,
+            "{ppm}: underrun at tick {}",
+            r.last_underrun_tick
+        );
+        assert_eq!(r.overflows, 0, "{ppm}");
+    }
 }

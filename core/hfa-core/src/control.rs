@@ -708,6 +708,10 @@ async fn connect_inner(
     let hub_key = hs
         .remote_static()
         .ok_or_else(|| CoreError::Protocol("hub sent no static key".into()))?;
+    if hub_key == identity.public_key() {
+        // Loop protection: this device's own hub (e.g. its own address typed in).
+        return Err(CoreError::SelfConnection);
+    }
     expected.check(&hub_key)?;
     io.write_record(&hs.write_message(&[])?).await?;
     let mut ch = ControlChannel::new(io, hs.into_transport()?, peer_addr);
@@ -753,6 +757,11 @@ async fn accept_inner(
     let transport = hs.into_transport()?;
     let sender_key = transport.remote_static();
     let mut ch = ControlChannel::new(io, transport, addr);
+    if sender_key == identity.public_key() {
+        // Loop protection (a sender that did not check it itself).
+        ch.send_bye("own device").await;
+        return Err(CoreError::SelfConnection);
+    }
 
     let sender_hello = match check_hello(ch.recv().await?, Role::Sender, &sender_key) {
         Ok(h) => h,

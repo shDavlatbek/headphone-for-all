@@ -22,9 +22,14 @@
 //!   backoff ([`INITIAL_BACKOFF`] doubling up to [`MAX_BACKOFF`], back to the start after a
 //!   session that streamed) and starts a **new** stream (new `stream_id` and key). Pairing
 //!   and key errors ([`crate::CoreError::PairingRequired`], [`crate::CoreError::PairingFailed`],
-//!   [`crate::CoreError::KeyMismatch`]) are final: the state becomes [`SenderState::Failed`].
+//!   [`crate::CoreError::KeyMismatch`]) and [`crate::CoreError::SelfConnection`] (the hub is
+//!   this very device) are final: the state becomes [`SenderState::Failed`].
 //!   After the first connection the hub's key is pinned for every reconnect, and a pairing
 //!   secret is used at most once.
+//! - **Capture failure:** a capture that fails for good ([`CaptureSource::error`], polled by
+//!   the encoder thread) stops the stream (`StreamStop`) and the sender with
+//!   [`SenderState::Failed`]`("the audio capture stopped: <reason>")`, instead of passing for
+//!   silence (DTX keep-alives while showing `Streaming`).
 //! - [`SenderHandle::stop`] sends `StreamStop` + `Bye`, stops the encoder thread and the
 //!   capture, and waits for everything.
 
@@ -73,6 +78,11 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 type HubControls = (f32, bool, bool);
 /// Controls of a stream the hub announced nothing for.
 const DEFAULT_HUB_CONTROLS: HubControls = (1.0, false, false);
+/// Every this many pings the trust store is re-read from disk (5 s).
+const TRUST_RELOAD_PINGS: u64 = 5;
+/// Consecutive `Stats` saying the hub receives nothing ([`crate::hub::NO_MEDIA_LOSS_PCT`])
+/// before the sender reports it as an error.
+const NO_MEDIA_REPORTS: u32 = 3;
 
 /// How to reach the hub.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +356,7 @@ impl SenderEngine {
             stop: stop_rx,
             epoch: Instant::now(),
             hub_control: DEFAULT_HUB_CONTROLS,
+            no_media_reports: 0,
         };
         let task = tokio::spawn(control.run(thread));
         Ok(SenderHandle {
@@ -438,13 +449,16 @@ enum SessionEnd {
     },
     /// Give up (pairing or key errors).
     Fatal(CoreError),
+    /// The capture failed for good: give up with this reason.
+    CaptureFailed(String),
 }
 
 fn end_with(error: CoreError, streamed: bool) -> SessionEnd {
     match error {
-        CoreError::PairingRequired | CoreError::PairingFailed(_) | CoreError::KeyMismatch(_) => {
-            SessionEnd::Fatal(error)
-        }
+        CoreError::PairingRequired
+        | CoreError::PairingFailed(_)
+        | CoreError::KeyMismatch(_)
+        | CoreError::SelfConnection => SessionEnd::Fatal(error),
         other => SessionEnd::Retry {
             reason: other.to_string(),
             streamed,
@@ -474,6 +488,8 @@ struct Control {
     epoch: Instant,
     /// Gain, mute and priority the hub applies to our stream.
     hub_control: HubControls,
+    /// Consecutive `Stats` of the current stream saying the hub receives nothing.
+    no_media_reports: u32,
 }
 
 impl Control {
@@ -492,6 +508,7 @@ impl Control {
                     self.emit(SenderEvent::Error(message.clone()));
                     break SenderState::Failed(message);
                 }
+                SessionEnd::CaptureFailed(reason) => break self.capture_failed(reason),
                 SessionEnd::Retry { reason, streamed } => {
                     self.command(EncoderCommand::Clear);
                     if streamed {
@@ -503,10 +520,8 @@ impl Control {
                         backoff.as_secs()
                     )));
                     self.set_state(SenderState::Reconnecting);
-                    let mut stop = self.stop.clone();
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
-                        _ = wait_stop(&mut stop) => break SenderState::Stopped,
+                    if let Some(end) = self.wait_backoff(backoff).await {
+                        break end;
                     }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
@@ -526,6 +541,39 @@ impl Control {
 
     fn emit(&self, event: SenderEvent) {
         let _ = self.events.send(event);
+    }
+
+    /// Waits `backoff` before a reconnect; returns the final state if the sender was stopped
+    /// or its capture failed for good meanwhile.
+    async fn wait_backoff(&mut self, backoff: Duration) -> Option<SenderState> {
+        let mut stop = self.stop.clone();
+        let sleep = tokio::time::sleep(backoff);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => return None,
+                _ = wait_stop(&mut stop) => return Some(SenderState::Stopped),
+                event = self.encoder_events.recv() => match event {
+                    Some(EncoderEvent::CaptureFailed(reason)) => {
+                        return Some(self.capture_failed(reason));
+                    }
+                    Some(EncoderEvent::Warning(message)) => {
+                        tracing::warn!(%message, "encoder");
+                        self.emit(SenderEvent::Error(message));
+                    }
+                    Some(EncoderEvent::StreamFailed { .. }) => {}
+                    None => return Some(SenderState::Failed(CoreError::Closed.to_string())),
+                },
+            }
+        }
+    }
+
+    /// The capture died: report it and give up (a final state).
+    fn capture_failed(&self, reason: String) -> SenderState {
+        let message = format!("the audio capture stopped: {reason}");
+        tracing::warn!(%message, "sender failed");
+        self.emit(SenderEvent::Error(message.clone()));
+        SenderState::Failed(message)
     }
 
     fn command(&self, command: EncoderCommand) {
@@ -575,24 +623,36 @@ impl Control {
     }
 
     async fn connect_phase(&mut self) -> Result<(ControlChannel, PeerInfo)> {
-        let (addr, discovered_key, required_id) = self.resolve().await?;
+        let (addrs, discovered_key, required_id) = self.resolve().await?;
         let key = self.pinned.or(self.expected_hub_key).or(discovered_key);
         if self.secret.is_some()
             && !key.is_some_and(|k| self.trust.is_trusted_as(&k, PeerRole::Hub))
         {
             self.set_state(SenderState::Pairing);
         }
-        let secret = self.secret.as_ref().map(|s| s.as_str().to_owned());
-        ControlChannel::connect_checked(
-            addr,
-            &self.identity,
-            &self.trust,
-            key,
-            required_id.as_deref(),
-            secret,
-        )
-        .await
-        .map_err(|e| discovered_hub_error(&self.hub, addr, e))
+        // Every address in turn (IPv4 first), until one answers: a host may have an address
+        // the hub cannot be reached on (another family, another network).
+        let mut connected = Err(CoreError::HubNotFound("no address".into()));
+        for addr in addrs {
+            let secret = self.secret.as_ref().map(|s| s.as_str().to_owned());
+            connected = ControlChannel::connect_checked(
+                addr,
+                &self.identity,
+                &self.trust,
+                key,
+                required_id.as_deref(),
+                secret,
+            )
+            .await
+            .map_err(|e| discovered_hub_error(&self.hub, addr, e));
+            match &connected {
+                Err(CoreError::Io(e)) | Err(CoreError::Timeout(e)) => {
+                    tracing::debug!(%addr, error = %e, "hub address unreachable");
+                }
+                _ => break,
+            }
+        }
+        connected
     }
 
     fn on_connected(&mut self, peer: &PeerInfo) {
@@ -612,23 +672,22 @@ impl Control {
         }
     }
 
-    /// Hub socket address, the hub key known from the trust store (discovery), and the device
-    /// id the hub must have (discovery by id / pinned hub).
-    async fn resolve(&self) -> Result<(SocketAddr, Option<[u8; 32]>, Option<String>)> {
+    /// Hub socket addresses (IPv4 first), the hub key known from the trust store
+    /// (discovery), and the device id the hub must have (discovery by id / pinned hub).
+    async fn resolve(&self) -> Result<(Vec<SocketAddr>, Option<[u8; 32]>, Option<String>)> {
         match &self.hub {
             HubAddress::Direct { host, port } => {
                 let host = host.trim().trim_start_matches('[').trim_end_matches(']');
-                let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, *port))
+                let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, *port))
                     .await
                     .map_err(|e| CoreError::HubNotFound(format!("{host}: {e}")))?
                     .collect();
-                let addr = addrs
-                    .iter()
-                    .find(|a| a.is_ipv4())
-                    .or_else(|| addrs.first())
-                    .copied()
-                    .ok_or_else(|| CoreError::HubNotFound(host.to_owned()))?;
-                Ok((addr, None, None))
+                if addrs.is_empty() {
+                    return Err(CoreError::HubNotFound(host.to_owned()));
+                }
+                addrs.sort_by_key(SocketAddr::is_ipv6);
+                addrs.dedup();
+                Ok((addrs, None, None))
             }
             HubAddress::Discover { name_or_id } => {
                 let target = match self.pinned {
@@ -736,6 +795,8 @@ impl Control {
             self.emit_hub_control();
         }
         let stream_id = media.stream_id();
+        let media_port = media.dest().port();
+        self.no_media_reports = 0;
         tracing::info!(stream_id, dest = %media.dest(), "streaming");
         self.command(EncoderCommand::Stream {
             media,
@@ -762,13 +823,24 @@ impl Control {
                         Err(e) => return end_with(e, true),
                     };
                     last_rx = Instant::now();
-                    if let Some(end) = self.on_message(&mut ch, msg, stream_id).await {
+                    if let Some(end) = self.on_message(&mut ch, msg, stream_id, media_port).await {
                         self.command(EncoderCommand::Clear);
                         let _ = ch.close("stream ended").await;
                         return end;
                     }
                 }
                 _ = ping.tick() => {
+                    if self.pinned.is_some_and(|k| !self.trust.is_trusted_as(&k, PeerRole::Hub)) {
+                        // The hub was forgotten on this device while streaming (trust is
+                        // otherwise only checked at the handshake).
+                        self.command(EncoderCommand::Clear);
+                        let _ = ch.close("hub no longer trusted").await;
+                        tracing::info!("the hub was removed from the trusted devices; stopping");
+                        return SessionEnd::Fatal(CoreError::PairingRequired);
+                    }
+                    if nonce % TRUST_RELOAD_PINGS == TRUST_RELOAD_PINGS - 1 {
+                        crate::hub::reload_trust(&self.trust).await;
+                    }
                     if last_rx.elapsed() > HUB_TIMEOUT {
                         self.command(EncoderCommand::Clear);
                         let _ = ch.close("no answer").await;
@@ -794,6 +866,14 @@ impl Control {
                         tracing::warn!(%message, "encoder");
                         self.emit(SenderEvent::Error(message));
                     }
+                    Some(EncoderEvent::CaptureFailed(reason)) => {
+                        self.command(EncoderCommand::Clear);
+                        let stop = ControlMessage::new(Body::StreamStop(StreamStop { stream_id }));
+                        if ch.send(&stop).await.is_ok() {
+                            let _ = ch.close("capture failed").await;
+                        }
+                        return SessionEnd::CaptureFailed(reason);
+                    }
                     None => {
                         let _ = ch.close("encoder stopped").await;
                         return SessionEnd::Fatal(CoreError::Closed);
@@ -817,6 +897,7 @@ impl Control {
         ch: &mut ControlChannel,
         msg: ControlMessage,
         stream_id: u32,
+        media_port: u16,
     ) -> Option<SessionEnd> {
         match msg.body? {
             Body::Pong(p) => {
@@ -836,6 +917,19 @@ impl Control {
                 }
             }
             Body::Stats(s) if s.stream_id == stream_id => {
+                if s.loss_pct >= crate::hub::NO_MEDIA_LOSS_PCT {
+                    self.no_media_reports += 1;
+                    if self.no_media_reports == NO_MEDIA_REPORTS {
+                        let message = format!(
+                            "the hub receives no audio from this device (is UDP port \
+                             {media_port} blocked by a firewall on the hub or the network?)"
+                        );
+                        tracing::warn!("{message}");
+                        self.emit(SenderEvent::Error(message));
+                    }
+                } else {
+                    self.no_media_reports = 0;
+                }
                 let before = self.adapter.current();
                 let after = self.adapter.on_report(s.loss_pct, Instant::now());
                 if after != before {
@@ -920,7 +1014,7 @@ fn discovered_hub_error(hub: &HubAddress, addr: SocketAddr, error: CoreError) ->
 async fn discover(
     target: &str,
     trust: &TrustStore,
-) -> Result<(SocketAddr, Option<[u8; 32]>, Option<String>)> {
+) -> Result<(Vec<SocketAddr>, Option<[u8; 32]>, Option<String>)> {
     let mut browser = crate::discovery::browse()?;
     let by_id = hfa_proto::is_fingerprint(target);
     let wanted = target.to_lowercase();
@@ -949,13 +1043,14 @@ async fn discover(
         }
     }
     let info = best.ok_or_else(|| CoreError::HubNotFound(target.to_owned()))?;
-    let ip = info.addrs[0];
+    let mut addrs: Vec<SocketAddr> = info
+        .addrs
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, info.port))
+        .collect();
+    addrs.sort_by_key(SocketAddr::is_ipv6);
     let key = trust.get(&info.device_id).map(|p| p.public_key);
-    Ok((
-        SocketAddr::new(ip, info.port),
-        key,
-        by_id.then(|| target.to_owned()),
-    ))
+    Ok((addrs, key, by_id.then(|| target.to_owned())))
 }
 
 #[cfg(test)]
@@ -974,6 +1069,10 @@ mod tests {
         ));
         assert!(matches!(
             end_with(CoreError::KeyMismatch("x".into()), false),
+            SessionEnd::Fatal(_)
+        ));
+        assert!(matches!(
+            end_with(CoreError::SelfConnection, false),
             SessionEnd::Fatal(_)
         ));
         for e in [

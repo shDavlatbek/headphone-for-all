@@ -20,7 +20,8 @@
 //!   first pop, a packet older than the first buffered one is still accepted (start-up
 //!   reordering). When storing a packet would exceed `capacity` packets, or would make the
 //!   window span more than `capacity` sequence numbers (a jump ahead), the **oldest** buffered
-//!   slots are dropped (their frames count as lost), the new packet is stored, leading gaps
+//!   slots are dropped (counted in [`JitterStats::overflowed`], not as network loss: the
+//!   consumer did not keep up), the new packet is stored, leading gaps
 //!   are skipped and [`PushResult::Overflow`] is returned (if the new packet is itself the
 //!   oldest, it is the one dropped). A packet more than `capacity` behind the first
 //!   buffered one before playout starts is dropped (also `Overflow`).
@@ -37,6 +38,16 @@
 //!   [`Pop::Stretch`] instead of a frame (at most once every [`STRETCH_MIN_INTERVAL`] pops): the
 //!   caller synthesizes one frame (Opus PLC) without consuming a packet, so the buffer grows by
 //!   one frame. Counted in [`JitterStats::stretched`].
+//! - **Shrinking.** The symmetric case: a network stall followed by a burst (Wi-Fi power
+//!   save, a channel scan) can leave far more audio buffered than the target, and the drift
+//!   controller alone would take minutes to drain it (≤ 2 ms/s). So while primed, when the
+//!   buffer stays more than `max(SHRINK_THRESHOLD_FRAMES · frame_ms,
+//!   SHRINK_THRESHOLD_TARGET_FRACTION · target)` above the target for [`SHRINK_HOLD_MS`] of
+//!   pops in a row, [`JitterBuffer::pop`] silently discards the oldest slot before taking the
+//!   next one (at most once every [`SHRINK_MIN_INTERVAL`] pops, about 100 ms of audio per
+//!   second). An excess of more than [`MAX_EXCESS_MS`] is cut at once: the oldest slots are
+//!   discarded until the buffer is within one frame of the target. Discarded slots are
+//!   counted in [`JitterStats::skipped`], not as loss (they were a local latency decision).
 //! - **Reset.** [`JitterBuffer::reset`] drops packets and playout state but keeps the
 //!   statistics and the jitter/target estimate (they describe the network, not the stream).
 //!   `seq` keeps increasing across a `FLAG_RESET` (it is never reused), so the buffer keeps a
@@ -59,6 +70,24 @@ pub const STRETCH_THRESHOLD_FRAMES: f64 = 2.0;
 /// Minimum number of pops between two [`Pop::Stretch`] results (spreads the inserted
 /// concealment frames out so each one is short and isolated).
 pub const STRETCH_MIN_INTERVAL: u32 = 10;
+
+/// Shrinking starts once the excess over the target exceeds this many frames (and
+/// [`SHRINK_THRESHOLD_TARGET_FRACTION`] of the target).
+pub const SHRINK_THRESHOLD_FRAMES: f64 = 3.0;
+
+/// Shrinking starts once the excess over the target exceeds this fraction of the target (and
+/// [`SHRINK_THRESHOLD_FRAMES`] frames).
+pub const SHRINK_THRESHOLD_TARGET_FRACTION: f64 = 0.5;
+
+/// How long (in ms of popped audio) the excess must persist before a frame is discarded, so
+/// ordinary arrival jitter never triggers it.
+pub const SHRINK_HOLD_MS: f64 = 500.0;
+
+/// Minimum number of pops between two single-frame discards.
+pub const SHRINK_MIN_INTERVAL: u32 = 10;
+
+/// An excess over the target larger than this (ms) is discarded at once.
+pub const MAX_EXCESS_MS: f64 = 200.0;
 
 /// Media timestamp rate (samples per second) used for the jitter estimate.
 const TIMESTAMP_RATE_HZ: f64 = 48_000.0;
@@ -131,8 +160,10 @@ pub enum Pop {
 pub struct JitterStats {
     /// Packets accepted.
     pub received: u64,
-    /// Frames lost: reported as [`Pop::Missing`], never-received slots skipped when playout
-    /// starts on the first real packet, and slots (received or not) dropped by an overflow.
+    /// Frames lost in the network: reported as [`Pop::Missing`], never-received slots skipped
+    /// when playout starts on the first real packet, and sequence numbers jumped over. Slots
+    /// dropped by an overflow are counted in `overflowed` instead (a local cause: the consumer
+    /// did not keep up), frames discarded to cut latency in `skipped`.
     pub lost: u64,
     /// Packets rejected as [`PushResult::TooLate`].
     pub late: u64,
@@ -143,6 +174,14 @@ pub struct JitterStats {
     /// Frames synthesized on request ([`Pop::Stretch`]) to grow the buffer towards the target.
     #[serde(default)]
     pub stretched: u64,
+    /// Buffered slots (received or not) dropped because the buffer was full or the window too
+    /// wide ([`PushResult::Overflow`]).
+    #[serde(default)]
+    pub overflowed: u64,
+    /// Slots discarded because far more audio was buffered than the target (see the module
+    /// docs, "Shrinking").
+    #[serde(default)]
+    pub skipped: u64,
 }
 
 /// `seq + n` (wrapping); `seq` is only `None` before the first packet, where 0 is used.
@@ -170,6 +209,11 @@ pub struct JitterBuffer {
     primed: bool,
     /// Pops left before another [`Pop::Stretch`] may be returned.
     stretch_cooldown: u32,
+    /// Pops left before another single-frame discard (shrinking).
+    shrink_cooldown: u32,
+    /// Popped audio (ms) during which the excess over the target stayed above the shrink
+    /// threshold without interruption.
+    excess_ms: f64,
     stats: JitterStats,
     /// RFC 3550 jitter estimate in ms.
     jitter_ms: f64,
@@ -192,6 +236,8 @@ impl JitterBuffer {
             floor: None,
             primed: false,
             stretch_cooldown: 0,
+            shrink_cooldown: 0,
+            excess_ms: 0.0,
             stats: JitterStats::default(),
             jitter_ms: 0.0,
             prev_arrival: None,
@@ -250,10 +296,51 @@ impl JitterBuffer {
         slot
     }
 
-    /// Drops the oldest slot; its frame will never be played, so it counts as lost.
+    /// Drops the oldest slot to make room (an overflow); its frame will never be played.
     fn drop_front(&mut self) {
         self.advance();
-        self.stats.lost += 1;
+        self.stats.overflowed += 1;
+    }
+
+    /// Discards the oldest slot to cut latency (shrinking); keeps at least one packet.
+    fn skip_front(&mut self) {
+        if self.count > 1 || matches!(self.slots.front(), Some(None)) {
+            self.advance();
+            self.stats.skipped += 1;
+        }
+    }
+
+    /// Shrinking (see the module docs): discards slots while far more audio is buffered
+    /// than the target. Called by `pop` while primed, with at least one packet buffered.
+    fn shrink(&mut self) {
+        let frame = f64::from(self.config.frame_ms);
+        let excess = self.buffered_ms() - self.target_ms;
+        if excess > MAX_EXCESS_MS {
+            // A burst after a stall: cut straight back to the target.
+            while self.count > 1 && self.buffered_ms() - self.target_ms > frame {
+                self.skip_front();
+            }
+            // Playout resumes on a real packet, not on a gap left by the cut.
+            while matches!(self.slots.front(), Some(None)) {
+                self.skip_front();
+            }
+            self.excess_ms = 0.0;
+            self.shrink_cooldown = SHRINK_MIN_INTERVAL;
+            return;
+        }
+        let threshold = (SHRINK_THRESHOLD_FRAMES * frame)
+            .max(SHRINK_THRESHOLD_TARGET_FRACTION * self.target_ms);
+        if excess > threshold {
+            self.excess_ms += frame;
+        } else {
+            self.excess_ms = 0.0;
+        }
+        if self.shrink_cooldown > 0 {
+            self.shrink_cooldown -= 1;
+        } else if self.excess_ms >= SHRINK_HOLD_MS && self.count > 1 {
+            self.shrink_cooldown = SHRINK_MIN_INTERVAL - 1;
+            self.skip_front();
+        }
     }
 
     /// Skips leading never-received slots (counted as lost).
@@ -398,6 +485,7 @@ impl JitterBuffer {
             self.primed = false;
             return Pop::Underrun;
         }
+        self.shrink();
         if self.stretch_cooldown > 0 {
             self.stretch_cooldown -= 1;
         } else if self.target_ms - self.buffered_ms()
@@ -459,6 +547,30 @@ impl JitterBuffer {
         self.reset_state(Some(first_seq.wrapping_sub(1)));
     }
 
+    /// The highest `seq` pushed so far (wrap-aware; kept across resets), `None` before the
+    /// first packet.
+    pub fn highest_seq(&self) -> Option<u32> {
+        self.highest_seq
+    }
+
+    /// For a `FLAG_RESET` packet with seq `first_seq` that arrives **after** later packets of
+    /// the same restart (reordered): if playout has not started since the last reset, lowers
+    /// the sequence floor so that `first_seq` (and anything between it and the current window)
+    /// is still accepted instead of being [`PushResult::TooLate`]. Does nothing once a frame
+    /// was played or skipped, or when there was no reset. Unlike [`JitterBuffer::reset_at`],
+    /// buffered packets are kept.
+    pub fn lower_floor(&mut self, first_seq: u32) {
+        if self.anchored {
+            return;
+        }
+        let wanted = first_seq.wrapping_sub(1);
+        if let Some(floor) = self.floor.as_mut() {
+            if (wanted.wrapping_sub(*floor) as i32) < 0 {
+                *floor = wanted;
+            }
+        }
+    }
+
     fn reset_state(&mut self, floor: Option<u32>) {
         self.slots.clear();
         self.next_seq = None;
@@ -466,6 +578,8 @@ impl JitterBuffer {
         self.anchored = false;
         self.primed = false;
         self.stretch_cooldown = 0;
+        self.shrink_cooldown = 0;
+        self.excess_ms = 0.0;
         self.prev_arrival = None;
         self.floor = floor;
     }
@@ -657,7 +771,8 @@ mod tests {
         assert_eq!(jb.buffered_ms(), 40.0);
         assert_eq!(jb.pop(), pkt(1));
         assert_eq!(push(&mut jb, 0), PushResult::TooLate);
-        assert_eq!(jb.stats().lost, 1);
+        // A local cause (nobody popped), not network loss.
+        assert_eq!((jb.stats().lost, jb.stats().overflowed), (0, 1));
         // Span limit: seq 5 would need a 5-slot window (1..=5) with capacity 4.
         let mut jb = JitterBuffer::new(JitterConfig {
             capacity: 4,
@@ -673,7 +788,7 @@ mod tests {
         assert_eq!(jb.pop(), pkt(3));
         assert_eq!(jb.pop(), pkt(4));
         assert_eq!(jb.pop(), pkt(5));
-        assert_eq!(jb.stats().lost, 1);
+        assert_eq!((jb.stats().lost, jb.stats().overflowed), (0, 1));
         // Before playout, a packet too far behind the window is dropped.
         let mut jb = JitterBuffer::new(JitterConfig {
             capacity: 4,
@@ -698,7 +813,8 @@ mod tests {
         push(&mut jb, 1_002);
         assert_eq!(jb.pop(), pkt(1_000));
         // 1, 2, 3 were dropped and 4..=999 never arrived.
-        assert_eq!(jb.stats().lost, 999);
+        assert_eq!(jb.stats().overflowed, 3);
+        assert_eq!(jb.stats().lost, 996);
         assert_eq!(push(&mut jb, 999), PushResult::TooLate);
     }
 
@@ -864,5 +980,139 @@ mod tests {
         // what is buffered.)
         assert_eq!(jb.buffered_ms(), 30.0);
         assert_eq!(jb.stats().late, 2);
+    }
+
+    /// Pushes `seq` arriving at `arrival_ms` (timestamp = seq · 480).
+    fn push_at(jb: &mut JitterBuffer, seq: u32, arrival_ms: u64) -> PushResult {
+        jb.push(
+            seq,
+            seq * 480,
+            arrival_ms * 1000,
+            seq.to_be_bytes().to_vec(),
+        )
+    }
+
+    /// Reviewer scenario: the network holds packets for 500 ms and releases them in one
+    /// burst. The excess over the target is cut at once instead of draining at the drift
+    /// controller's ≤ 2 ms/s for minutes, and the cut is not counted as loss.
+    #[test]
+    fn a_burst_after_a_stall_is_cut_back_to_the_target() {
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        let mut seq = 0_u32;
+        let mut played = Vec::new();
+        let pop = |jb: &mut JitterBuffer, played: &mut Vec<u32>| {
+            if let Pop::Packet(p) = jb.pop() {
+                played.push(u32::from_be_bytes([p[0], p[1], p[2], p[3]]));
+            }
+        };
+        // 2 s of steady 10 ms packets, one pop per tick.
+        for tick in 0..200_u64 {
+            push_at(&mut jb, seq, tick * 10);
+            seq += 1;
+            pop(&mut jb, &mut played);
+        }
+        let steady_target = jb.target_ms();
+        // 500 ms stall: nothing arrives, the buffer runs dry.
+        for _ in 0..50 {
+            pop(&mut jb, &mut played);
+        }
+        // Everything held back arrives at once, then the stream continues normally.
+        for _ in 0..50 {
+            push_at(&mut jb, seq, 2_500);
+            seq += 1;
+        }
+        assert!(jb.buffered_ms() >= 450.0, "{}", jb.buffered_ms());
+        for tick in 250..300_u64 {
+            push_at(&mut jb, seq, tick * 10);
+            seq += 1;
+            pop(&mut jb, &mut played);
+        }
+        let excess = jb.buffered_ms() - jb.target_ms();
+        assert!(
+            excess <= 2.0 * 10.0,
+            "excess {excess} ms (buffered {}, target {}, steady target {steady_target})",
+            jb.buffered_ms(),
+            jb.target_ms()
+        );
+        let st = jb.stats();
+        assert!(st.skipped >= 20, "{st:?}");
+        assert_eq!((st.lost, st.overflowed), (0, 0), "{st:?}");
+        // Order is kept (a cut only moves forward).
+        assert!(played.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    /// A moderate excess that persists is shrunk one frame at a time, spaced out; ordinary
+    /// jitter (a short excess) never is.
+    #[test]
+    fn a_persistent_moderate_excess_is_shrunk_gradually() {
+        let mut jb = JitterBuffer::new(fixed_cfg());
+        // Prime with 10 packets (100 ms, target 30 ms): 70 ms of excess.
+        for s in 0..10 {
+            push(&mut jb, s);
+        }
+        let mut skips_at = Vec::new();
+        let mut seq = 10_u32;
+        for tick in 0..300_u32 {
+            let before = jb.stats().skipped;
+            let _ = jb.pop();
+            if jb.stats().skipped > before {
+                skips_at.push(tick);
+            }
+            push(&mut jb, seq);
+            seq += 1;
+        }
+        // Nothing before the hold time (500 ms = 50 pops), then spaced-out single frames
+        // until the excess is under the threshold (3 frames).
+        assert!(!skips_at.is_empty());
+        assert!(skips_at[0] >= 49, "{skips_at:?}");
+        assert!(skips_at
+            .windows(2)
+            .all(|w| w[1] - w[0] >= SHRINK_MIN_INTERVAL));
+        assert!(
+            jb.buffered_ms() - jb.target_ms() <= 30.0,
+            "{}",
+            jb.buffered_ms()
+        );
+        assert_eq!(jb.stats().lost, 0);
+
+        // A short excess (under the hold time) is left alone.
+        let mut jb = JitterBuffer::new(fixed_cfg());
+        for s in 0..8 {
+            push(&mut jb, s);
+        }
+        for s in 8..30 {
+            let _ = jb.pop();
+            if s % 2 == 0 {
+                push(&mut jb, s);
+            }
+        }
+        assert_eq!(jb.stats().skipped, 0);
+    }
+
+    #[test]
+    fn lower_floor_admits_a_reordered_reset_packet_until_playout_starts() {
+        // reset_at(11) (the first packet after DTX was 11), then the reset packet 10 arrives.
+        let mut jb = JitterBuffer::new(fixed_cfg());
+        for s in 0..4 {
+            push(&mut jb, s);
+        }
+        jb.reset_at(11);
+        assert_eq!(push(&mut jb, 11), PushResult::Accepted);
+        assert_eq!(push(&mut jb, 12), PushResult::Accepted);
+        assert_eq!(jb.highest_seq(), Some(12));
+        jb.lower_floor(10);
+        assert_eq!(push(&mut jb, 10), PushResult::Accepted);
+        assert_eq!(push(&mut jb, 9), PushResult::TooLate, "pre-reset straggler");
+        assert_eq!(jb.pop(), pkt(10));
+        assert_eq!(jb.pop(), pkt(11));
+        assert_eq!(jb.pop(), pkt(12));
+        assert_eq!(jb.stats().lost, 0);
+        // Once playout started, the floor no longer moves.
+        jb.lower_floor(5);
+        assert_eq!(push(&mut jb, 8), PushResult::TooLate);
+        // Never raised, and a no-op without a reset.
+        let mut jb = JitterBuffer::new(fixed_cfg());
+        jb.lower_floor(100);
+        assert_eq!(push(&mut jb, 3), PushResult::Accepted);
     }
 }

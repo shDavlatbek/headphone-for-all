@@ -4,8 +4,10 @@
 //! # Structure
 //!
 //! - **Sockets:** TCP (control) and UDP (media) are bound on the same port number
-//!   (`settings.port`; `0` picks a free number for both, see [`HubHandle::local_port`]). A
-//!   port that is already taken is an error ([`crate::CoreError::Io`] naming the port).
+//!   (`settings.port`; `0` picks a free number for both, see [`HubHandle::local_port`]), as
+//!   dual-stack IPv6 sockets (`[::]`, `IPV6_V6ONLY` off: IPv6 and IPv4 peers), or on IPv4
+//!   `0.0.0.0` only when the host has no IPv6. A port that is already taken is an error
+//!   ([`crate::CoreError::Io`] naming the port).
 //! - **Accept loop** (tokio): one task per sender connection ([`ControlChannel::accept`] with
 //!   the hub's [`PairingManager`]; [`HubEvent::PairingCompleted`] /
 //!   [`HubEvent::PairingFailed`]). Unauthenticated connections are limited, so nobody on the
@@ -13,7 +15,8 @@
 //!   [`FIRST_MESSAGE_TIMEOUT`]; at most [`MAX_PENDING_PER_IP`] handshakes per IP address run
 //!   at once (more are closed); when [`MAX_PENDING_HANDSHAKES`] are running, the oldest is
 //!   dropped for a newcomer. Authenticated connections (at most [`MAX_CONNECTIONS`]) do not
-//!   count against that budget; one that owns no stream for [`NO_STREAM_TIMEOUT`] is closed.
+//!   count against that budget; one that owns no stream for [`NO_STREAM_TIMEOUT`], or that
+//!   sent nothing (senders ping every second) for [`CONTROL_IDLE_TIMEOUT`], is closed.
 //!   Then:
 //!   - `StreamStart` is validated (48 kHz, 2 channels, `frame_ms` 10 or 20, a 32-byte key, at
 //!     most [`MAX_STREAMS`] streams, a stream id not in use) and registered with the
@@ -24,7 +27,10 @@
 //!     ([`HubEvent::SourceRemoved`]); `Ping` is answered with `Pong`.
 //!   - The hub's own controls ([`HubHandle::set_gain`], ...) are forwarded to the sender as
 //!     `SetVolume` / `SetMute` / `SetPriority` so its UI can show them. Controls are
-//!     remembered per device id and re-applied when the device reconnects.
+//!     remembered per device id and re-applied when the device reconnects, also after a hub
+//!     restart: they are saved in `<data_dir>/`[`HUB_CONTROLS_FILE`] (at most
+//!     [`PREFS_SAVE_DELAY`] after a change, and when the hub stops) and loaded on start;
+//!     devices that are no longer trusted are left out.
 //! - **Receive task** (tokio): UDP (a 64 KiB buffer, so an oversize datagram cannot make the
 //!   receive fail on Windows; per-datagram errors never pause the loop) →
 //!   [`MediaDemux::open`] (authentication, replay window) →
@@ -36,17 +42,21 @@
 //!   → mixer (gain, mute, priority ducking, limiter) → output format → output ring. It polls
 //!   [`AudioOutput::has_error`] and restarts a failed output.
 //! - **Stats task:** every [`STATS_INTERVAL`] it refreshes each [`SourceInfo`]
-//!   ([`HubEvent::SourceUpdated`]) and sends `Stats` to its sender. `Stats.loss_pct` is the
-//!   **network** loss (before recovery, what the sender adapts to); [`StreamStats::loss_pct`]
-//!   is the loss left after redundancy/FEC. A stream without datagrams (audio or DTX
-//!   keep-alives) for [`IDLE_AFTER`] is inactive; after [`REMOVE_AFTER`] it is removed and
-//!   its connection closed.
+//!   ([`HubEvent::SourceUpdated`]) and sends `Stats` to its sender whenever a loss measurement
+//!   completed (at least 40 frames, or none at all during DTX; a partial interval is extended
+//!   and not reported). `Stats.loss_pct` is the **network** loss (before recovery, what the
+//!   sender adapts to); [`StreamStats::loss_pct`] is what the listener misses after
+//!   redundancy/FEC. A stream without datagrams (audio or DTX keep-alives) for [`IDLE_AFTER`]
+//!   is inactive and reported to its sender as [`NO_MEDIA_LOSS_PCT`] loss (nothing arrives);
+//!   after [`REMOVE_AFTER`] it is removed and its connection closed. So is the stream of a
+//!   device that is no longer trusted (the store is shared with the rest of the process and
+//!   re-read from disk every 5 s, see [`TrustStore`]).
 //! - [`HubHandle::stop`] closes every connection with `Bye`, stops advertising, the tasks,
 //!   the mixer and the output.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,6 +78,7 @@ use crate::config::{Settings, FRAME_MS_CHOICES};
 use crate::control::{ControlChannel, PeerInfo};
 use crate::discovery::Advertiser;
 use crate::hub_mixer::{Controls, MixStream, MixerCommand, StreamShared};
+pub use crate::hub_prefs::HUB_CONTROLS_FILE;
 use crate::identity::{Identity, PeerRole, TrustStore};
 use crate::media::MediaDemux;
 use crate::pairing::{PairingInfo, PairingManager, DEFAULT_PAIRING_TTL};
@@ -80,6 +91,10 @@ pub const STATS_INTERVAL: Duration = Duration::from_secs(1);
 pub const IDLE_AFTER: Duration = Duration::from_secs(2);
 /// A stream without packets for this long is removed.
 pub const REMOVE_AFTER: Duration = Duration::from_secs(30);
+/// `Stats.loss_pct` sent for a stream that received no datagram at all (not even a DTX
+/// keep-alive) for [`IDLE_AFTER`]: everything is lost on the way (e.g. a firewall that lets
+/// the TCP control connection through but blocks UDP).
+pub const NO_MEDIA_LOSS_PCT: f32 = 100.0;
 /// Most streams the hub mixes at once.
 pub const MAX_STREAMS: usize = 16;
 /// Most simultaneous authenticated control connections.
@@ -93,12 +108,20 @@ pub const MAX_PENDING_PER_IP: usize = 4;
 pub const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// An authenticated connection without a stream for this long is closed.
 pub const NO_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+/// An authenticated connection that sent nothing (senders `Ping` every second) for this long
+/// is closed: its peer is gone, e.g. it changed networks and left a half-open connection.
+pub const CONTROL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long after a control change the remembered controls are saved (changes in between,
+/// e.g. a slider drag, are saved together).
+pub const PREFS_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Jitter-buffer target before the first jitter estimate (clamped to the settings' bounds).
 const INITIAL_JITTER_TARGET_MS: u32 = 40;
 /// Capacity of the event channel.
 const EVENT_CAPACITY: usize = 256;
 /// Fewest frames a loss measurement covers (a shorter interval is extended).
 const MIN_FRAMES_FOR_LOSS: u64 = 40;
+/// Every this many stats ticks the trust store is re-read from disk (5 s).
+const TRUST_RELOAD_TICKS: u32 = 5;
 /// How often a free TCP port is tried when `settings.port` is 0 and its UDP twin is taken.
 const PORT_ATTEMPTS: usize = 16;
 /// How long [`HubHandle::stop`] waits for the connections to say `Bye`.
@@ -131,14 +154,16 @@ impl fmt::Debug for HubConfig {
 /// Receive statistics of one stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamStats {
-    /// Packet loss (after FEC) over the last second, in percent.
+    /// Frames missing from the output over the last second (lost and not recovered by
+    /// redundancy/FEC, or dropped by a jitter-buffer overflow), in percent.
     pub loss_pct: f32,
     /// Interarrival jitter in ms.
     pub jitter_ms: f32,
     /// Jitter-buffer fill in ms.
     pub buffer_ms: f32,
-    /// Estimated end-to-end latency in ms (jitter target + frame + output ring fill target +
-    /// the output's own latency).
+    /// Estimated end-to-end latency in ms (audio queued in the jitter buffer — its target
+    /// before playout starts — + frame + output ring fill target + the output's own
+    /// latency).
     pub latency_ms: f32,
     /// Post-gain level in dBFS.
     pub level_db: f32,
@@ -221,7 +246,7 @@ pub struct StreamCounters {
     pub resets: u64,
     /// Frames decoded from their own packet.
     pub played: u64,
-    /// Frames the jitter buffer reported lost (never arrived, too late, dropped by overflow).
+    /// Frames lost in the network (never arrived in time; the jitter buffer's `lost`).
     pub lost: u64,
     /// Packets that arrived after their frame was played.
     pub late: u64,
@@ -237,6 +262,14 @@ pub struct StreamCounters {
     pub stretched: u64,
     /// Ticks in which a playing stream ran dry (outside DTX).
     pub underruns: u64,
+    /// Buffered frames dropped because the jitter buffer was full (the mixer did not keep
+    /// up; not network loss).
+    #[serde(default)]
+    pub overflowed: u64,
+    /// Frames discarded because far more audio was buffered than the target (cuts the
+    /// latency a network burst left behind).
+    #[serde(default)]
+    pub skipped: u64,
 }
 
 /// Entry point of the hub engine.
@@ -265,6 +298,12 @@ impl HubEngine {
             )));
         }
         let (identity, trust) = load_identity(&settings).await?;
+        let prefs = {
+            let (dir, trust) = (settings.data_dir.clone(), trust.clone());
+            tokio::task::spawn_blocking(move || crate::hub_prefs::load(&dir, &trust))
+                .await
+                .unwrap_or_default()
+        };
         let (listener, udp) = bind(settings.port).await?;
         let port = listener.local_addr()?.port();
 
@@ -321,7 +360,11 @@ impl HubEngine {
             settings,
             port,
             events: events.clone(),
-            state: Mutex::new(HubState::default()),
+            state: Mutex::new(HubState {
+                sources: Vec::new(),
+                prefs,
+            }),
+            prefs_changed: tokio::sync::Notify::new(),
             demux: Mutex::new(MediaDemux::new()),
             streams: Mutex::new(HashMap::new()),
             mixer: mixer_tx,
@@ -343,7 +386,8 @@ impl HubEngine {
                 Arc::new(udp),
                 shutdown_rx.clone(),
             )),
-            tokio::spawn(stats_loop(Arc::clone(&shared), shutdown_rx)),
+            tokio::spawn(stats_loop(Arc::clone(&shared), shutdown_rx.clone())),
+            tokio::spawn(prefs_loop(Arc::clone(&shared), shutdown_rx)),
         ];
         Ok(HubHandle {
             events,
@@ -359,11 +403,82 @@ impl HubEngine {
     }
 }
 
-/// Binds TCP and UDP on the same port number (see the module docs).
+/// Address families the hub listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stack {
+    /// One IPv6 socket per protocol with `IPV6_V6ONLY` off: IPv6 and (IPv4-mapped) IPv4.
+    Dual,
+    /// IPv4 only (the host has no IPv6).
+    V4,
+}
+
+/// A bind failure: which protocol, and the error.
+type BindError = (&'static str, std::io::Error);
+
+fn new_socket(stack: Stack, ty: socket2::Type, port: u16) -> std::io::Result<socket2::Socket> {
+    use socket2::{Domain, Socket};
+    let (domain, addr): (Domain, std::net::SocketAddr) = match stack {
+        Stack::Dual => (Domain::IPV6, (Ipv6Addr::UNSPECIFIED, port).into()),
+        Stack::V4 => (Domain::IPV4, (Ipv4Addr::UNSPECIFIED, port).into()),
+    };
+    let socket = Socket::new(domain, ty, None)?;
+    if stack == Stack::Dual {
+        socket.set_only_v6(false)?;
+    }
+    // Like `tokio::net::TcpListener::bind`: a restarted hub can take its port back at once
+    // (not on Windows, where SO_REUSEADDR would let another socket steal a bound port).
+    #[cfg(not(windows))]
+    if ty == socket2::Type::STREAM {
+        socket.set_reuse_address(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket)
+}
+
+fn tcp_listener(stack: Stack, port: u16) -> std::io::Result<TcpListener> {
+    let socket = new_socket(stack, socket2::Type::STREAM, port)?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
+}
+
+fn udp_socket(stack: Stack, port: u16) -> std::io::Result<UdpSocket> {
+    let socket = new_socket(stack, socket2::Type::DGRAM, port)?;
+    UdpSocket::from_std(socket.into())
+}
+
+/// Binds TCP and UDP on the same port number in `stack` (port 0: any number free for both).
+fn bind_stack(stack: Stack, port: u16) -> std::result::Result<(TcpListener, UdpSocket), BindError> {
+    if port != 0 {
+        let tcp = tcp_listener(stack, port).map_err(|e| ("TCP", e))?;
+        let udp = udp_socket(stack, port).map_err(|e| ("UDP", e))?;
+        return Ok((tcp, udp));
+    }
+    for _ in 0..PORT_ATTEMPTS {
+        let tcp = tcp_listener(stack, 0).map_err(|e| ("TCP", e))?;
+        let chosen = tcp.local_addr().map_err(|e| ("TCP", e))?.port();
+        match udp_socket(stack, chosen) {
+            Ok(udp) => return Ok((tcp, udp)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => return Err(("UDP", e)),
+        }
+    }
+    Err((
+        "UDP",
+        std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "found no port number free for both TCP and UDP",
+        ),
+    ))
+}
+
+/// Binds TCP and UDP on the same port number (see the module docs): dual-stack (IPv6 and
+/// IPv4) where the host supports IPv6, else IPv4 only.
 async fn bind(port: u16) -> Result<(TcpListener, UdpSocket)> {
-    let any = Ipv4Addr::UNSPECIFIED;
-    let port_error = |proto: &str, e: std::io::Error| {
-        if e.kind() == std::io::ErrorKind::AddrInUse {
+    let port_error = |(proto, e): BindError| {
+        if port == 0 {
+            CoreError::Io(format!("cannot bind a {proto} port: {e}"))
+        } else if e.kind() == std::io::ErrorKind::AddrInUse {
             CoreError::Io(format!(
                 "{proto} port {port} is already in use (is another hub running?); choose \
                  another port, or 0 for any free port"
@@ -372,27 +487,14 @@ async fn bind(port: u16) -> Result<(TcpListener, UdpSocket)> {
             CoreError::Io(format!("cannot bind {proto} port {port}: {e}"))
         }
     };
-    if port != 0 {
-        let tcp = TcpListener::bind((any, port))
-            .await
-            .map_err(|e| port_error("TCP", e))?;
-        let udp = UdpSocket::bind((any, port))
-            .await
-            .map_err(|e| port_error("UDP", e))?;
-        return Ok((tcp, udp));
-    }
-    for _ in 0..PORT_ATTEMPTS {
-        let tcp = TcpListener::bind((any, 0)).await?;
-        let chosen = tcp.local_addr()?.port();
-        match UdpSocket::bind((any, chosen)).await {
-            Ok(udp) => return Ok((tcp, udp)),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
-            Err(e) => return Err(e.into()),
+    match bind_stack(Stack::Dual, port) {
+        Ok(sockets) => Ok(sockets),
+        Err((proto, e)) if e.kind() == std::io::ErrorKind::AddrInUse => Err(port_error((proto, e))),
+        Err((proto, e)) => {
+            tracing::info!(%proto, error = %e, "no IPv6 sockets; the hub listens on IPv4 only");
+            bind_stack(Stack::V4, port).map_err(port_error)
         }
     }
-    Err(CoreError::Io(
-        "found no port number free for both TCP and UDP".into(),
-    ))
 }
 
 /// Everything the hub's tasks share.
@@ -404,6 +506,8 @@ struct Shared {
     port: u16,
     events: broadcast::Sender<HubEvent>,
     state: Mutex<HubState>,
+    /// Signalled when the remembered controls changed (see [`prefs_loop`]).
+    prefs_changed: tokio::sync::Notify,
     demux: Mutex<MediaDemux>,
     /// Receive-path lookup of the streams' shared state.
     streams: Mutex<HashMap<u32, Arc<StreamShared>>>,
@@ -420,15 +524,16 @@ struct Shared {
 }
 
 /// Lock order: `state` → `demux` → `streams` → a stream's `state`.
-#[derive(Default)]
 struct HubState {
     sources: Vec<SourceEntry>,
-    /// Controls remembered per device id.
+    /// Controls remembered per device id (persisted, see [`prefs_loop`]).
     prefs: HashMap<String, Controls>,
 }
 
 struct SourceEntry {
     info: SourceInfo,
+    /// The sender's static key (its trust is re-checked every stats tick).
+    public_key: [u8; 32],
     frame_ms: u32,
     tx: mpsc::UnboundedSender<ConnCommand>,
     shared: Arc<StreamShared>,
@@ -445,6 +550,7 @@ struct Snapshot {
     lost: u64,
     played: u64,
     recovered: u64,
+    overflowed: u64,
 }
 
 /// Commands to a connection task.
@@ -533,6 +639,7 @@ impl Shared {
             active: true,
             stats: StreamStats::default(),
         };
+        self.replace_stale_streams(peer, tx, &info.label);
         {
             let mut st = self.state.lock();
             if st.sources.len() >= MAX_STREAMS {
@@ -547,6 +654,7 @@ impl Shared {
             let _ = self.mixer.send(MixerCommand::Add(Box::new(mix)));
             st.sources.push(SourceEntry {
                 info: info.clone(),
+                public_key: peer.public_key,
                 frame_ms: ss.frame_ms,
                 tx: tx.clone(),
                 shared: stream,
@@ -564,6 +672,47 @@ impl Shared {
         );
         self.emit(HubEvent::SourceAdded(info));
         Ok(controls)
+    }
+
+    /// A device that reconnects (e.g. after roaming to another network) usually leaves its
+    /// old connection half-open, so its old stream would linger as an inactive duplicate
+    /// until [`REMOVE_AFTER`] and hold a [`MAX_STREAMS`] slot. Removes the streams of the same
+    /// device and label on **other** connections that received nothing for [`IDLE_AFTER`],
+    /// and closes such a connection once it owns no stream any more.
+    fn replace_stale_streams(
+        &self,
+        peer: &PeerInfo,
+        tx: &mpsc::UnboundedSender<ConnCommand>,
+        label: &str,
+    ) {
+        let now = Instant::now();
+        let stale: Vec<(u32, mpsc::UnboundedSender<ConnCommand>)> = self
+            .state
+            .lock()
+            .sources
+            .iter()
+            .filter(|e| {
+                e.info.device_id == peer.device_id
+                    && e.info.label == label
+                    && !e.tx.same_channel(tx)
+                    && now.saturating_duration_since(e.shared.state.lock().last_packet)
+                        >= IDLE_AFTER
+            })
+            .map(|e| (e.info.stream_id, e.tx.clone()))
+            .collect();
+        for (stream_id, old_tx) in stale {
+            tracing::info!(stream_id, device = %peer.device_id, "replacing a stale stream");
+            self.remove_stream(stream_id);
+            let still_used = self
+                .state
+                .lock()
+                .sources
+                .iter()
+                .any(|e| e.tx.same_channel(&old_tx));
+            if !still_used {
+                let _ = old_tx.send(ConnCommand::Close("replaced by a new connection".into()));
+            }
+        }
     }
 
     /// Changes a stream's controls, remembers them for its device, tells the mixer and the
@@ -590,6 +739,7 @@ impl Shared {
             entry.info.muted = c.muted;
             entry.info.priority = c.priority;
             prefs.insert(entry.info.device_id.clone(), c);
+            self.prefs_changed.notify_one();
             // Both sends are non-blocking; doing them under the lock keeps the mixer and the
             // sender in the order in which concurrent calls changed `state` (a slider drag
             // through the FFI runs `set_gain` on several threads).
@@ -610,12 +760,13 @@ impl Shared {
         {
             let mut st = self.state.lock();
             for e in st.sources.iter_mut() {
-                let (jb, buffered, target, mix, level, last_packet) = {
+                let (jb, buffered, target, primed, mix, level, last_packet) = {
                     let s = e.shared.state.lock();
                     (
                         s.jb.stats(),
                         s.jb.buffered_ms(),
                         s.jb.target_ms(),
+                        s.jb.is_primed(),
                         s.mix,
                         s.level_db,
                         s.last_packet,
@@ -625,27 +776,49 @@ impl Shared {
                     lost: jb.lost,
                     played: mix.played,
                     recovered: mix.recovered_redundancy + mix.recovered_fec,
+                    overflowed: jb.overflowed,
                 };
                 let lost = cur.lost.saturating_sub(e.last.lost);
                 let played = cur.played.saturating_sub(e.last.played);
                 let recovered = cur.recovered.saturating_sub(e.last.recovered).min(lost);
+                let overflowed = cur.overflowed.saturating_sub(e.last.overflowed);
                 let total = lost + played;
-                if total >= MIN_FRAMES_FOR_LOSS {
+                let idle_for = now.saturating_duration_since(last_packet);
+                let active = idle_for < IDLE_AFTER;
+                // Whether this tick completed a measurement worth sending to the sender. A
+                // partial interval is not: re-sending the previous value would count one
+                // heavy-loss second twice in the sender's adaptation.
+                let mut report = true;
+                if !active {
+                    // Not even DTX keep-alives (every 100 ms) arrive: everything the sender
+                    // sends is lost (UDP blocked by a firewall, or an outage). Say so instead
+                    // of "0 %" (see NO_MEDIA_LOSS_PCT).
+                    e.last = cur;
+                    e.loss_pct = NO_MEDIA_LOSS_PCT;
+                    e.residual_loss_pct = 0.0;
+                } else if total >= MIN_FRAMES_FOR_LOSS {
                     // Too few frames (start-up, DTX) would give a noisy estimate that the
                     // sender might overreact to: keep the previous values and let the
                     // interval grow until it holds enough frames.
                     e.last = cur;
+                    // Network loss only: frames the hub itself dropped (overflow) must not
+                    // make the sender cut its bitrate.
                     e.loss_pct = 100.0 * lost as f32 / total as f32;
-                    e.residual_loss_pct = 100.0 * (lost - recovered) as f32 / total as f32;
+                    // What the listener misses: unrecovered losses and overflow drops.
+                    e.residual_loss_pct = 100.0 * (lost - recovered + overflowed) as f32
+                        / (total + overflowed) as f32;
                 } else if total == 0 {
-                    // Nothing played (DTX or idle): no loss either.
+                    // Nothing played while keep-alives arrive (DTX): no loss either.
                     e.last = cur;
                     e.loss_pct = 0.0;
                     e.residual_loss_pct = 0.0;
+                } else {
+                    report = false;
                 }
-                let idle_for = now.saturating_duration_since(last_packet);
-                let active = idle_for < IDLE_AFTER;
-                let latency_ms = target as f32 + e.frame_ms as f32 + output_latency;
+                // The audio actually queued while playing (a burst can leave more than the
+                // target for a while), the target before playout starts.
+                let queued = if primed { buffered } else { target };
+                let latency_ms = queued as f32 + e.frame_ms as f32 + output_latency;
                 e.info.active = active;
                 e.info.stats = StreamStats {
                     loss_pct: e.residual_loss_pct,
@@ -658,37 +831,46 @@ impl Shared {
                         hfa_audio::meter::SILENCE_DB
                     },
                 };
-                if idle_for >= REMOVE_AFTER {
-                    expired.push((e.info.stream_id, e.tx.clone()));
+                if !self.trust.is_trusted_as(&e.public_key, PeerRole::Sender) {
+                    // Forgotten on this hub (forget_peer, `hfa trust remove`): trust is only
+                    // checked at the handshake, so end what is already connected.
+                    expired.push((
+                        e.info.stream_id,
+                        e.tx.clone(),
+                        "this device is no longer trusted by the hub".to_owned(),
+                    ));
                     continue;
                 }
-                let stats = Stats {
-                    stream_id: e.info.stream_id,
-                    loss_pct: e.loss_pct,
-                    jitter_ms: jb.jitter_ms,
-                    buffer_ms: buffered as f32,
-                    latency_ms,
-                    recommended_bitrate: 0,
-                };
-                let _ =
-                    e.tx.send(ConnCommand::Send(ControlMessage::new(Body::Stats(stats))));
+                if idle_for >= REMOVE_AFTER {
+                    expired.push((
+                        e.info.stream_id,
+                        e.tx.clone(),
+                        format!("no media received for {} s", REMOVE_AFTER.as_secs()),
+                    ));
+                    continue;
+                }
+                if report {
+                    let stats = Stats {
+                        stream_id: e.info.stream_id,
+                        loss_pct: e.loss_pct,
+                        jitter_ms: jb.jitter_ms,
+                        buffer_ms: buffered as f32,
+                        latency_ms,
+                        recommended_bitrate: 0,
+                    };
+                    let _ =
+                        e.tx.send(ConnCommand::Send(ControlMessage::new(Body::Stats(stats))));
+                }
                 updates.push(e.info.clone());
             }
         }
         for info in updates {
             self.emit(HubEvent::SourceUpdated(info));
         }
-        for (stream_id, tx) in expired {
-            tracing::info!(
-                stream_id,
-                "no media for {} s; removing the stream",
-                REMOVE_AFTER.as_secs()
-            );
+        for (stream_id, tx, reason) in expired {
+            tracing::info!(stream_id, %reason, "removing the stream");
             self.remove_stream(stream_id);
-            let _ = tx.send(ConnCommand::Close(format!(
-                "no media received for {} s",
-                REMOVE_AFTER.as_secs()
-            )));
+            let _ = tx.send(ConnCommand::Close(reason));
         }
     }
 }
@@ -716,7 +898,8 @@ async fn accept_loop(
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, addr)) => {
-                    let ip = addr.ip();
+                    // An IPv4 peer on the dual-stack socket shows up as ::ffff:a.b.c.d.
+                    let ip = addr.ip().to_canonical();
                     // Held across `spawn`, so the task cannot deregister before it is listed.
                     let mut pending = shared.pending.lock();
                     let authenticated = connections.len().saturating_sub(pending.len());
@@ -842,10 +1025,12 @@ async fn connection(
     let mut owned: Vec<u32> = Vec::new();
     // A connection without a stream is closed after NO_STREAM_TIMEOUT (it only holds a slot).
     let mut no_stream_deadline = tokio::time::Instant::now() + NO_STREAM_TIMEOUT;
+    let mut idle_deadline = tokio::time::Instant::now() + CONTROL_IDLE_TIMEOUT;
     let close = loop {
         tokio::select! {
             msg = ch.recv() => match msg {
                 Ok(msg) => {
+                    idle_deadline = tokio::time::Instant::now() + CONTROL_IDLE_TIMEOUT;
                     let flow = on_message(&shared, &peer, &tx, &mut owned, &mut ch, msg).await;
                     if !owned.is_empty() {
                         no_stream_deadline = tokio::time::Instant::now() + NO_STREAM_TIMEOUT;
@@ -879,6 +1064,10 @@ async fn connection(
                     tracing::info!(conn, device = %peer.device_id, "sender is no longer trusted; disconnecting it");
                     break Some("device removed from the trusted devices".to_owned());
                 }
+            }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                tracing::info!(conn, device = %peer.device_id, "the sender went silent; closing");
+                break Some(format!("nothing received for {} s", CONTROL_IDLE_TIMEOUT.as_secs()));
             }
             _ = wait_stop(&mut shutdown) => break Some("hub stopping".to_owned()),
         }
@@ -1012,15 +1201,66 @@ async fn receive_loop(
     }
 }
 
+/// Saves the remembered controls [`PREFS_SAVE_DELAY`] after a change, and once more at
+/// shutdown if a change is still pending.
+async fn prefs_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            // A change that is still pending at shutdown is saved (below).
+            biased;
+            _ = shared.prefs_changed.notified() => {}
+            _ = wait_stop(&mut shutdown) => return,
+        }
+        let stopping = tokio::select! {
+            _ = tokio::time::sleep(PREFS_SAVE_DELAY) => false,
+            _ = wait_stop(&mut shutdown) => true,
+        };
+        save_prefs(&shared).await;
+        if stopping {
+            return;
+        }
+    }
+}
+
+async fn save_prefs(shared: &Arc<Shared>) {
+    let prefs = shared.state.lock().prefs.clone();
+    let (dir, trust) = (shared.settings.data_dir.clone(), shared.trust.clone());
+    let saved =
+        tokio::task::spawn_blocking(move || crate::hub_prefs::save(&dir, &prefs, &trust)).await;
+    match saved {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "cannot save the remembered hub controls"),
+        Err(e) => tracing::warn!(error = %e, "hub controls save task failed"),
+    }
+}
+
 async fn stats_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(STATS_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
+    let mut ticks = 0u32;
     loop {
         tokio::select! {
-            _ = tick.tick() => shared.collect_stats(),
+            _ = tick.tick() => {
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(TRUST_RELOAD_TICKS) {
+                    reload_trust(&shared.trust).await;
+                }
+                shared.collect_stats();
+            }
             _ = wait_stop(&mut shutdown) => break,
         }
+    }
+}
+
+/// Re-reads the trust store off the async workers, so a peer removed by another process
+/// (e.g. `hfa trust remove` next to a running app) is noticed.
+pub(crate) async fn reload_trust(trust: &TrustStore) {
+    let trust = trust.clone();
+    match tokio::task::spawn_blocking(move || trust.reload()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::debug!(error = %e, "cannot reload the trust store"),
+        Err(e) => tracing::debug!(error = %e, "trust reload task failed"),
     }
 }
 
@@ -1076,6 +1316,8 @@ impl HubHandle {
             concealed: s.mix.concealed,
             stretched: jb.stretched,
             underruns: s.mix.underruns,
+            overflowed: jb.overflowed,
+            skipped: jb.skipped,
         })
     }
 

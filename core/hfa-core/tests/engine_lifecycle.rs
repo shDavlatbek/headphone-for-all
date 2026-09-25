@@ -95,7 +95,8 @@ async fn untrusted_senders_are_refused() {
 
 /// The hub restarts on the same port (same identity and trust store): the sender notices,
 /// backs off, reconnects without a new pairing and streams a new stream. The restarted hub
-/// forgot that it had muted the sender, and the sender's view follows.
+/// forgot that it had muted the sender (its saved controls were deleted), and the sender's
+/// view follows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sender_reconnects_after_hub_restart() {
     let _serial = serial().await;
@@ -124,6 +125,9 @@ async fn sender_reconnects_after_hub_restart() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // Remembered controls survive a restart (see engine_control); forget them here.
+    std::fs::remove_file(hub_dev.path().join(hfa_core::hub::HUB_CONTROLS_FILE))
+        .expect("saved controls");
 
     let mut hub2 = start_hub(&hub_dev, port, Out::Null).await;
     assert_eq!(hub2.hub.local_port(), port);
@@ -207,4 +211,163 @@ async fn sender_discovers_the_hub_by_device_id() {
     assert_eq!(added.as_deref(), Some("Finder"), "{:?}", sender.status());
     sender.stop().await;
     hub.stop().await;
+}
+
+/// The hub listens on IPv6 as well as IPv4 (dual-stack): a sender that reaches it over `::1`
+/// streams normally. Skipped on hosts without IPv6.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sender_reaches_the_hub_over_ipv6() {
+    if std::net::UdpSocket::bind("[::1]:0").is_err() {
+        eprintln!("no IPv6 on this host; skipped");
+        return;
+    }
+    let _serial = serial().await;
+    let hub_dev = Device::new("Hub");
+    let mut hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let pin = hub.hub.start_pairing().pin;
+    let dev = Device::new("IPv6 laptop");
+    let (capture, _) =
+        hfa_core::sender::open_capture(&hfa_capture::CaptureTarget::Tone { freq_hz: 440.0 })
+            .expect("tone");
+    let sender = hfa_core::SenderEngine::start(hfa_core::SenderConfig {
+        hub: hfa_core::HubAddress::Direct {
+            host: "[::1]".into(),
+            port: hub.hub.local_port(),
+        },
+        settings: dev.settings(0),
+        capture,
+        label: "IPv6".into(),
+        expected_hub_key: None,
+        pairing_secret: Some(pin),
+    })
+    .await
+    .expect("sender");
+    let stream_id = wait_source_added(&mut hub, START_TIMEOUT).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let counters = hub.hub.stream_counters(stream_id).expect("counters");
+    let status = sender.status();
+    sender.stop().await;
+    hub.hub.stop().await;
+    assert_eq!(status.state, SenderState::Streaming, "{status:?}");
+    assert!(counters.played > 50, "{counters:?}");
+}
+
+/// Forgetting a device takes effect at once in the running engines (the trust store is shared
+/// in the process): the hub drops the forgotten sender's stream, whose reconnect then needs a
+/// new pairing; a sender whose hub is forgotten stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forgetting_a_device_ends_its_running_session() {
+    let _serial = serial().await;
+    let hub_dev = Device::new("Hub");
+    let mut hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let pin = hub.hub.start_pairing().pin;
+    let dev = Device::new("Old phone");
+    let mut sender = start_sender(&dev, hub.hub.local_port(), 440.0, Some(pin)).await;
+    let stream_id = wait_source_added(&mut hub, START_TIMEOUT).await;
+    wait_state(&mut sender, START_TIMEOUT, SenderState::Streaming).await;
+    let device_id = hub.hub.sources()[0].device_id.clone();
+
+    // The hub's user forgets the phone (as the FFI's forget_peer does).
+    let trust = TrustStore::load(hub_dev.path()).expect("trust");
+    assert!(trust.remove(&device_id).expect("remove"));
+    let removed = wait_event(&mut hub.events, Duration::from_secs(5), |ev| match ev {
+        HubEvent::SourceRemoved { stream_id } => Some(*stream_id),
+        _ => None,
+    })
+    .await;
+    assert_eq!(removed, Some(stream_id));
+    let failed = wait_event(&mut sender.events, Duration::from_secs(10), |ev| match ev {
+        SenderEvent::StateChanged(SenderState::Failed(reason)) => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(failed.as_deref(), Some("pairing required"));
+    sender.sender.stop().await;
+
+    // The other way round: the sender device forgets the hub while streaming.
+    let pin = hub.hub.start_pairing().pin;
+    let mut sender = start_sender(&dev, hub.hub.local_port(), 440.0, Some(pin)).await;
+    wait_state(&mut sender, START_TIMEOUT, SenderState::Streaming).await;
+    let sender_trust = TrustStore::load(dev.path()).expect("trust");
+    assert!(sender_trust
+        .remove(hub.hub.device_id())
+        .expect("remove hub"));
+    let failed = wait_event(&mut sender.events, Duration::from_secs(5), |ev| match ev {
+        SenderEvent::StateChanged(SenderState::Failed(reason)) => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(failed.as_deref(), Some("pairing required"));
+    sender.sender.stop().await;
+    hub.hub.stop().await;
+}
+
+/// A capture that dies for good (`CaptureSource::error`) is not mistaken for silence: the
+/// sender stops its stream and fails with the capture's reason instead of sending DTX
+/// keep-alives forever while showing "Streaming".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_capture_fails_the_sender() {
+    struct Dying {
+        inner: Box<dyn hfa_capture::CaptureSource>,
+        dies_at: std::time::Instant,
+    }
+    impl hfa_capture::CaptureSource for Dying {
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        fn format(&self) -> hfa_audio::AudioFormat {
+            self.inner.format()
+        }
+        fn start(&mut self, sink: hfa_capture::PcmSink) -> hfa_capture::Result<()> {
+            self.inner.start(sink)
+        }
+        fn stop(&mut self) {
+            self.inner.stop();
+        }
+        fn error(&self) -> Option<String> {
+            (std::time::Instant::now() >= self.dies_at).then(|| "device unplugged".to_owned())
+        }
+    }
+
+    let _serial = serial().await;
+    let hub_dev = Device::new("Hub");
+    let mut hub = start_hub(&hub_dev, 0, Out::Null).await;
+    let pin = hub.hub.start_pairing().pin;
+    let dev = Device::new("Desktop");
+    let (inner, _) =
+        hfa_core::sender::open_capture(&hfa_capture::CaptureTarget::Tone { freq_hz: 440.0 })
+            .expect("tone");
+    let sender = hfa_core::SenderEngine::start(hfa_core::SenderConfig {
+        hub: hfa_core::HubAddress::Direct {
+            host: "127.0.0.1".into(),
+            port: hub.hub.local_port(),
+        },
+        settings: dev.settings(0),
+        capture: Box::new(Dying {
+            inner,
+            dies_at: std::time::Instant::now() + Duration::from_secs(2),
+        }),
+        label: "Dying".into(),
+        expected_hub_key: None,
+        pairing_secret: Some(pin),
+    })
+    .await
+    .expect("sender");
+    let mut events = sender.events();
+    let stream_id = wait_source_added(&mut hub, START_TIMEOUT).await;
+    let failed = wait_event(&mut events, Duration::from_secs(10), |ev| match ev {
+        SenderEvent::StateChanged(SenderState::Failed(reason)) => Some(reason.clone()),
+        _ => None,
+    })
+    .await
+    .expect("the sender fails");
+    assert!(failed.contains("device unplugged"), "{failed}");
+    let removed = wait_event(&mut hub.events, Duration::from_secs(5), |ev| match ev {
+        HubEvent::SourceRemoved { stream_id } => Some(*stream_id),
+        _ => None,
+    })
+    .await;
+    assert_eq!(removed, Some(stream_id), "the stream was stopped");
+    sender.stop().await;
+    hub.hub.stop().await;
 }

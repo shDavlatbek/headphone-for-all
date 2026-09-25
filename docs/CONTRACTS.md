@@ -956,6 +956,101 @@ Modules:
   process's write, lazy/forced reload, corrupt file, roles + legacy files), `tests/net_control.rs` (id mismatch
   before pairing, one-way pairing), `tests/engine_control.rs` (forgetting a connected sender disconnects it),
   `tests/discovery_backend.rs` (fake platform backend), `tests/net_discovery.rs` (IPv4-only advertising).
+### 6.5 Refinements made by `fix/core-engine` (the code and module docs in `core/hfa-audio` and `core/hfa-core` are authoritative; they override §4.2 and §6.3 where they differ)
+
+- **Jitter buffer shrinking (`hfa-audio` `jitter`).** The symmetric counterpart of `Pop::Stretch`: while primed,
+  when `buffered_ms − target_ms` stays above `max(SHRINK_THRESHOLD_FRAMES (3) · frame_ms,
+  SHRINK_THRESHOLD_TARGET_FRACTION (0.5) · target_ms)` for `SHRINK_HOLD_MS = 500` ms of pops in a row, `pop()`
+  silently discards the oldest slot before taking the next one (at most once every `SHRINK_MIN_INTERVAL = 10`
+  pops). An excess above `MAX_EXCESS_MS = 200` is cut at once: the oldest slots are discarded until the buffer is
+  within one frame of the target, and leading gaps after the cut are discarded too. The `Pop` enum is unchanged
+  (the caller simply receives the next frame). A network stall followed by a burst no longer leaves the stream
+  ~0.5 s late for minutes (the drift controller alone drains ≤ 2 ms/s).
+- **`JitterStats` split (`#[serde(default)]` fields):** `lost` is now **network** loss only (`Missing`, gaps skipped
+  at priming, sequence numbers jumped over); slots dropped by an overflow are counted in **`overflowed`**, slots
+  discarded by shrinking in **`skipped`**. `Stats.loss_pct` (what the sender adapts to) therefore no longer counts
+  local overflow drops; `StreamStats.loss_pct` (what the listener misses) = `(lost − recovered + overflowed) /
+  (lost + played + overflowed)`. `StreamCounters` gains `overflowed` and `skipped` (`#[serde(default)]`).
+- **`StreamStats.latency_ms` / `Stats.latency_ms`** use the audio actually queued in the jitter buffer while it is
+  primed (its target before playout starts) + frame + output ring fill target + the output's latency.
+- **Reordered `FLAG_RESET` (hub, `hub_mixer.rs`).** `seq` only grows, so a `FLAG_RESET` packet whose seq is at or
+  below the highest seq already pushed (`JitterBuffer::highest_seq()`, new) was reordered behind later packets of
+  the same restart: it no longer calls `reset_at` (which discarded those packets for good — the replay window had
+  already accepted them). Instead **new `JitterBuffer::lower_floor(seq)`** lowers the post-reset floor so the late
+  reset packet still joins the buffer, as long as nothing was played since the reset (otherwise it is `TooLate`).
+- **Loss reports (`Stats`).** The hub sends `Stats` to a sender only when a loss measurement **completed**: ≥ 40
+  frames, or no frame at all while DTX keep-alives arrive (0 %). A partial interval is extended and **not** sent
+  (re-sending the previous value counted one heavy-loss second twice in the sender's adaptation). A stream that
+  received no datagram at all for `IDLE_AFTER` (not even keep-alives, e.g. UDP blocked by a firewall while TCP
+  works, or an outage) is reported as **`hub::NO_MEDIA_LOSS_PCT` (100 %)** instead of 0 %. After
+  `NO_MEDIA_REPORTS = 3` such reports in a row the sender emits `SenderEvent::Error("the hub receives no audio from
+  this device (is UDP port N blocked by a firewall …?)")` (once per stream); `SenderStatus.loss_pct` shows 100.
+- **Mixer output pacing.** The underrun-driven `extra` fill **now shrinks**: after `EXTRA_FILL_DECAY_AFTER = 30`
+  refreshes (30 s) in a row without an output underrun it drops by `EXTRA_FILL_DECAY_MS = 5` ms (down to 0), and it
+  is reset to 0 whenever the output is (re)opened (`configure`). An output that is up but has not taken audio for
+  `OUTPUT_STALL = 300 ms` without reporting `has_error()` (a suspended device) is treated like a stopped one: the
+  streams are consumed at wall-clock pace and the mix is discarded until it pulls again, so the jitter buffers do
+  not overflow.
+- **Reconnects after a network change.** On `StreamStart`, streams of the **same device id and label** on **another**
+  connection that received no datagram for `IDLE_AFTER` are removed first (`SourceRemoved`; they no longer linger as
+  inactive duplicates for `REMOVE_AFTER` or hold a `MAX_STREAMS` slot); such a connection is closed with
+  `Bye("replaced by a new connection")` once it owns no stream. An authenticated connection that sent nothing for
+  **`CONTROL_IDLE_TIMEOUT = 15 s`** (senders ping every second) is closed with `Bye("nothing received for 15 s")`.
+- **Remembered controls are persisted** (replaces "for the hub's lifetime" in §6.3): per-device gain/mute/priority
+  live in **`<data_dir>/hub_controls.json`** (`hub::HUB_CONTROLS_FILE`; `{"version":1,"devices":{"<device id>":
+  {"gain":f32,"muted":bool,"priority":bool}}}`, atomic rewrite, mode 0644), loaded by `HubEngine::start` and saved
+  `hub::PREFS_SAVE_DELAY = 500 ms` after a change (changes in between are batched) and at `HubHandle::stop` if a
+  change is pending. Devices that are not (or no longer) trusted are dropped on load and on save; a missing,
+  unreadable or corrupt file is logged and treated as empty (never fatal). The **master gain is not persisted by
+  the core** (the app shows and re-applies it; persisting it needs `HubStatusDto` support in `hfa-ffi`/Dart).
+- **IPv6 (replaces "IPv4 `0.0.0.0` only" in §6.3).** The hub binds TCP and UDP as **dual-stack IPv6 sockets**
+  (`[::]:port`, `IPV6_V6ONLY` off, via `socket2`; SO_REUSEADDR on the TCP listener except on Windows, like tokio),
+  so IPv6 and IPv4 peers both connect; when the host has no IPv6 (creating/binding the IPv6 socket fails with
+  anything but `AddrInUse`) it falls back to IPv4 `0.0.0.0`. Same port rules and errors as before. The per-IP
+  handshake limit compares `IpAddr::to_canonical()` (an IPv4 peer shows up as `::ffff:a.b.c.d`). **Sender:**
+  `Direct` hosts and discovered hubs are tried address by address (IPv4 first) until one connects (only I/O and
+  timeout errors move on to the next address).
+- **Loop protection (`control.rs`, ARCHITECTURE §1 "never to itself").** New **`CoreError::SelfConnection`** ("this is
+  this device's own hub; a device cannot stream to itself"): `ControlChannel::connect` fails with it right after
+  the Noise handshake reveals that the hub's static key is the device's own; `ControlChannel::accept` answers a
+  sender with the hub's own key with `Bye("own device")` and fails with it (nothing is paired, the pairing window
+  is not used). The sender treats it as final (`Failed`), like `KeyMismatch`. (The UI-side defaults — not
+  preselecting "everything this device plays" while this device's hub runs — belong to the app.)
+- **One `TrustStore` per data directory and process (`identity.rs`).** `TrustStore::load(dir)` returns a handle to
+  the store already open for that directory (canonicalized path; a process-wide registry of weak handles), after
+  re-reading `trusted.json` into it; so the FFI's `forget_peer`/`trusted_peers` and the engines share one in-memory
+  list and a removal is seen at once (hfa-ffi needs no change: it already loads through `TrustStore::load`).
+  **Merge on write:** `add`/`remove` re-read the file under the save lock before changing it (falling back to the
+  in-memory list if it cannot be read), so a peer removed by another process (`hfa trust remove` beside a running
+  app) is not written back by the next pairing. **New `TrustStore::reload()`** (blocking). The **hub** re-reads the
+  store every 5 s and, every stats tick, removes the streams of devices that are no longer trusted and closes their
+  connections with `Bye("this device is no longer trusted by the hub")` (their reconnect then needs pairing). The
+  **sender** re-reads it every 5 pings and, if its pinned hub is no longer trusted, ends with the final error
+  `PairingRequired` (`Failed("pairing required")`). This resolves the §8.5 "Known limit" (a running engine's own
+  copy) without a `TrustStore` field in `HubConfig`/`SenderConfig`; the app's hub restart after a forget (§8.7) is
+  no longer needed, but harmless.
+- **Capture failure (cross-crate addition to `hfa-capture`, made by `fix/core-engine`).** New default method
+  **`CaptureSource::error(&self) -> Option<String>`** (default `None`; backward compatible): `Some(reason)` once a
+  started capture failed for good and delivers nothing any more. Implemented by WASAPI (the worker thread gave up:
+  repeated failures or a re-opened endpoint with another format), PipeWire (the capture thread ended: connection
+  lost) and external feeds (unregistered/replaced); the macOS tap has no such signal yet (`None`). The sender's
+  encoder thread polls it every 100 ms; on `Some` the control task sends `StreamStop`, closes the connection and the
+  sender ends in **`Failed("the audio capture stopped: <reason>")`** (also emitted as `SenderEvent::Error`), also
+  while it is waiting to reconnect — instead of treating a dead capture as silence (DTX keep-alives forever while
+  `Streaming`).
+- **Version.** The Rust workspace version is **1.0.0**, the same as `app/pubspec.yaml` (`version: 1.0.0+1`), so
+  `hfa_core::APP_VERSION` (`AppInfo.version` on the About screen, `Hello.app_version`) matches the installed app.
+  Both move together; `hfa-core`'s unit test `app_version_matches_the_flutter_app` fails when they differ.
+
+**Integration note (§6.4 + §6.5).** Both branches made the trust store shared; the merged code uses §6.4's store
+(file lock, stamp-based lazy reload, `subscribe`, roles, `reload() -> Result<bool>`). §6.5's engine behaviour stays on
+top of it: the hub's periodic `reload()` and per-tick removal of streams whose device is no longer trusted **as a
+sender**, the per-connection disconnect on a `subscribe` change, and the sender's final `PairingRequired` once its
+hub is no longer trusted. The self-connection check (§6.5) runs before §6.4's expected key/id check in
+`connect_checked`; the sender tries every address with `connect_checked`, and a `KeyMismatch` at an mDNS address is
+still turned into a retryable `HubNotFound`. Advertising stays **IPv4-only** (§6.4) even though the hub now binds
+dual-stack (§6.5): every advertised address is reachable, and the sender still dials IPv6 hosts typed in directly.
+Re-enabling IPv6 advertising is a later, separate change.
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

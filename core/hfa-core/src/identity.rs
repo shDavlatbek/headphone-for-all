@@ -829,4 +829,48 @@ mod tests {
         let back: TrustedPeer = serde_json::from_str(&json).expect("parse");
         assert_eq!(back, peer);
     }
+
+    #[test]
+    fn stores_of_one_directory_are_shared_in_a_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // An engine loaded the store; the FFI/CLI loads it again and forgets a peer.
+        let engine = TrustStore::load(dir.path()).expect("load");
+        engine.add(TrustedPeer::new([1u8; 32], "A")).expect("add");
+        let ui = TrustStore::load(dir.path()).expect("load again");
+        assert!(ui.is_trusted(&[1u8; 32]));
+        assert!(ui
+            .remove(&hfa_proto::fingerprint(&[1u8; 32]))
+            .expect("remove"));
+        assert!(
+            !engine.is_trusted(&[1u8; 32]),
+            "the running engine sees the removal"
+        );
+        // The same directory spelled differently is the same store.
+        let other_spelling = TrustStore::load(&dir.path().join(".")).expect("load");
+        other_spelling
+            .add(TrustedPeer::new([2u8; 32], "B"))
+            .expect("add");
+        assert!(engine.is_trusted(&[2u8; 32]));
+    }
+
+    #[test]
+    fn writers_merge_with_changes_saved_by_another_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TrustStore::load(dir.path()).expect("load");
+        store.add(TrustedPeer::new([1u8; 32], "A")).expect("add");
+        store.add(TrustedPeer::new([2u8; 32], "B")).expect("add");
+        // Another process (e.g. `hfa trust remove`) removes A from the file.
+        let b = store.get(&hfa_proto::fingerprint(&[2u8; 32])).expect("B");
+        save_peers(&dir.path().join(TRUST_FILE), &[b]).expect("external save");
+        // A pairing in this process must not bring A back.
+        store.add(TrustedPeer::new([3u8; 32], "C")).expect("add");
+        assert!(!store.is_trusted(&[1u8; 32]));
+        assert!(store.is_trusted(&[2u8; 32]) && store.is_trusted(&[3u8; 32]));
+        let (on_disk, _) = read_trust_file(&dir.path().join(TRUST_FILE)).expect("read");
+        assert_eq!(on_disk.len(), 2);
+        // reload() picks up an external change without a write.
+        save_peers(&dir.path().join(TRUST_FILE), &[]).expect("external save");
+        store.reload().expect("reload");
+        assert!(store.peers().is_empty());
+    }
 }

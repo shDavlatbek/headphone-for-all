@@ -1031,3 +1031,35 @@ async fn many_small_records_in_one_read_arrive_in_order() {
         );
     }
 }
+
+/// Loop protection: a device never connects to its own hub (same identity), whether the
+/// sender notices it (the normal client) or only the hub does (a client that does not check).
+#[tokio::test]
+async fn a_device_cannot_connect_to_its_own_hub() {
+    let hub = hub().await;
+    let pin = hub.pairing.start(DEFAULT_PAIRING_TTL).pin;
+    let accepted = hub.accept_one();
+    let connected = ControlChannel::connect(
+        hub.addr,
+        &hub.dev.identity,
+        &hub.dev.trust,
+        None,
+        Some(pin.clone()),
+    )
+    .await;
+    assert_eq!(connected.err(), Some(CoreError::SelfConnection));
+    assert!(accepted.await.expect("join").is_err());
+
+    // A raw client with the hub's own key completes the Noise handshake: the hub refuses it.
+    let accepted = hub.accept_one();
+    let _raw = RawPeer::connect(hub.addr, hub.dev.identity.keypair.clone()).await;
+    assert_eq!(
+        accepted.await.expect("join").err(),
+        Some(CoreError::SelfConnection)
+    );
+    assert!(hub.dev.trust.peers().is_empty(), "nothing was paired");
+    assert!(
+        hub.pairing.current().is_some(),
+        "the window was not used up"
+    );
+}
