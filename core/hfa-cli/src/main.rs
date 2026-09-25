@@ -1,21 +1,41 @@
 //! `hfa`: headless headphone-for-all hub / sender, discovery, trust management and selftest.
 //! See `docs/CONTRACTS.md` §7.
 
+mod analysis;
 mod cli;
 mod commands;
+mod display;
+mod hub;
+mod onset;
+mod selftest;
+mod send;
+
+use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Cli, Command};
 
-fn init_tracing(verbose: u8) {
-    let default = match verbose {
-        0 => "info",
-        1 => "debug",
+/// How long the runtime waits for leftover blocking tasks (e.g. an mDNS browse thread
+/// hand-off) after the command returned.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Log filter for `-v` counts. The commands print their own user-facing output, so without
+/// `-v` only warnings and errors are logged (they would scramble the live tables otherwise).
+fn default_filter(verbose: u8) -> &'static str {
+    match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
         _ => "trace",
-    };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    }
+}
+
+fn init_tracing(verbose: u8) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_filter(verbose)));
     // Ignore the error if a subscriber is already installed.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -23,17 +43,52 @@ fn init_tracing(verbose: u8) {
         .try_init();
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    init_tracing(cli.verbose);
+async fn run(cli: Cli) -> anyhow::Result<()> {
     let data_dir = cli.data_dir;
     match cli.command {
-        Command::Hub(args) => commands::hub(data_dir, args).await,
-        Command::Send(args) => commands::send(data_dir, args).await,
-        Command::Discover(args) => commands::discover(args).await,
+        Command::Hub(args) => hub::run(commands::data_dir(data_dir)?, args).await,
+        Command::Send(args) => send::run(commands::data_dir(data_dir)?, args).await,
+        Command::Discover(args) => commands::discover(data_dir, args).await,
         Command::Devices => commands::devices().await,
-        Command::Trust { command } => commands::trust(data_dir, command).await,
-        Command::Selftest(args) => commands::selftest(args).await,
+        Command::Trust { command } => commands::trust(commands::data_dir(data_dir)?, command).await,
+        Command::Selftest(args) => selftest::run(args).await,
+    }
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    init_tracing(cli.verbose);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("hfa-rt")
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: cannot start the async runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(run(cli));
+    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_filter;
+
+    #[test]
+    fn verbosity_levels() {
+        assert_eq!(default_filter(0), "warn");
+        assert_eq!(default_filter(1), "info");
+        assert_eq!(default_filter(2), "debug");
+        assert_eq!(default_filter(7), "trace");
     }
 }
