@@ -15,10 +15,20 @@ import 'settings_controller.dart';
 /// Sender states in which a sender is live (`sender_start` would refuse).
 const liveSenderStates = {'connecting', 'pairing', 'streaming', 'reconnecting'};
 
-/// Why a hub without an address cannot be used on iOS.
+/// Why a hub without an address cannot be used on iOS: the broadcast
+/// extension (iOS's only sender) cannot look for hubs itself, so it needs the
+/// address the app found (native Bonjour), remembered, scanned or was given.
 const iosNeedsHubAddress =
-    'This device cannot look for hubs on the network. Add the hub by '
-    "address or scan its QR code (on the hub: Pair a device).";
+    "The hub's address is not known yet. Pick the hub from the list of hubs "
+    'found on this network, scan its QR code (on the hub: Pair a device) or '
+    'add it by address.';
+
+/// iOS: what to check when no hub shows up (browsing needs the Local Network
+/// permission, which the user may have denied).
+const iosLocalNetworkHint =
+    'If your hub does not appear, allow Local Network access for Headphone '
+    'for All (Settings → Privacy & Security → Local Network), or scan its QR '
+    'code (Pair a device) or add it by address.';
 
 /// iOS pre-pairing: how often the core's sender status is polled as a
 /// fallback for a status event the subscription may have missed.
@@ -328,8 +338,8 @@ class SenderController extends Notifier<SenderState> {
     final target = pin == null ? baseTarget : baseTarget.withPin(pin);
     if (pin != null) state = state.copyWith(target: target);
     if (target.host.isEmpty && ref.read(appInfoProvider).isIos) {
-      // No mDNS on iOS (§8.9): neither the app's sender nor the broadcast
-      // extension could find the hub by its id.
+      // iOS (§8.9): the broadcast extension, which does the sending, cannot
+      // look a hub up by id (only the app browses, through native Bonjour).
       state = state.copyWith(error: iosNeedsHubAddress);
       return;
     }

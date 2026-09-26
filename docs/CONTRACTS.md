@@ -1358,10 +1358,11 @@ iOS also registers the platform view `hfa/broadcast_picker`, which wraps an `RPS
 whose `preferredExtension` is the broadcast extension's bundle id.
 
 Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `{type: "captureStopped"|"captureError"|"broadcastStarted"|"broadcastFinished", message?: String}`,
-and on iOS `{type: "broadcastStatus", state: String, message: String?, hubName: String?, updatedAtMs: int}` (the
-`getBroadcastStatus` fields without the legacy keys) whenever the extension's status changes. `state` is one of
-`"idle"`, `"connecting"`, `"streaming"`, `"reconnecting"`, `"failed"`, `"stopped"` (§8.9.2). These names are a
-contract between the iOS runner and `app/lib`: do not rename them.
+and on iOS `{type: "broadcastStatus", state: String, message: String?, hubName: String?, updatedAtMs: int,
+broadcasting: bool}` (the `getBroadcastStatus` fields without the legacy `timestamp`) whenever the extension's status
+changes. `state` is one of `"idle"`, `"connecting"`, `"streaming"`, `"reconnecting"`, `"failed"`, `"stopped"`
+(§8.9.2). A running state (`connecting`, `streaming`, `reconnecting`) is only ever sent together with
+`broadcasting: true`. These names are a contract between the iOS runner and `app/lib`: do not rename them.
 
 ### 8.4 Refinements made by `feat/scaffold`
 
@@ -1992,12 +1993,17 @@ treat every state except `failed`, `stopped` and the legacy `finished` as runnin
   legacy `broadcasting` (a broadcast runs now) and `timestamp` (seconds) keys. `state` ∈ `idle`, `connecting`,
   `streaming`, `reconnecting`, `failed`, `stopped`; legacy files map `started` → `connecting` and `finished` →
   `failed` (non-empty message) or `stopped`; unknown values → `idle`. `updatedAtMs` = `timestamp` × 1000
-  (0 if not a sane number). Empty `message`/`hubName` are left out. (`BroadcastStatusReport`, XCTest
-  `BroadcastStatusReportTests`.)
-- Event `{type: "broadcastStatus", state, message?, hubName?, updatedAtMs}` after every change of the status
-  file: on the `.started`, `.finished` and `.status` notifications, when Dart starts listening, when the app
-  becomes active or the capture state changes (a notification can be missed while suspended), and after the
-  vanish check wrote `failed`. An identical status is not sent twice to the same listener.
+  (0 if not a sane number). Empty `message`/`hubName` are left out. A running state is reported only while the
+  broadcast runs now (`BroadcastSync.running`: the screen is captured); a file that still says `connecting`/
+  `streaming`/`reconnecting` while the screen is not captured (the extension is finishing, or iOS killed it,
+  e.g. while the app was not running) answers `state: idle` without `message`/`hubName` and
+  `broadcasting: false`. (`BroadcastStatusReport.answer`, XCTest `BroadcastStatusReportTests`.)
+- Event `{type: "broadcastStatus", state, message?, hubName?, updatedAtMs, broadcasting}` after every change of
+  the status file: on the `.started`, `.finished` and `.status` notifications, when Dart starts listening, when
+  the app becomes active or the capture state changes (a notification can be missed while suspended), and after
+  the vanish check wrote `failed`. An identical status is not sent twice to the same listener. A running state of
+  an extension that looks vanished is held back (no event; Dart keeps what it showed) until the extension's
+  final status or the vanish check's `failed` (within 8 s) replaces it (`BroadcastStatusReport.event`).
   `broadcastStarted` / `broadcastFinished` are unchanged.
 
 **Already done before this package (verified):** `getDataDir`'s strict `NO_APP_GROUP` (Swift
@@ -2192,10 +2198,14 @@ state is used. **Files the app keeps in the data directory** (never read by the 
 (`{<device id>: {"host", "port"}}`, the last address a sender streamed to or a broadcast config was written for;
 removed with "Forget") and `app_prefs.json` (`{"startHubOnLaunch": bool}`). Both are written through a temp file
 and a rename; a missing or broken file means empty/defaults. `dataDirProvider` is `null` in tests and the demo mode
-(nothing is written). **iOS** (no mDNS, §8.9): paired hubs are dialled at their remembered address; a start with an
-empty host is refused ("This device cannot look for hubs on the network. Add the hub by address or scan its QR
-code ..."), so no broadcast config with an empty `hubHost` is written; the hub list explains this instead of
-"Looking for hubs…" and labels host-less paired hubs "address unknown: add it by address". The broadcast card says
+(nothing is written). **iOS** (the app browses through native Bonjour, §8.9; the broadcast extension cannot look for
+hubs): paired hubs that are not discovered are dialled at their remembered address; a start with an empty host is
+refused ("The hub's address is not known yet. Pick the hub from the list of hubs found on this network, scan its
+QR code or add it by address."; Swift `writeBroadcastConfig` answers the same `BAD_ARGS` message), so no broadcast
+config with an empty `hubHost` is written. The hub list shows "Looking for hubs on this network…" (or the
+discovery error) like every platform, plus a hint to allow Local Network access in Settings when nothing is
+found, labels paired hubs that are not seen "Paired, not seen right now" and host-less ones "address unknown:
+add it by address". The broadcast card says
 the broadcast started and to check the hub, not that audio is being sent.
 
 **Trust.** "Forget" also stops a live sender whose target is the forgotten hub and drops its remembered address.

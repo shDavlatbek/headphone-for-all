@@ -86,7 +86,7 @@ enum HfaShared {
 /// (`forSender(fileData:dataDir:)`) before passing the JSON to Rust.
 struct BroadcastConfig: Codable, Equatable {
   /// Hub host name or address. Required: the app refuses an empty one (`writeBroadcastConfig`),
-  /// since mDNS discovery needs the restricted multicast entitlement on iOS.
+  /// since the extension cannot look for the hub itself (only the app browses Bonjour).
   var hubHost: String
   /// Hub UDP/TCP port; 0 = the port in the shared settings.
   var hubPort: Int

@@ -32,7 +32,7 @@ broadcast upload extension streams what the phone plays).
 |---|---|
 | `getDataDir` | `<App Group>/hfa` (created). Without the App Group (a build not signed with the App Groups capability) `FlutterError("NO_APP_GROUP")`, which the app shows as a start-up error: a private directory would hide the pairings from the extension. Only Simulator builds fall back to Application Support `/hfa` |
 | `startHubService` / `stopHubService` | `AVAudioSession` category `.playback` with `.mixWithOthers`, `setActive(true)` / `setActive(false, .notifyOthersOnDeactivation)`; errors → `FlutterError("AUDIO_SESSION")` |
-| `writeBroadcastConfig` | `{hubHost, hubPort, hubDeviceId?, hubKey?, label}` → `<container>/broadcast_config.json` with the C ABI keys plus `data_dir`. `hubHost` is required (`BAD_ARGS`: the extension cannot look for hubs, see Known limitations); `FlutterError("NO_APP_GROUP")` without the App Group |
+| `writeBroadcastConfig` | `{hubHost, hubPort, hubDeviceId?, hubKey?, label}` → `<container>/broadcast_config.json` with the C ABI keys plus `data_dir`. `hubHost` is required (`BAD_ARGS` "The hub's address is not known yet ...": the extension cannot look for hubs itself, see Known limitations); `FlutterError("NO_APP_GROUP")` without the App Group |
 | `captureSupport` | `{supported: true, reason: "broadcast"}` |
 | `startSystemCapture` | `false` (the user starts the broadcast with the picker) |
 | `stopSystemCapture`, `acquireMulticastLock`, `releaseMulticastLock` | no-op |
@@ -49,10 +49,13 @@ A running status while nothing is captured for 8 s means ReplayKit ended the ext
 
 Events: `{type: "broadcastStarted"}` and `{type: "broadcastFinished", message?}`, driven by the Darwin
 notifications `io.github.shdavlatbek.hfa.broadcast.started` / `.finished` that the extension posts, and
-`{type: "broadcastStatus", state, message?, hubName?, updatedAtMs}` (the `getBroadcastStatus` fields without the
-legacy keys) after every change of the status file: on each of those notifications, on `.status` (the extension's
-connection state changed), when Dart starts listening and when the app becomes active (a notification can be
-missed while the app is suspended); an unchanged status is not sent twice.
+`{type: "broadcastStatus", state, message?, hubName?, updatedAtMs, broadcasting}` (the `getBroadcastStatus` fields
+without the legacy `timestamp`) after every change of the status file: on each of those notifications, on `.status`
+(the extension's connection state changed), when Dart starts listening and when the app becomes active (a
+notification can be missed while the app is suspended); an unchanged status is not sent twice. A running state is
+only reported while the screen is captured: a file that still says `streaming` after iOS killed the extension
+answers `idle` with `broadcasting: false` from `getBroadcastStatus`, and no event is sent until the vanish check
+writes `failed`.
 Darwin notifications carry no payload, so the extension first writes
 `<container>/broadcast_status.json` (`{state, message?, timestamp, hubName?}`; `state` `connecting` at the start,
 then `streaming` / `reconnecting` as `hfa_ext_sender_state` reports them, finally `failed` or `stopped`, which

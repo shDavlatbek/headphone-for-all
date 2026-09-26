@@ -354,17 +354,20 @@ private final class BonjourService {
       failed("resolving", errorCode)
       return
     }
-    retryDelay = 1
     resolvedTXT = HfaBonjourCodec.parseTXTRecord(txt)
     self.port = port
     if let host, !host.isEmpty, host != self.host {
       self.host = host
-      lookUpAddresses(of: host)
+      // On failure the resolution starts over later, with a growing delay.
+      guard lookUpAddresses(of: host) else { return }
     }
+    retryDelay = 1
     onChange(self)
   }
 
-  private func lookUpAddresses(of host: String) {
+  /// Starts looking up the addresses of `host`; `false` when that could not start (the whole
+  /// resolution is then released and retried later).
+  private func lookUpAddresses(of host: String) -> Bool {
     if let addressRef {
       DNSServiceRefDeallocate(addressRef)
       self.addressRef = nil
@@ -381,10 +384,15 @@ private final class BonjourService {
           errorCode: errorCode, flags: flags, address: address.flatMap { HfaBonjourCodec.ipString($0) })
       }, context)
     guard let scheduled = DNSSD.schedule(ref, error, on: queue, what: "looking up \(host)") else {
+      // Start the whole resolution over, as `failed` does: a retry of `start()` alone would
+      // return at once while `resolveRef` lives, and later resolve callbacks with the same host
+      // would never look its addresses up again, so the hub would never be reported.
+      releaseReferences()
       retryLater()
-      return
+      return false
     }
     addressRef = scheduled
+    return true
   }
 
   private func addressChanged(errorCode: DNSServiceErrorType, flags: DNSServiceFlags, address: String?) {

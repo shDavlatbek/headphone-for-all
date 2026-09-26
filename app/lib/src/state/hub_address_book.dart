@@ -1,8 +1,10 @@
 /// The last address each paired hub was reached at.
 ///
-/// iOS cannot browse mDNS (the multicast entitlement is restricted, §8.9), so
-/// a paired hub that is not typed in again would have no host, and neither
-/// the app's sender nor the broadcast extension could reach it. The app
+/// On iOS the app lists hubs through native Bonjour (§8.9), but the broadcast
+/// extension, which does the sending, cannot browse (mdns-sd needs the
+/// restricted multicast entitlement, and the native backend lives in the
+/// app): a paired hub that is not discovered right now would have no host,
+/// and the broadcast extension could not reach it. The app
 /// remembers where it last reached each hub (by device id) in
 /// `<data dir>/hub_addresses.json` and dials that address on iOS.
 library;

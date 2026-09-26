@@ -216,6 +216,83 @@ final class BroadcastStatusReportTests: XCTestCase {
     XCTAssertNil(map["hubName"])
   }
 
+  /// A running broadcast: the contract fields plus the legacy keys.
+  func testAnswerWhileRunning() {
+    let streaming = status("streaming", hub: "Desk")
+    XCTAssertEqual(
+      BroadcastStatusReport.answer(of: streaming, sync: .running),
+      [
+        "state": "streaming", "hubName": "Desk", "updatedAtMs": 1_700_000_000_123,
+        "broadcasting": true, "timestamp": 1_700_000_000.1234,
+      ])
+    XCTAssertEqual(
+      BroadcastStatusReport.event(of: streaming, sync: .running),
+      ["state": "streaming", "hubName": "Desk", "updatedAtMs": 1_700_000_000_123, "broadcasting": true])
+  }
+
+  /// iOS killed the extension while the app was not running: the file still says `streaming`,
+  /// but the screen is no longer captured. Dart must not see a running state (its parser only
+  /// downgrades one when it also reads `broadcasting: false`).
+  func testVanishedExtensionIsNotReportedAsRunning() {
+    let stale = status("streaming", "old hint", hub: "Desk")
+    let sync = BroadcastSync.evaluate(status: stale, screenCaptured: false)
+    XCTAssertEqual(sync, .vanished)
+    let answer = BroadcastStatusReport.answer(of: stale, sync: sync)
+    XCTAssertEqual(
+      answer,
+      [
+        "state": "idle", "updatedAtMs": 1_700_000_000_123, "broadcasting": false,
+        "timestamp": 1_700_000_000.1234,
+      ])
+    XCTAssertNil(
+      BroadcastStatusReport.event(of: stale, sync: sync),
+      "the event waits for the final status or the vanish check's failed")
+    for running in ["connecting", "reconnecting", "started", "pairing"] {
+      let file = status(running)
+      let answer = BroadcastStatusReport.answer(of: file, sync: .vanished)
+      XCTAssertEqual(answer["state"], AnyHashable("idle"), running)
+      XCTAssertNil(BroadcastStatusReport.event(of: file, sync: .vanished), running)
+    }
+  }
+
+  /// An ended broadcast is reported as it is, whatever the screen capture says.
+  func testEndedBroadcastIsAlwaysReported() {
+    let failed = status("failed", "hub refused", hub: "Desk")
+    for captured in [false, true] {
+      let sync = BroadcastSync.evaluate(status: failed, screenCaptured: captured)
+      XCTAssertEqual(
+        BroadcastStatusReport.event(of: failed, sync: sync),
+        [
+          "state": "failed", "message": "hub refused", "hubName": "Desk",
+          "updatedAtMs": 1_700_000_000_123, "broadcasting": false,
+        ])
+      XCTAssertEqual(
+        BroadcastStatusReport.answer(of: failed, sync: sync)["state"], AnyHashable("failed"))
+    }
+  }
+
+  /// Every state reported with `broadcasting: false` is one that does not claim a broadcast.
+  func testRunningStateOnlyWithBroadcasting() {
+    let running: Set<AnyHashable> = ["connecting", "streaming", "reconnecting"]
+    for state in ["connecting", "pairing", "streaming", "reconnecting", "failed", "stopped",
+      "started", "finished", "x"]
+    {
+      for captured in [false, true] {
+        let file = status(state)
+        let sync = BroadcastSync.evaluate(status: file, screenCaptured: captured)
+        let answer = BroadcastStatusReport.answer(of: file, sync: sync)
+        if let reported = answer["state"], running.contains(reported) {
+          XCTAssertEqual(answer["broadcasting"], AnyHashable(true), "\(state), captured \(captured)")
+        }
+        if let event = BroadcastStatusReport.event(of: file, sync: sync),
+          let reported = event["state"], running.contains(reported)
+        {
+          XCTAssertEqual(event["broadcasting"], AnyHashable(true), "\(state), captured \(captured)")
+        }
+      }
+    }
+  }
+
   func testMillisecondsAreSane() {
     XCTAssertEqual(BroadcastStatusReport.milliseconds(1.5), 1_500)
     XCTAssertEqual(BroadcastStatusReport.milliseconds(.nan), 0)

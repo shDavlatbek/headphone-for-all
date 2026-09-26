@@ -18,13 +18,14 @@ import os
 /// | `captureSupport` | `{supported: true, reason: "broadcast"}` |
 /// | `startSystemCapture` | `false` (capture runs in the broadcast extension) |
 /// | `stopSystemCapture`, `acquireMulticastLock`, `releaseMulticastLock` | no-op |
-/// | `getBroadcastStatus` | `{state, message?, hubName?, updatedAtMs, broadcasting, timestamp}`, `nil` without a status file |
+/// | `getBroadcastStatus` | `{state, message?, hubName?, updatedAtMs, broadcasting, timestamp}`, `nil` without a status file (see `BroadcastStatusReport.answer`) |
 ///
 /// Broadcast events: `broadcastStarted` / `broadcastFinished` follow the extension's Darwin
 /// notifications and are re-synchronized with `broadcast_status.json` and the screen capture
 /// state when a listener starts, the app becomes active or the capture state changes (see
 /// `syncBroadcastState()`). `broadcastStatus` events (`{type, state, message?, hubName?,
-/// updatedAtMs}`, see `BroadcastStatusReport`) follow every change of the status file.
+/// updatedAtMs, broadcasting}`, see `BroadcastStatusReport.event`) follow every change of the
+/// status file; a running state is only sent while the screen is captured.
 final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   /// Name of the method channel.
   static let methodChannelName = "hfa/platform"
@@ -56,6 +57,10 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   /// Why a broadcast ended when ReplayKit stopped the extension without `broadcastFinished`.
   static let vanishedMessage =
     "The broadcast stopped unexpectedly: iOS ended the broadcast extension (for example because it used too much memory). Start it again."
+
+  /// Message of the `BAD_ARGS` error of `writeBroadcastConfig` without a hub address.
+  static let hubAddressUnknownMessage =
+    "The hub's address is not known yet. Pick the hub from the list of hubs found on this network, scan its QR code or add it by address."
 
   /// Registers the channels and the platform view with the application registrar of the
   /// implicit Flutter engine. Keep the returned object alive for the app's lifetime.
@@ -222,13 +227,13 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     guard (0...65_535).contains(hubPort) else {
       return FlutterError(code: "BAD_ARGS", message: "hubPort out of range: \(hubPort)", details: nil)
     }
-    // The extension cannot look for the hub: mDNS needs the restricted multicast entitlement
-    // on iOS, so a configuration without an address could only fail after the broadcast started.
+    // The extension cannot look for the hub itself (only the app browses, through
+    // HfaBonjourDiscovery), so a configuration without an address could only fail after the
+    // broadcast started.
     guard !hubHost.isEmpty else {
       return FlutterError(
         code: "BAD_ARGS",
-        message:
-          "The hub's address is unknown, and this device cannot look for hubs on the network. Add the hub by address or scan its QR code.",
+        message: Self.hubAddressUnknownMessage,
         details: nil)
     }
     let dataDir: URL
@@ -380,27 +385,27 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     vanishCheck = nil
   }
 
-  /// Sends a `broadcastStatus` event when the status file differs from the last one sent.
+  /// Sends a `broadcastStatus` event when what Dart should see (`BroadcastStatusReport.event`)
+  /// differs from the last one sent. A running state of an extension that looks `vanished` is
+  /// held back: the extension's final status or the vanish check's `failed` follows.
   private func reportBroadcastStatus() {
     guard let eventSink, let status = BroadcastStatus.read() else { return }
-    let fields = BroadcastStatusReport.fields(of: status)
-    guard fields != reportedStatus else { return }
+    let sync = BroadcastSync.evaluate(status: status, screenCaptured: Self.screenCaptured() ?? false)
+    guard let fields = BroadcastStatusReport.event(of: status, sync: sync),
+      fields != reportedStatus
+    else { return }
     reportedStatus = fields
     var event = BroadcastStatusReport.channelMap(fields)
     event["type"] = "broadcastStatus"
     eventSink(event)
   }
 
-  /// `getBroadcastStatus`: `nil` without a status file, else `BroadcastStatusReport.fields`
-  /// plus the older keys `broadcasting` (a broadcast runs now, `BroadcastSync.running`) and
-  /// `timestamp` (seconds since 1970).
+  /// `getBroadcastStatus`: `nil` without a status file, else `BroadcastStatusReport.answer`
+  /// (the contract fields, `broadcasting` and `timestamp`).
   private func broadcastStatusResult() -> Any? {
     guard let status = BroadcastStatus.read() else { return nil }
     let sync = BroadcastSync.evaluate(status: status, screenCaptured: Self.screenCaptured() ?? false)
-    var answer = BroadcastStatusReport.channelMap(BroadcastStatusReport.fields(of: status))
-    answer["broadcasting"] = sync == .running
-    answer["timestamp"] = status.timestamp
-    return answer
+    return BroadcastStatusReport.channelMap(BroadcastStatusReport.answer(of: status, sync: sync))
   }
 
   /// Whether the screen is being captured (a broadcast, but also a recording or mirroring), or
@@ -462,6 +467,39 @@ enum BroadcastStatusReport {
       fields["hubName"] = hubName
     }
     return fields
+  }
+
+  /// What Dart is told about `status` while the broadcast looks like `sync`
+  /// (`BroadcastSync.evaluate`): `fields(of:)` plus `broadcasting` (`sync == .running`).
+  ///
+  /// A running state (`connecting`, `streaming`, `reconnecting`: the file says the extension
+  /// runs) is reported only while `sync` is `.running`, so the contract fields never claim a
+  /// broadcast that `broadcasting` denies. When the screen is no longer captured (`.vanished`),
+  /// the extension is either writing its final status right now or iOS killed it (memory limit,
+  /// crash; the file then keeps its last running state until the vanish check writes `failed`):
+  /// the state is `idle`, without the stale `message` and `hubName`.
+  static func answer(of status: BroadcastStatus, sync: BroadcastSync) -> [String: AnyHashable] {
+    let running = sync == .running
+    var answer = fields(of: status)
+    if status.isActive && !running {
+      answer["state"] = "idle"
+      answer["message"] = nil
+      answer["hubName"] = nil
+    }
+    answer["broadcasting"] = running
+    answer["timestamp"] = status.timestamp
+    return answer
+  }
+
+  /// The `broadcastStatus` event for `status` (without `type`), or `nil` while it must be held
+  /// back: a running state of an extension that looks `.vanished` is not sent (Dart keeps what
+  /// it showed; the final status or the vanish check's `failed` follows within `vanishGrace`).
+  /// Otherwise `answer(of:sync:)` without the legacy `timestamp`.
+  static func event(of status: BroadcastStatus, sync: BroadcastSync) -> [String: AnyHashable]? {
+    if status.isActive && sync == .vanished { return nil }
+    var event = answer(of: status, sync: sync)
+    event["timestamp"] = nil
+    return event
   }
 
   /// `fields` with plain values for the Flutter codec (`AnyHashable` unwrapped).
