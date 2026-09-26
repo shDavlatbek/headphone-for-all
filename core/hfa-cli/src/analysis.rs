@@ -301,6 +301,99 @@ mod tests {
         assert!(longest_dropout_ms(&x) >= 5.0);
     }
 
+    /// A steady 440 Hz tone (Opus-coded, as a sender sends it) played out through the hub's
+    /// jitter buffer with latency cuts: a burst of 15 packets (single-frame cuts every 100 ms
+    /// once the excess persisted for 500 ms) and one of 45 (a multi-frame cut at once).
+    /// Returns the played left channel with the hub's handling of `Pop::Skipped` (decode the
+    /// discarded packets, splice with `Splicer`) or, with `recipe == false`, the handling
+    /// before it (discarded packets never decoded, frames butted together), and the number
+    /// of discarded slots.
+    fn play_with_latency_cuts(recipe: bool) -> (Vec<f32>, u64) {
+        use hfa_audio::{
+            JitterBuffer, JitterConfig, OpusConfig, OpusDecoder, OpusEncoder, Pop, SineGenerator,
+            Splicer,
+        };
+        const FRAME: usize = 480;
+        let format = hfa_audio::AudioFormat::INTERNAL;
+        let mut enc = OpusEncoder::new(OpusConfig::default()).unwrap();
+        let mut tone = SineGenerator::new(440.0, 0.25, format);
+        let mut pcm = vec![0.0; FRAME * 2];
+        let packets: Vec<Vec<u8>> = (0..500)
+            .map(|_| {
+                tone.fill(&mut pcm);
+                let mut buf = vec![0u8; 1275];
+                let n = enc.encode(&pcm, &mut buf).unwrap();
+                buf.truncate(n);
+                buf
+            })
+            .collect();
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        let mut dec = OpusDecoder::new(48_000, 2).unwrap();
+        let mut splicer = Splicer::new(48_000, 2);
+        let mut out = Vec::new();
+        let mut next = 0;
+        for tick in 0.. {
+            let arriving = match tick {
+                100 => 15,
+                250 => 45,
+                _ => 1,
+            };
+            if next + arriving > packets.len() {
+                break;
+            }
+            for _ in 0..arriving {
+                jb.push(
+                    next as u32,
+                    (next * FRAME) as u32,
+                    tick * 10_000,
+                    packets[next].clone(),
+                );
+                next += 1;
+            }
+            loop {
+                match jb.pop() {
+                    Pop::Skipped(p) => {
+                        if recipe {
+                            let p = p.expect("nothing is lost");
+                            let n = dec.decode(&p, &mut pcm).unwrap();
+                            splicer.discard(&pcm[..n * 2]);
+                        }
+                    }
+                    Pop::Packet(p) => {
+                        let n = dec.decode(&p, &mut pcm).unwrap();
+                        let (head, rest) = splicer.splice(&pcm[..n * 2]);
+                        out.extend(head.iter().chain(rest).step_by(2));
+                        break;
+                    }
+                    Pop::Underrun => {
+                        out.extend(std::iter::repeat_n(0.0, FRAME));
+                        break;
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        (out, jb.stats().skipped)
+    }
+
+    #[test]
+    fn latency_cuts_of_the_jitter_buffer_are_not_glitches() {
+        let (out, skipped) = play_with_latency_cuts(true);
+        // Both kinds of cut happened after the 0.5 s skipped here (priming, codec start-up).
+        assert!(skipped > 40, "{skipped} slots discarded");
+        let r = glitches(&out[index(0.5)..], &[440.0]);
+        assert!((r.amplitudes[0] - 0.25).abs() < 0.01, "{r:?}");
+        assert_eq!(r.bad_windows, 0, "{r:?}");
+        assert_eq!(longest_dropout_ms(&out[index(0.5)..]), 0.0);
+
+        // The control: the same cuts without decoding the discarded packets and without the
+        // splice are what the selftest failed on (a phase jump of the tone at every cut).
+        let (old, old_skipped) = play_with_latency_cuts(false);
+        assert_eq!(old_skipped, skipped);
+        let r = glitches(&old[index(0.5)..], &[440.0]);
+        assert!(r.events >= 5, "{r:?}");
+    }
+
     #[test]
     fn finds_a_step_onset_among_other_tones() {
         let background = tones(1.0, &[(1000.0, 0.25), (2500.0, 0.25)]);

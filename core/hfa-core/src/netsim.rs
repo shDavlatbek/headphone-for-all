@@ -6,17 +6,31 @@
 //! every datagram to the real hub port, dropping [`ImpairConfig::loss_pct`] percent of them
 //! at random and delaying each one by a random `0..=jitter_ms` ms, which also **reorders**
 //! datagrams whenever the delay exceeds the packet interval. Deterministic for a given seed.
+//!
+//! The relay runs on its own OS thread (`hfa-netsim`), promoted like the hub's media receive
+//! thread ([`hfa_capture::rt::promote_current_thread`]) on a blocking socket, with the delayed
+//! datagrams in a timer queue. It used to be a tokio task: on a loaded CI runner a
+//! normal-priority tokio worker wakes up tens of milliseconds late, and the relay then held
+//! back **every** sender's datagrams at once and released them in a burst — a network stall
+//! the configuration never asked for (every stream underran together, then the hub had to cut
+//! the burst's excess latency).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use tokio::net::UdpSocket;
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use crate::{CoreError, Result};
 
-use crate::Result;
+/// The relay thread checks its stop flag at least this often.
+const POLL: Duration = Duration::from_millis(20);
+/// Period the relay thread is promoted for (the senders' packet interval).
+const RELAY_PERIOD: Duration = Duration::from_millis(10);
+/// Receive buffer: room for any UDP datagram.
+const RECV_BUFFER: usize = 65_536;
 
 /// How the proxy impairs the traffic.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,13 +72,14 @@ struct Counters {
     forwarded: AtomicU64,
 }
 
-/// A running one-way UDP impairment relay (see the module docs).
+/// A running one-way UDP impairment relay (see the module docs). Dropping it stops the relay
+/// thread in the background.
 #[derive(Debug)]
 pub struct UdpImpairProxy {
     local_addr: SocketAddr,
     counters: Arc<Counters>,
-    stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
 }
 
 /// SplitMix64: tiny, deterministic, good enough for simulations.
@@ -91,66 +106,39 @@ impl UdpImpairProxy {
     /// relaying to `target`.
     ///
     /// # Errors
-    /// [`crate::CoreError::Io`] if a socket cannot be bound.
+    /// [`crate::CoreError::Io`] if a socket cannot be bound or the thread cannot start.
     pub async fn start(target: SocketAddr, config: ImpairConfig) -> Result<UdpImpairProxy> {
         let bind_ip: IpAddr = match target.ip() {
             ip if ip.is_loopback() => ip,
             IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
             IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
         };
-        let socket = UdpSocket::bind((bind_ip, 0)).await?;
+        let socket = UdpSocket::bind((bind_ip, 0))?;
         // Like the real media sockets: the relay must not add drops of its own.
         crate::media::enlarge_buffers(socket2::SockRef::from(&socket));
-        let socket = Arc::new(socket);
+        socket.set_read_timeout(Some(POLL))?;
         let local_addr = socket.local_addr()?;
         let counters = Arc::new(Counters::default());
-        let (stop, mut stopped) = watch::channel(false);
-        let task_counters = Arc::clone(&counters);
-        let task = tokio::spawn(async move {
-            let mut rng = SplitMix(config.seed);
-            let mut buf = vec![0u8; 65_536];
-            let loss = f64::from(config.loss_pct.clamp(0.0, 100.0)) / 100.0;
-            loop {
-                let received = tokio::select! {
-                    r = socket.recv_from(&mut buf) => r,
-                    _ = stopped.wait_for(|s| *s) => break,
-                };
-                let Ok((n, _)) = received else {
-                    continue;
-                };
-                task_counters.received.fetch_add(1, Ordering::Relaxed);
-                if rng.next_f64() < loss {
-                    task_counters.dropped.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                let datagram = buf[..n].to_vec();
-                let delay_us = if config.jitter_ms == 0 {
-                    0
-                } else {
-                    (rng.next_f64() * f64::from(config.jitter_ms) * 1000.0) as u64
-                };
-                let socket = Arc::clone(&socket);
-                let counters = Arc::clone(&task_counters);
-                let forward = async move {
-                    if delay_us > 0 {
-                        tokio::time::sleep(Duration::from_micros(delay_us)).await;
-                    }
-                    if socket.send_to(&datagram, target).await.is_ok() {
-                        counters.forwarded.fetch_add(1, Ordering::Relaxed);
-                    }
-                };
-                if delay_us == 0 {
-                    forward.await;
-                } else {
-                    tokio::spawn(forward);
-                }
-            }
-        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let relay = Relay {
+            socket,
+            target,
+            config,
+            counters: Arc::clone(&counters),
+            stop: Arc::clone(&stop),
+        };
+        let thread = std::thread::Builder::new()
+            .name("hfa-netsim".into())
+            .spawn(move || {
+                let _rt = hfa_capture::rt::promote_current_thread(RELAY_PERIOD);
+                relay.run();
+            })
+            .map_err(|e| CoreError::Io(format!("cannot start the netsim relay thread: {e}")))?;
         Ok(UdpImpairProxy {
             local_addr,
             counters,
             stop,
-            task,
+            thread: Some(thread),
         })
     }
 
@@ -168,10 +156,105 @@ impl UdpImpairProxy {
         }
     }
 
-    /// Stops relaying (datagrams still being delayed may be delivered afterwards).
-    pub async fn stop(self) {
-        let _ = self.stop.send(true);
-        let _ = self.task.await;
+    /// Stops relaying and waits for the relay thread (datagrams still being delayed are
+    /// discarded).
+    pub async fn stop(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+        }
+    }
+}
+
+impl Drop for UdpImpairProxy {
+    fn drop(&mut self) {
+        // The thread notices within `POLL` and exits on its own.
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+/// The relay thread's state.
+struct Relay {
+    socket: UdpSocket,
+    target: SocketAddr,
+    config: ImpairConfig,
+    counters: Arc<Counters>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Relay {
+    fn run(self) {
+        let mut rng = SplitMix(self.config.seed);
+        let mut buf = vec![0u8; RECV_BUFFER];
+        let loss = f64::from(self.config.loss_pct.clamp(0.0, 100.0)) / 100.0;
+        // Delayed datagrams: (due, arrival order, datagram), earliest first.
+        let mut delayed: BinaryHeap<Reverse<(Instant, u64, Vec<u8>)>> = BinaryHeap::new();
+        let mut order = 0u64;
+        let mut errors_in_a_row = 0u32;
+        while !self.stop.load(Ordering::Acquire) {
+            let now = Instant::now();
+            while delayed
+                .peek()
+                .is_some_and(|Reverse((due, _, _))| *due <= now)
+            {
+                if let Some(Reverse((_, _, datagram))) = delayed.pop() {
+                    self.forward(&datagram);
+                }
+            }
+            // Wait for the next datagram, at most until the next delayed one is due.
+            let wait = delayed.peek().map_or(POLL, |Reverse((due, _, _))| {
+                due.saturating_duration_since(now)
+                    .clamp(Duration::from_micros(100), POLL)
+            });
+            if self.socket.set_read_timeout(Some(wait)).is_err() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let n = match self.socket.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    errors_in_a_row = 0;
+                    n
+                }
+                // The read timeout: look at the queue and the stop flag again.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                // A per-datagram error (Windows reports an earlier ICMP "port unreachable"
+                // as ConnectionReset); only a long run of them earns a pause, so a broken
+                // socket cannot make this promoted thread spin.
+                Err(_) => {
+                    errors_in_a_row = errors_in_a_row.saturating_add(1);
+                    if errors_in_a_row > 100 {
+                        errors_in_a_row = 0;
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    continue;
+                }
+            };
+            self.counters.received.fetch_add(1, Ordering::Relaxed);
+            if rng.next_f64() < loss {
+                self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if self.config.jitter_ms == 0 {
+                self.forward(&buf[..n]);
+                continue;
+            }
+            let delay_us = (rng.next_f64() * f64::from(self.config.jitter_ms) * 1000.0) as u64;
+            let due = Instant::now() + Duration::from_micros(delay_us);
+            delayed.push(Reverse((due, order, buf[..n].to_vec())));
+            order += 1;
+        }
+    }
+
+    fn forward(&self, datagram: &[u8]) {
+        if self.socket.send_to(datagram, self.target).is_ok() {
+            self.counters.forwarded.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -190,6 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn drops_and_delays_datagrams() {
+        use tokio::net::UdpSocket;
         let sink = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         let proxy = UdpImpairProxy::start(
             sink.local_addr().expect("addr"),

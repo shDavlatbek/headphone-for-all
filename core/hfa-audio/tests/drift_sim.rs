@@ -167,18 +167,28 @@ fn simulate(
             match jb.pop() {
                 Pop::Packet(p) => {
                     let idx = u64::from_le_bytes(p[..8].try_into().unwrap());
-                    let skipped = jb.stats().skipped;
-                    if let Some(e) = expected_idx {
-                        // Discarding slots to cut latency moves forward by exactly that many.
-                        if idx != e + (skipped - report.skipped) {
-                            report.out_of_order += 1;
-                        }
+                    if expected_idx.is_some_and(|e| idx != e) {
+                        report.out_of_order += 1;
                     }
-                    report.skipped = skipped;
                     expected_idx = Some(idx + 1);
                     started = true;
                     pcm.fill(0.1);
                     rs.process(&pcm, &mut fifo).unwrap();
+                }
+                Pop::Skipped(p) => {
+                    // Discarded to cut latency: the hub decodes it and splices around it; no
+                    // audio for it, the next pop continues in order.
+                    report.skipped += 1;
+                    match p {
+                        Some(p) => {
+                            let idx = u64::from_le_bytes(p[..8].try_into().unwrap());
+                            if expected_idx.is_some_and(|e| idx != e) {
+                                report.out_of_order += 1;
+                            }
+                            expected_idx = Some(idx + 1);
+                        }
+                        None => expected_idx = expected_idx.map(|e| e + 1),
+                    }
                 }
                 Pop::Missing { .. } => {
                     report.missing += 1;
@@ -244,6 +254,8 @@ fn simulate(
             }
         }
     }
+    // Every discarded slot was handed to the consumer.
+    assert_eq!(report.skipped, jb.stats().skipped);
     report.last_minute_ppm = last_sum / last_n;
     let mean = ppm_sum / ppm_n;
     report.ppm_std = (ppm_sq / ppm_n - mean * mean).max(0.0).sqrt();

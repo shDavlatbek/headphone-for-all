@@ -11,14 +11,22 @@
 //! - `Missing{next: Some(n)}` → decode the **redundant copy** in `n` (full recovery), else
 //!   Opus in-band FEC from `n` if it has any, else PLC;
 //! - `Missing{next: None}` → PLC; `Stretch` → PLC without consuming a packet;
+//! - `Skipped(p)` (the buffer cut latency) → decode `p` all the same (PLC for a slot that
+//!   never arrived), so the Opus decoder state stays continuous, hand the audio to the
+//!   stream's [`Splicer`] instead of playing it, and pop again;
 //! - `Underrun` → no audio this tick: the stream is left out of the mixer's inputs (the
 //!   mixer fades it back in later).
 //!
-//! The decoded frame goes through the stream's [`StreamResampler`] (48 kHz → 48 kHz with the
-//! [`DriftController`]'s relative ratio, updated every tick while the buffer is primed) into
-//! the FIFO. A stream reset (`FLAG_RESET`, or the first audio packet after DTX keep-alives)
-//! resets the decoder, the resampler and the FIFO before the next frame is decoded; the drift
-//! estimate is kept (it describes the two clocks, not the stream).
+//! The decoded frame goes through the [`Splicer`] (after a cut it crossfades, pitch-aligned,
+//! from what would have been heard next into the audio after the cut, so the cut is
+//! inaudible; otherwise the frame passes unchanged) and the stream's [`StreamResampler`]
+//! (48 kHz → 48 kHz with the [`DriftController`]'s relative ratio, updated every tick while
+//! the buffer is primed) into the FIFO. Before each pop the jitter buffer is told whether the
+//! last decoded frame was quiet ([`QUIET_FLOOR_DBFS`], [`QUIET_BELOW_AVERAGE_DB`]), so a due
+//! single-frame cut lands in a pause when there is one. A stream reset (`FLAG_RESET`, or the
+//! first audio packet after DTX keep-alives) resets the decoder, the splicer, the resampler
+//! and the FIFO before the next frame is decoded; the drift estimate is kept (it describes the
+//! two clocks, not the stream).
 //!
 //! # Pacing and output
 //!
@@ -55,7 +63,7 @@ use std::time::{Duration, Instant};
 use hfa_audio::meter::SILENCE_DB;
 use hfa_audio::{
     packet_has_fec, AudioFormat, DriftConfig, DriftController, JitterBuffer, LevelMeter, Mixer,
-    MixerConfig, OpusDecoder, Pop, SourceId, StreamResampler,
+    MixerConfig, OpusDecoder, Pop, SourceId, Splicer, StreamResampler,
 };
 use hfa_capture::{AudioOutput, PcmSink, RingStats};
 use hfa_proto::{MediaHeader, FLAG_DTX, FLAG_RESET};
@@ -102,6 +110,15 @@ pub(crate) const OUTPUT_REFRESH: Duration = Duration::from_secs(1);
 pub(crate) const OUTPUT_RETRY: Duration = Duration::from_secs(2);
 /// Most ticks produced in one go before the thread checks commands and sleeps again.
 const MAX_TICKS_PER_WAKE: usize = 50;
+/// A decoded frame below this RMS is quiet (a good place for a latency cut, see
+/// [`JitterBuffer::set_quiet`]).
+pub(crate) const QUIET_FLOOR_DBFS: f32 = -50.0;
+/// A decoded frame this much below the stream's recent level ([`QUIET_AVERAGE_FRAMES`]) is
+/// quiet too (a pause in speech or music that is not silent).
+pub(crate) const QUIET_BELOW_AVERAGE_DB: f32 = 15.0;
+/// Time constant, in decoded frames, of the recent level [`QUIET_BELOW_AVERAGE_DB`] compares
+/// with.
+const QUIET_AVERAGE_FRAMES: f32 = 50.0;
 
 /// Per-source controls.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -238,10 +255,16 @@ pub(crate) struct MixStream {
     shared: Arc<StreamShared>,
     frame_frames: usize,
     decoder: OpusDecoder,
+    /// Joins the audio around latency cuts (`Pop::Skipped`).
+    splicer: Splicer,
     resampler: StreamResampler,
     drift: DriftController,
     pcm: Vec<f32>,
     fifo: Vec<f32>,
+    /// Mean square of recent decoded frames (exponential average), for the quiet hint.
+    recent_ms: f32,
+    /// The last decoded frame was quiet (hint for the jitter buffer's latency cuts).
+    quiet: bool,
     meter: LevelMeter,
     controls: Controls,
     counters: MixCounters,
@@ -265,6 +288,7 @@ impl MixStream {
             shared,
             frame_frames,
             decoder: OpusDecoder::new(format.sample_rate, format.channels)?,
+            splicer: Splicer::new(format.sample_rate, format.channels),
             resampler: StreamResampler::new(
                 format.channels,
                 format.sample_rate,
@@ -274,6 +298,8 @@ impl MixStream {
             drift: DriftController::new(DriftConfig::default()),
             pcm: vec![0.0; MAX_PACKET_FRAMES * 2],
             fifo: Vec::with_capacity(MIX_SAMPLES * 4 + MAX_PACKET_FRAMES * 3),
+            recent_ms: 0.0,
+            quiet: false,
             meter: LevelMeter::new(),
             controls,
             counters: MixCounters::default(),
@@ -307,6 +333,31 @@ impl MixStream {
         self.conceal()
     }
 
+    /// A frame discarded to cut latency: decoded all the same (so the decoder state stays
+    /// continuous), PLC if it cannot be; not counted as played or concealed.
+    fn decode_discarded(&mut self, packet: Option<&[u8]>) -> usize {
+        if let Some(p) = packet.and_then(payload::parse) {
+            if let Ok(frames) = self.decoder.decode(p.primary, &mut self.pcm) {
+                if frames > 0 {
+                    return frames;
+                }
+            }
+        }
+        self.conceal()
+    }
+
+    /// Updates the quiet hint from a decoded frame (see [`QUIET_FLOOR_DBFS`]).
+    fn note_level(&mut self, pcm_len: usize) {
+        let pcm = &self.pcm[..pcm_len];
+        let ms = pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len().max(1) as f32;
+        let floor = 10f32.powf(QUIET_FLOOR_DBFS / 10.0);
+        let below = 10f32.powf(-QUIET_BELOW_AVERAGE_DB / 10.0);
+        self.quiet = ms < floor || ms < self.recent_ms * below;
+        if ms.is_finite() {
+            self.recent_ms += (ms - self.recent_ms) / QUIET_AVERAGE_FRAMES;
+        }
+    }
+
     /// A lost frame: redundancy in the next packet, else in-band FEC, else PLC.
     fn recover(&mut self, next: Option<&[u8]>) -> usize {
         if let Some(p) = next.and_then(payload::parse) {
@@ -337,27 +388,43 @@ impl MixStream {
             let (pop, reset, in_dtx) = {
                 let mut st = self.shared.state.lock();
                 let reset = std::mem::take(&mut st.reset_pending);
+                st.jb.set_quiet(self.quiet);
                 (st.jb.pop(), reset, st.in_dtx)
             };
             if reset {
                 self.decoder.reset();
+                self.splicer.reset();
                 self.resampler.reset();
                 self.fifo.clear();
+                self.quiet = false;
             }
             let frames = match pop {
                 Pop::Packet(p) => self.decode(&p),
                 Pop::Missing { next } => self.recover(next.as_deref()),
                 Pop::Stretch => self.conceal(),
+                Pop::Skipped(p) => {
+                    // Cut out to reduce latency: decoded, not played; the next frame is
+                    // spliced onto what was played before.
+                    let frames = self.decode_discarded(p.as_deref());
+                    let n = (frames * 2).min(self.pcm.len());
+                    self.splicer.discard(&self.pcm[..n]);
+                    continue;
+                }
                 Pop::Underrun => {
                     if self.playing && !in_dtx {
                         self.counters.underruns += 1;
                     }
+                    // Nothing to splice onto: the mixer fades the stream out and back in.
+                    self.splicer.reset();
                     break;
                 }
             };
             let n = (frames * 2).min(self.pcm.len());
+            self.note_level(n);
+            let (head, rest) = self.splicer.splice(&self.pcm[..n]);
             // Cannot fail for valid 48 kHz stereo input; a failure only loses this frame.
-            let _ = self.resampler.process(&self.pcm[..n], &mut self.fifo);
+            let _ = self.resampler.process(head, &mut self.fifo);
+            let _ = self.resampler.process(rest, &mut self.fifo);
         }
         self.has_input = self.fifo.len() >= MIX_SAMPLES;
         self.playing = self.has_input;
@@ -985,6 +1052,131 @@ mod tests {
         assert_eq!(st.jb.stats().lost, 0, "{:?}", st.jb.stats());
         assert_eq!(st.jb.stats().late, 0, "{:?}", st.jb.stats());
         assert_eq!(st.mix.concealed, 0, "{:?}", st.mix);
+    }
+
+    /// Start times (s) of the abnormal windows of a steady `freq` tone in `x` (48 kHz mono):
+    /// the detector of `hfa selftest` (`hfa-cli/src/analysis.rs::glitches`) for one tone:
+    /// Hann-windowed 20 ms windows every 10 ms where the tone's amplitude leaves 0.5..1.5 ×
+    /// its median, or the energy that is not the tone exceeds 2 % (−17 dB) of the tone's.
+    fn abnormal_windows(x: &[f32], freq: f64) -> Vec<f64> {
+        let (len, hop) = (960, 480);
+        let w: Vec<f64> = (0..len)
+            .map(|n| 0.5 - 0.5 * (std::f64::consts::TAU * n as f64 / (len - 1) as f64).cos())
+            .collect();
+        let (sum, sum_sq): (f64, f64) = (w.iter().sum(), w.iter().map(|v| v * v).sum());
+        let coeff = 2.0 * (std::f64::consts::TAU * freq / 48_000.0).cos();
+        let windows: Vec<(f64, f64)> = (0..)
+            .map(|k| k * hop)
+            .take_while(|s| s + len <= x.len())
+            .map(|s| {
+                let block = &x[s..s + len];
+                let (mut s1, mut s2) = (0.0f64, 0.0f64);
+                for (v, w) in block.iter().zip(&w) {
+                    let s0 = f64::from(*v) * w + coeff * s1 - s2;
+                    s2 = s1;
+                    s1 = s0;
+                }
+                let amp = 2.0 * (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt() / sum;
+                let ms = block
+                    .iter()
+                    .zip(&w)
+                    .map(|(v, w)| (f64::from(*v) * w).powi(2))
+                    .sum::<f64>()
+                    / sum_sq;
+                (amp, ms)
+            })
+            .collect();
+        let mut amps: Vec<f64> = windows.iter().map(|w| w.0).collect();
+        amps.sort_by(f64::total_cmp);
+        let median = amps[amps.len() / 2];
+        windows
+            .iter()
+            .enumerate()
+            .filter(|(_, (amp, ms))| {
+                *amp < 0.5 * median
+                    || *amp > 1.5 * median
+                    || ms - amp * amp / 2.0 > 0.02 * median * median / 2.0
+            })
+            .map(|(k, _)| k as f64 * 0.010)
+            .collect()
+    }
+
+    /// The failure of the macOS CI run: a burst after a stall left far more audio buffered
+    /// than the target, and every latency cut (one frame every 100 ms) was a glitch of the
+    /// tone. Through the real per-stream path: a burst of 15 packets (single-frame cuts) and
+    /// one of 45 (a multi-frame cut at once). The selftest's detector finds nothing, and the
+    /// decoder saw every packet, discarded ones included.
+    #[test]
+    fn latency_cuts_are_inaudible_and_keep_the_decoder_continuous() {
+        let (shared, mut mix) = stream(10);
+        {
+            // The hub's default jitter settings (a 20 ms minimum target).
+            let mut st = shared.state.lock();
+            st.jb = JitterBuffer::new(JitterConfig {
+                frame_ms: 10,
+                min_target_ms: 20,
+                max_target_ms: 150,
+                initial_target_ms: 40,
+                capacity: 64,
+            });
+        }
+        let pkts = packets(500, false);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut next = 0usize;
+        for tick in 0u64.. {
+            let arriving = match tick {
+                100 => 15,
+                250 => 45,
+                _ => 1,
+            };
+            if next + arriving + 1 > pkts.len() {
+                break;
+            }
+            for _ in 0..arriving {
+                shared.state.lock().on_datagram(
+                    &header(0, next as u32),
+                    pkts[next].clone(),
+                    tick * 10_000,
+                    t0,
+                );
+                next += 1;
+            }
+            mix.fill();
+            if mix.has_input {
+                out.extend(mix.fifo[..MIX_SAMPLES].iter().step_by(2));
+                mix.fifo.drain(..MIX_SAMPLES);
+            } else {
+                out.extend(std::iter::repeat_n(0.0, MIX_FRAMES));
+            }
+        }
+        let (stats, counters) = {
+            let st = shared.state.lock();
+            (st.jb.stats(), st.mix)
+        };
+        assert!(stats.skipped > 40, "{stats:?}");
+        assert_eq!(
+            stats.lost + counters.concealed + stats.stretched,
+            0,
+            "{stats:?} {counters:?}"
+        );
+        // Single-frame cuts after the first burst, one long cut after the second.
+        assert!(mix.splicer.splices() >= 5, "{}", mix.splicer.splices());
+        let bad = abnormal_windows(&out[24_000..], 440.0);
+        assert!(bad.is_empty(), "abnormal windows at {bad:?} s after 0.5 s");
+
+        // Opus state continuity: the stream's decoder decoded packets 0..n in order (played
+        // or discarded), so it decodes packet n exactly like a decoder that saw them all.
+        let n = (counters.played + stats.skipped) as usize;
+        let mut reference = OpusDecoder::new(48_000, 2).expect("decoder");
+        let mut expected = vec![0.0; MAX_PACKET_FRAMES * 2];
+        for p in &pkts[..=n] {
+            let primary = payload::parse(p).expect("container").primary;
+            reference.decode(primary, &mut expected).expect("decode");
+        }
+        let primary = payload::parse(&pkts[n]).expect("container").primary;
+        let frames = mix.decoder.decode(primary, &mut mix.pcm).expect("decode");
+        assert_eq!(mix.pcm[..frames * 2], expected[..frames * 2]);
     }
 
     /// An output that records what it is given, for [`OutputStage`] tests.

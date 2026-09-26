@@ -330,6 +330,50 @@ pub const MAX_CONTROL_FRAME: usize = 65_000;
   `jb.reset_at(R)` before pushing it, then `dec.reset()`, `rs.reset()`, `drift.reset()` (these belong to the
   mixer-side state; reset them before the first frame after the reset is decoded).
 
+### 4.3 Refinements made by `fix/ci-3` (the code and module docs in `core/hfa-audio` are authoritative; they override §4.2 and the shrinking bullet of §6.5 where they differ)
+
+- **Latency cuts are inaudible.** Discarding whole frames to cut latency (§6.5 "Jitter buffer shrinking") was an
+  audible splice: the discarded packet never reached the Opus decoder (a state gap: CELT's overlap and energy
+  prediction belong to the frame before), and jumping one frame ahead is a phase jump of any periodic sound
+  (10 ms of a 440 Hz tone is 4.4 periods: 144°). A debug `cargo test` on the macOS runner failed on it: after a
+  stall and burst, every cut (one per 100 ms) was a glitch of the selftest's 440 Hz tone.
+- **`Pop::Skipped(Option<Vec<u8>>)` (new variant; `Pop` is no longer unchanged by shrinking).** Every slot the
+  jitter buffer discards to cut latency is returned by `pop()`, one per call, in `seq` order (`Some(packet)`, or
+  `None` for a slot that never arrived); a run of them is one cut. The consumer decodes it (conceals a `None`),
+  **throws the audio away** (it is not played and not counted as played/concealed) and pops again. The whole
+  multi-frame cut above `MAX_EXCESS_MS` therefore happens within one tick, as before; `JitterStats.skipped` counts
+  the `Skipped` results.
+- **Shrinking windows and the quiet hint.** Single-frame discards happen at most once per window of
+  `SHRINK_MIN_INTERVAL = 10` pops (the discarding pop itself does not count): at the first pop of the window after
+  the consumer reported quiet audio with **new `JitterBuffer::set_quiet(bool)`** (a cut in a pause is the least
+  audible), else at the window's last pop — so the rate stays one frame per 100 ms. Without hints discards happen
+  at window ends. Cuts above `MAX_EXCESS_MS` never wait. `reset()` clears the hint.
+- **New module `splice`: `Splicer`** (re-exported). `Splicer::new(sample_rate, channels)` preallocates
+  everything; `discard(&pcm)` takes the decoded audio of each discarded slot; `splice(&pcm) -> (head, rest)` turns
+  the first frame played after a cut into `head` (scratch) followed by `rest` (a suffix of `pcm`) — without a
+  pending cut `([], pcm)`; `reset()` forgets a pending cut; `is_pending()`, `splices()`, `crossfade_frames()`.
+  Method (WSOLA style, see the module docs): the tail = the first `CROSSFADE_MS = 5` ms of the discarded audio
+  (what the listener would have heard next); the splice point is searched within `±SEARCH_MS = 5` ms of the
+  nominal cut for the best normalized cross-correlation of the channel sum with the tail (nearest the nominal cut
+  among equally good points), so a periodic sound continues in phase; then an **equal-power crossfade compensated
+  for the measured correlation** `c ∈ [0, 1]` (gains `a = cos θ / n`, `b = sin θ / n`, `n = √(1 + c·sin 2θ)`:
+  equal power for unrelated audio, equal gain for matching audio, so the level neither dips nor bumps). A cut is
+  thus the discarded frames ± up to 5 ms; the next frame is that much shorter or longer (a fixed-chunk
+  `StreamResampler` keeps the remainder as a partial chunk). No allocation after `new` (`tests/no_alloc.rs`).
+- **Hub per-stream recipe (replaces the §4.2 wording where they differ):** before each `pop`, `jb.set_quiet(q)`
+  with `q` from the last decoded frame; `Skipped(p)` → decode `p` (PLC for `None`) → `splicer.discard(pcm)` → pop
+  again; every played frame (`Packet`, `Missing`, `Stretch`) → `splicer.splice(pcm)` → `rs.process(head)` then
+  `rs.process(rest)`; `Underrun` and a stream reset → `splicer.reset()`.
+- **Tests:** `jitter` unit tests (every discarded slot returned in order, gaps included; quiet-hint timing),
+  `splice` unit tests (in-phase continuation of 97 Hz–3.3 kHz tones, no level dip, the plain cut as control),
+  `tests/latency_cut.rs` (a burst cut and single-frame cuts of an Opus-coded 440 Hz tone: every frame after a cut
+  decodes bit-exactly as without the cut; a decoder that never saw the discarded packets differs), and in
+  `hfa-cli`, `analysis::tests::latency_cuts_of_the_jitter_buffer_are_not_glitches` (the selftest's own glitch
+  detector finds no abnormal window at the cuts; the old handling shows a glitch every 100 ms).
+- **Workspace (`core/Cargo.toml`):** `[profile.dev.package.hfa-audio] opt-level = 3` (debug assertions stay on):
+  the per-sample DSP on the mixer thread (and rubato's generic code it instantiates) cost the debug mixer thread
+  ~2.4× the CPU. libopus needs no such setting: `opusic-sys` builds it as CMake `Release` in every profile.
+
 ## 5. `hfa-capture` (OS audio I/O)
 
 ```rust
@@ -1029,8 +1073,9 @@ Modules:
   SHRINK_THRESHOLD_TARGET_FRACTION (0.5) · target_ms)` for `SHRINK_HOLD_MS = 500` ms of pops in a row, `pop()`
   silently discards the oldest slot before taking the next one (at most once every `SHRINK_MIN_INTERVAL = 10`
   pops). An excess above `MAX_EXCESS_MS = 200` is cut at once: the oldest slots are discarded until the buffer is
-  within one frame of the target, and leading gaps after the cut are discarded too. The `Pop` enum is unchanged
-  (the caller simply receives the next frame). A network stall followed by a burst no longer leaves the stream
+  within one frame of the target, and leading gaps after the cut are discarded too. ~~The `Pop` enum is unchanged
+  (the caller simply receives the next frame).~~ **Superseded by §4.3:** every discarded slot is returned as
+  `Pop::Skipped` so the caller keeps its decoder continuous and splices the audio. A network stall followed by a burst no longer leaves the stream
   ~0.5 s late for minutes (the drift controller alone drains ≤ 2 ms/s).
 - **`JitterStats` split (`#[serde(default)]` fields):** `lost` is now **network** loss only (`Missing`, gaps skipped
   at priming, sequence numbers jumped over); slots dropped by an overflow are counted in **`overflowed`**, slots
@@ -1139,6 +1184,24 @@ Re-enabling IPv6 advertising is a later, separate change.
 - **`SenderHandle::send_drops() -> u64`** (new): datagrams dropped at the sender (transient send errors after the
   retry; their `seq` is consumed). `packets_sent()` no longer counts them. The selftest report shows them
   (`DROPPED`), next to the hub's `OVERFLOW` and `SKIPPED` jitter-buffer counters.
+
+### 6.7 Refinements made by `fix/ci-3` (the code and module docs in `core/hfa-core/src/{hub_mixer,netsim}.rs` are authoritative)
+
+- **Mixer thread: latency cuts** follow the §4.3 recipe (`MixStream` owns a `Splicer`; discarded packets are
+  decoded with the payload container's primary entry, PLC if that fails, and never counted as played or
+  concealed). The quiet hint: a decoded frame is quiet when its RMS is below `QUIET_FLOOR_DBFS = −50` or
+  `QUIET_BELOW_AVERAGE_DB = 15` dB below the stream's recent level (exponential average over 50 frames).
+  Test: `hub_mixer::tests::latency_cuts_are_inaudible_and_keep_the_decoder_continuous` (bursts of 15 and 45 packets
+  through the real `MixStream::fill`: no abnormal window for the selftest's detector, and the stream's decoder
+  decodes the next packet bit-exactly like one that saw every packet).
+- **`netsim` relay on a promoted OS thread (`hfa-netsim`)** instead of a tokio task: a blocking socket
+  (`POLL = 20 ms` read timeout for the stop flag), delayed datagrams in a timer queue (earliest first, arrival
+  order among equal due times), promoted with `promote_current_thread(10 ms)` like the hub's receive thread
+  (§6.6). Same public API (`start(..).await`, `local_addr`, `stats`, `stop().await`), except that datagrams still
+  delayed at `stop` are discarded, and dropping the proxy stops the thread. Reason: the macOS runner's timer report
+  shows a plain thread's 10 ms sleeps overshooting by 40–78 ms (a promoted one's by < 0.4 ms), so the relay held
+  back every sender's datagrams at once and released them in a burst — the stall (both streams underrunning, a
+  120 ms dropout) that the debug selftest then had to recover from with latency cuts.
 
 ## 7. `hfa-cli` (`hfa` binary, clap)
 

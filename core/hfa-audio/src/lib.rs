@@ -8,6 +8,7 @@
 //! - [`jitter`]: adaptive jitter buffer.
 //! - [`drift`]: PI clock-drift controller.
 //! - [`resample`]: variable-ratio resampler (`rubato`).
+//! - [`splice`]: inaudible latency cuts (pitch-aligned crossfade around discarded frames).
 //! - [`mixer`]: per-source gain/mute, priority ducking, soft limiter.
 //! - [`meter`]: peak/RMS level meters.
 //! - [`tone`]: sine generator (tests, selftest).
@@ -24,6 +25,7 @@ pub mod meter;
 pub mod mixer;
 pub mod opus;
 pub mod resample;
+pub mod splice;
 pub mod tone;
 pub mod wav;
 
@@ -35,6 +37,7 @@ pub use meter::{Level, LevelMeter};
 pub use mixer::{Mixer, MixerConfig, SourceId};
 pub use opus::{packet_has_fec, OpusConfig, OpusDecoder, OpusEncoder};
 pub use resample::StreamResampler;
+pub use splice::Splicer;
 pub use tone::SineGenerator;
 
 /// Result type used throughout this crate.
@@ -50,4 +53,5 @@ const _: () = {
     assert_send::<Mixer>();
     assert_send::<JitterBuffer>();
     assert_send::<DriftController>();
+    assert_send::<Splicer>();
 };

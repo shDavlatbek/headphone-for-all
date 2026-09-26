@@ -9,7 +9,7 @@ use std::cell::Cell;
 
 use hfa_audio::{
     AudioFormat, DriftConfig, DriftController, JitterBuffer, JitterConfig, Mixer, MixerConfig, Pop,
-    SineGenerator, StreamResampler,
+    SineGenerator, Splicer, StreamResampler,
 };
 
 struct Counting;
@@ -120,6 +120,35 @@ fn hub_stream_path_does_not_allocate_after_warmup() {
         }
     }
     assert_eq!(total, 0, "hub stream path allocated {total} times");
+}
+
+#[test]
+fn splicing_does_not_allocate() {
+    const FRAMES: usize = 480;
+    let mut sp = Splicer::new(48_000, 2);
+    let mut gen = SineGenerator::new(440.0, 0.25, AudioFormat::INTERNAL);
+    let mut frames = vec![vec![0.0_f32; FRAMES * 2]; 4];
+    for f in &mut frames {
+        gen.fill(f);
+    }
+    let short = &frames[0][..200];
+    let mut total = 0;
+    for _ in 0..3 {
+        total += count_allocs(|| {
+            // A cut of a short frame and two full ones, spliced onto the next frame.
+            sp.discard(short);
+            sp.discard(&frames[1]);
+            sp.discard(&frames[2]);
+            let (head, rest) = sp.splice(&frames[3]);
+            assert!(!head.is_empty() && !rest.is_empty());
+            // A one-frame cut, then a frame that is played as it is.
+            sp.discard(&frames[0]);
+            let _ = sp.splice(&frames[1]);
+            let (head, _) = sp.splice(&frames[2]);
+            assert!(head.is_empty());
+        });
+    }
+    assert_eq!(total, 0, "Splicer allocated {total} times");
 }
 
 #[test]

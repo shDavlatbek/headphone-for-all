@@ -39,15 +39,25 @@
 //!   caller synthesizes one frame (Opus PLC) without consuming a packet, so the buffer grows by
 //!   one frame. Counted in [`JitterStats::stretched`].
 //! - **Shrinking.** The symmetric case: a network stall followed by a burst (Wi-Fi power
-//!   save, a channel scan) can leave far more audio buffered than the target, and the drift
-//!   controller alone would take minutes to drain it (≤ 2 ms/s). So while primed, when the
-//!   buffer stays more than `max(SHRINK_THRESHOLD_FRAMES · frame_ms,
+//!   save, a channel scan, a descheduled relay) can leave far more audio buffered than the
+//!   target, and the drift controller alone would take minutes to drain it (≤ 2 ms/s). So while
+//!   primed, when the buffer stays more than `max(SHRINK_THRESHOLD_FRAMES · frame_ms,
 //!   SHRINK_THRESHOLD_TARGET_FRACTION · target)` above the target for [`SHRINK_HOLD_MS`] of
-//!   pops in a row, [`JitterBuffer::pop`] silently discards the oldest slot before taking the
-//!   next one (at most once every [`SHRINK_MIN_INTERVAL`] pops, about 100 ms of audio per
-//!   second). An excess of more than [`MAX_EXCESS_MS`] is cut at once: the oldest slots are
-//!   discarded until the buffer is within one frame of the target. Discarded slots are
+//!   pops in a row, **one slot per window of [`SHRINK_MIN_INTERVAL`] pops** is discarded (about
+//!   100 ms of audio per second): at the first pop of the window after the consumer reported
+//!   quiet audio ([`JitterBuffer::set_quiet`]; a cut in a pause is the least audible), else at
+//!   the window's last pop. An excess of more than [`MAX_EXCESS_MS`] is cut at once: the
+//!   oldest slots are discarded until the buffer is within one frame of the target, then any
+//!   gaps in front of the next packet (playout resumes on a real packet). Discarded slots are
 //!   counted in [`JitterStats::skipped`], not as loss (they were a local latency decision).
+//! - **Discarded slots are returned, not dropped.** Each discarded slot is one
+//!   [`Pop::Skipped`] result (in `seq` order, a run of them for a multi-frame cut), so the
+//!   consumer still decodes the packet — the Opus decoder predicts every frame from the
+//!   previous one, and a packet it never sees leaves a state gap that is audible in the next
+//!   frame — throws the audio away and splices around it ([`crate::splice::Splicer`]: a
+//!   pitch-aligned crossfade from what the listener would have heard next into the audio
+//!   after the cut). Simply jumping to the next frame is a splice too: a 10 ms cut shifts a
+//!   440 Hz tone by 144°, an audible click.
 //! - **Reset.** [`JitterBuffer::reset`] drops packets and playout state but keeps the
 //!   statistics and the jitter/target estimate (they describe the network, not the stream).
 //!   `seq` keeps increasing across a `FLAG_RESET` (it is never reused), so the buffer keeps a
@@ -83,7 +93,8 @@ pub const SHRINK_THRESHOLD_TARGET_FRACTION: f64 = 0.5;
 /// ordinary arrival jitter never triggers it.
 pub const SHRINK_HOLD_MS: f64 = 500.0;
 
-/// Minimum number of pops between two single-frame discards.
+/// Length (in pops) of a shrinking window: at most one slot is discarded per window, at the
+/// first pop after quiet audio was reported ([`JitterBuffer::set_quiet`]), else at the last.
 pub const SHRINK_MIN_INTERVAL: u32 = 10;
 
 /// An excess over the target larger than this (ms) is discarded at once.
@@ -153,6 +164,13 @@ pub enum Pop {
     /// (e.g. `OpusDecoder::conceal`) **without** a packet being consumed, which grows the
     /// buffer by one frame. The next pop continues in `seq` order.
     Stretch,
+    /// The slot was **discarded to cut latency** (see the module docs, "Shrinking"): `Some`
+    /// is its packet, `None` a slot that was never received. The caller decodes it (conceals
+    /// a `None`) and **throws the audio away** — so the decoder state stays continuous — hands
+    /// that audio to [`crate::splice::Splicer::discard`] (the next played frame is spliced
+    /// onto what came before the cut), and pops again: no frame is played for this slot. A
+    /// run of `Skipped` results is one cut.
+    Skipped(Option<Vec<u8>>),
 }
 
 /// Cumulative statistics.
@@ -209,8 +227,15 @@ pub struct JitterBuffer {
     primed: bool,
     /// Pops left before another [`Pop::Stretch`] may be returned.
     stretch_cooldown: u32,
-    /// Pops left before another single-frame discard (shrinking).
-    shrink_cooldown: u32,
+    /// Pops into the current shrinking window (see [`SHRINK_MIN_INTERVAL`]).
+    shrink_phase: u32,
+    /// A slot was already discarded in the current shrinking window.
+    shrink_taken: bool,
+    /// Cutting an excess above [`MAX_EXCESS_MS`]: every pop discards a slot until the buffer
+    /// is back near the target.
+    cutting: bool,
+    /// The consumer's hint that the audio it played last is quiet (see [`Self::set_quiet`]).
+    quiet: bool,
     /// Popped audio (ms) during which the excess over the target stayed above the shrink
     /// threshold without interruption.
     excess_ms: f64,
@@ -236,7 +261,10 @@ impl JitterBuffer {
             floor: None,
             primed: false,
             stretch_cooldown: 0,
-            shrink_cooldown: 0,
+            shrink_phase: 0,
+            shrink_taken: false,
+            cutting: false,
+            quiet: false,
             excess_ms: 0.0,
             stats: JitterStats::default(),
             jitter_ms: 0.0,
@@ -302,32 +330,30 @@ impl JitterBuffer {
         self.stats.overflowed += 1;
     }
 
-    /// Discards the oldest slot to cut latency (shrinking); keeps at least one packet.
-    fn skip_front(&mut self) {
-        if self.count > 1 || matches!(self.slots.front(), Some(None)) {
-            self.advance();
-            self.stats.skipped += 1;
-        }
-    }
-
-    /// Shrinking (see the module docs): discards slots while far more audio is buffered
-    /// than the target. Called by `pop` while primed, with at least one packet buffered.
-    fn shrink(&mut self) {
+    /// Shrinking (see the module docs): decides whether this pop discards the front slot
+    /// because far more audio is buffered than the target. Called by `pop` while primed, with
+    /// at least one packet buffered; a discard always leaves at least one packet.
+    fn shrink(&mut self) -> bool {
         let frame = f64::from(self.config.frame_ms);
-        let excess = self.buffered_ms() - self.target_ms;
-        if excess > MAX_EXCESS_MS {
-            // A burst after a stall: cut straight back to the target.
-            while self.count > 1 && self.buffered_ms() - self.target_ms > frame {
-                self.skip_front();
-            }
-            // Playout resumes on a real packet, not on a gap left by the cut.
-            while matches!(self.slots.front(), Some(None)) {
-                self.skip_front();
-            }
+        if !self.cutting && self.buffered_ms() - self.target_ms > MAX_EXCESS_MS {
+            // A burst after a stall: cut straight back to the target, one slot per pop (the
+            // consumer pops again after every `Skipped`, so the whole cut happens at once).
+            self.cutting = true;
             self.excess_ms = 0.0;
-            self.shrink_cooldown = SHRINK_MIN_INTERVAL;
-            return;
+            self.shrink_phase = 0;
+            self.shrink_taken = false;
         }
+        if self.cutting {
+            let over = self.count > 1 && self.buffered_ms() - self.target_ms > frame;
+            // Playout resumes on a real packet, not on a gap left by the cut.
+            let gap = matches!(self.slots.front(), Some(None));
+            if over || gap {
+                return true;
+            }
+            self.cutting = false;
+            return false;
+        }
+        let excess = self.buffered_ms() - self.target_ms;
         let threshold = (SHRINK_THRESHOLD_FRAMES * frame)
             .max(SHRINK_THRESHOLD_TARGET_FRACTION * self.target_ms);
         if excess > threshold {
@@ -335,12 +361,26 @@ impl JitterBuffer {
         } else {
             self.excess_ms = 0.0;
         }
-        if self.shrink_cooldown > 0 {
-            self.shrink_cooldown -= 1;
-        } else if self.excess_ms >= SHRINK_HOLD_MS && self.count > 1 {
-            self.shrink_cooldown = SHRINK_MIN_INTERVAL - 1;
-            self.skip_front();
+        if self.excess_ms < SHRINK_HOLD_MS || self.count <= 1 {
+            self.shrink_phase = 0;
+            self.shrink_taken = false;
+            return false;
         }
+        // One discard per window: in quiet audio if the consumer reports some, else at the
+        // window's end. The discarding pop does not count as one of the window's pops (the
+        // consumer pops again at once for the frame it plays).
+        let last = self.shrink_phase + 1 >= SHRINK_MIN_INTERVAL;
+        if !self.shrink_taken && (self.quiet || last) {
+            self.shrink_taken = true;
+            return true;
+        }
+        if last {
+            self.shrink_phase = 0;
+            self.shrink_taken = false;
+        } else {
+            self.shrink_phase += 1;
+        }
+        false
     }
 
     /// Skips leading never-received slots (counted as lost).
@@ -474,7 +514,8 @@ impl JitterBuffer {
         }
     }
 
-    /// Takes the next frame in `seq` order (or asks for a stretch frame, see the module docs).
+    /// Takes the next frame in `seq` order (or asks for a stretch frame, or returns a slot
+    /// discarded to cut latency; see the module docs).
     pub fn pop(&mut self) -> Pop {
         self.check_primed();
         if !self.primed {
@@ -483,9 +524,13 @@ impl JitterBuffer {
         if self.count == 0 {
             // Ran dry: re-prime before playing again.
             self.primed = false;
+            self.cutting = false;
             return Pop::Underrun;
         }
-        self.shrink();
+        if self.shrink() {
+            self.stats.skipped += 1;
+            return Pop::Skipped(self.advance());
+        }
         if self.stretch_cooldown > 0 {
             self.stretch_cooldown -= 1;
         } else if self.target_ms - self.buffered_ms()
@@ -503,6 +548,16 @@ impl JitterBuffer {
                 Pop::Missing { next }
             }
         }
+    }
+
+    /// Hint from the consumer: `quiet` is `true` when the audio it played last is quiet (a
+    /// pause, a soft passage), a good place for a latency cut. A single-frame discard that is
+    /// due (see the module docs, "Shrinking") is then taken at once instead of at the end of
+    /// its window. Without hints (`false`, the default) discards happen at window ends. Only
+    /// the timing of single-frame discards depends on it; a cut above [`MAX_EXCESS_MS`] never
+    /// waits.
+    pub fn set_quiet(&mut self, quiet: bool) {
+        self.quiet = quiet;
     }
 
     /// Buffered audio in ms (packets × frame_ms).
@@ -578,7 +633,10 @@ impl JitterBuffer {
         self.anchored = false;
         self.primed = false;
         self.stretch_cooldown = 0;
-        self.shrink_cooldown = 0;
+        self.shrink_phase = 0;
+        self.shrink_taken = false;
+        self.cutting = false;
+        self.quiet = false;
         self.excess_ms = 0.0;
         self.prev_arrival = None;
         self.floor = floor;
@@ -591,12 +649,16 @@ mod tests {
 
     /// 10 ms frames, fixed 30 ms target when timing is perfect, 8 packets.
     fn fixed_cfg() -> JitterConfig {
+        fixed_cfg_with_capacity(8)
+    }
+
+    fn fixed_cfg_with_capacity(capacity: usize) -> JitterConfig {
         JitterConfig {
             frame_ms: 10,
             min_target_ms: 30,
             max_target_ms: 150,
             initial_target_ms: 30,
-            capacity: 8,
+            capacity,
         }
     }
 
@@ -613,6 +675,21 @@ mod tests {
 
     fn pkt(seq: u32) -> Pop {
         Pop::Packet(seq.to_be_bytes().to_vec())
+    }
+
+    /// Pops like the hub does in one tick: discarded slots ([`Pop::Skipped`]) are collected
+    /// and popping continues until a frame (or an underrun/stretch) comes out.
+    fn pop_frame(jb: &mut JitterBuffer, skipped: &mut Vec<Option<Vec<u8>>>) -> Pop {
+        loop {
+            match jb.pop() {
+                Pop::Skipped(p) => skipped.push(p),
+                other => return other,
+            }
+        }
+    }
+
+    fn seq_of(p: &[u8]) -> u32 {
+        u32::from_be_bytes([p[0], p[1], p[2], p[3]])
     }
 
     #[test]
@@ -843,6 +920,7 @@ mod tests {
                 Pop::Stretch => stretch_at.push(tick),
                 Pop::Underrun => assert!(tick < 4, "underrun at tick {tick}"),
                 Pop::Missing { .. } => panic!("nothing is lost"),
+                Pop::Skipped(_) => panic!("nothing is discarded"),
             }
             if tick == 199 {
                 // Steady state before the jump: no stretching needed.
@@ -1000,9 +1078,10 @@ mod tests {
         let mut jb = JitterBuffer::new(JitterConfig::default());
         let mut seq = 0_u32;
         let mut played = Vec::new();
-        let pop = |jb: &mut JitterBuffer, played: &mut Vec<u32>| {
-            if let Pop::Packet(p) = jb.pop() {
-                played.push(u32::from_be_bytes([p[0], p[1], p[2], p[3]]));
+        let mut skipped = Vec::new();
+        let mut pop = |jb: &mut JitterBuffer, played: &mut Vec<u32>| {
+            if let Pop::Packet(p) = pop_frame(jb, &mut skipped) {
+                played.push(seq_of(&p));
             }
         };
         // 2 s of steady 10 ms packets, one pop per tick.
@@ -1041,6 +1120,53 @@ mod tests {
         assert!(played.windows(2).all(|w| w[1] > w[0]));
     }
 
+    /// Every discarded slot is handed to the consumer (so it can keep its decoder state
+    /// continuous), in order, exactly between the last frame played before the cut and the
+    /// first one after it; a gap left in front of the next packet is discarded too.
+    #[test]
+    fn a_cut_returns_every_discarded_slot_in_order() {
+        let mut jb = JitterBuffer::new(fixed_cfg_with_capacity(64));
+        // 30 ms target, 40 packets buffered (seq 5 never arrives): 370 ms over the target.
+        for s in (0..41).filter(|s| *s != 5) {
+            push(&mut jb, s);
+        }
+        let mut skipped = Vec::new();
+        let first = pop_frame(&mut jb, &mut skipped);
+        // The whole cut happens in one go (the consumer pops again after each discard).
+        let discarded: Vec<Option<u32>> =
+            skipped.iter().map(|p| p.as_deref().map(seq_of)).collect();
+        let resume = match first {
+            Pop::Packet(p) => seq_of(&p),
+            other => panic!("{other:?}"),
+        };
+        let expected: Vec<Option<u32>> = (0..resume).map(|s| (s != 5).then_some(s)).collect();
+        assert_eq!(discarded, expected);
+        // Back to within one frame of the target (+ the frame just popped).
+        assert!(
+            jb.buffered_ms() - jb.target_ms() <= 10.0,
+            "{}",
+            jb.buffered_ms()
+        );
+        assert_eq!(jb.stats().skipped, u64::from(resume));
+        assert_eq!(jb.stats().lost, 0, "a discarded gap is not network loss");
+        // The cut is over: the next pops play in order.
+        assert_eq!(jb.pop(), pkt(resume + 1));
+        assert_eq!(jb.pop(), pkt(resume + 2));
+
+        // A cut never lands on a gap: playout resumes on the next real packet.
+        // 40 packets (400 ms): the cut stops with 4 left (40 ms, one frame above the target),
+        // which start with the gap 36..=38.
+        let mut jb = JitterBuffer::new(fixed_cfg_with_capacity(64));
+        for s in (0..36).chain(39..43) {
+            push(&mut jb, s);
+        }
+        let mut skipped = Vec::new();
+        let first = pop_frame(&mut jb, &mut skipped);
+        assert_eq!(first, pkt(39), "{skipped:?}");
+        assert_eq!(skipped.len(), 39);
+        assert!(skipped[36..].iter().all(Option::is_none));
+    }
+
     /// A moderate excess that persists is shrunk one frame at a time, spaced out; ordinary
     /// jitter (a short excess) never is.
     #[test]
@@ -1052,10 +1178,22 @@ mod tests {
         }
         let mut skips_at = Vec::new();
         let mut seq = 10_u32;
+        let mut skipped = Vec::new();
+        let mut next_played: Option<u32> = None;
         for tick in 0..300_u32 {
-            let before = jb.stats().skipped;
-            let _ = jb.pop();
-            if jb.stats().skipped > before {
+            let before = skipped.len();
+            match pop_frame(&mut jb, &mut skipped) {
+                Pop::Packet(p) => {
+                    // Discarded slots are exactly the ones not played.
+                    if let Some(n) = next_played {
+                        assert_eq!(seq_of(&p), n + (skipped.len() - before) as u32);
+                    }
+                    next_played = Some(seq_of(&p) + 1);
+                }
+                other => panic!("{other:?}"),
+            }
+            if skipped.len() > before {
+                assert_eq!(skipped.len() - before, 1, "one frame at a time");
                 skips_at.push(tick);
             }
             push(&mut jb, seq);
@@ -1065,9 +1203,12 @@ mod tests {
         // until the excess is under the threshold (3 frames).
         assert!(!skips_at.is_empty());
         assert!(skips_at[0] >= 49, "{skips_at:?}");
-        assert!(skips_at
-            .windows(2)
-            .all(|w| w[1] - w[0] >= SHRINK_MIN_INTERVAL));
+        assert!(
+            skips_at
+                .windows(2)
+                .all(|w| w[1] - w[0] >= SHRINK_MIN_INTERVAL),
+            "{skips_at:?}"
+        );
         assert!(
             jb.buffered_ms() - jb.target_ms() <= 30.0,
             "{}",
@@ -1087,6 +1228,55 @@ mod tests {
             }
         }
         assert_eq!(jb.stats().skipped, 0);
+    }
+
+    /// A due single-frame discard waits for quiet audio within its window (the least audible
+    /// place for a cut), but never longer than the window.
+    #[test]
+    fn a_due_discard_prefers_quiet_audio() {
+        // 200 ms buffered, target 30 ms: 14 discards bring the excess down to the threshold.
+        // The consumer reports quiet audio on ticks 60..=62 and 95.
+        let run = |quiet_at: &dyn Fn(u32) -> bool| {
+            let mut jb = JitterBuffer::new(fixed_cfg_with_capacity(64));
+            for s in 0..20 {
+                push(&mut jb, s);
+            }
+            let (mut seq, mut skips_at, mut skipped) = (20_u32, Vec::new(), Vec::new());
+            for tick in 0..250_u32 {
+                jb.set_quiet(quiet_at(tick));
+                let before = skipped.len();
+                let _ = pop_frame(&mut jb, &mut skipped);
+                if skipped.len() > before {
+                    skips_at.push(tick);
+                }
+                push(&mut jb, seq);
+                seq += 1;
+            }
+            skips_at
+        };
+        let never = run(&|_| false);
+        let sometimes = run(&|t| (60..=62).contains(&t) || t == 95);
+        // Without hints: at the end of each window.
+        assert_eq!(never.len(), 14, "{never:?}");
+        assert!(
+            never.windows(2).all(|w| w[1] - w[0] == SHRINK_MIN_INTERVAL),
+            "{never:?}"
+        );
+        // With hints: the window containing tick 60 discards at 60 (once, although 61 and 62
+        // are quiet too); the one containing 95 at 95; the others at their ends.
+        assert!(
+            sometimes.contains(&60) && !sometimes.contains(&61),
+            "{sometimes:?}"
+        );
+        assert!(sometimes.contains(&95), "{sometimes:?}");
+        assert_eq!(
+            sometimes.len(),
+            never.len(),
+            "same rate: {never:?} vs {sometimes:?}"
+        );
+        for w in sometimes.windows(2) {
+            assert!(w[1] - w[0] < 2 * SHRINK_MIN_INTERVAL, "{sometimes:?}");
+        }
     }
 
     #[test]
