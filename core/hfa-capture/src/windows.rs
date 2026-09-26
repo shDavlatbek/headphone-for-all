@@ -1087,9 +1087,14 @@ fn activation_outcome(
 
 /// The process-loopback `AUDIOCLIENT_ACTIVATION_PARAMS` and the `VT_BLOB` `PROPVARIANT` that
 /// points at them.
+///
+/// The `PROPVARIANT` is only a **view** of `params` and must never be cleared: the windows
+/// crate implements `Drop` for `PROPVARIANT` with `PropVariantClear`, which for `VT_BLOB` frees
+/// `pBlobData` with `CoTaskMemFree` — here a pointer into this Rust allocation, i.e. heap
+/// corruption. Hence `ManuallyDrop` (nothing in the blob needs freeing).
 struct ActivationParamsData {
     params: AUDIOCLIENT_ACTIVATION_PARAMS,
-    prop: PROPVARIANT,
+    prop: ManuallyDrop<PROPVARIANT>,
 }
 
 /// Owner of a heap-allocated [`ActivationParamsData`] at a fixed address (the `PROPVARIANT`
@@ -1108,39 +1113,45 @@ impl ActivationParams {
                     },
                 },
             },
-            prop: PROPVARIANT::default(),
+            prop: ManuallyDrop::new(blob_propvariant(std::ptr::null_mut(), 0)),
         });
         let ptr = NonNull::from(Box::leak(data));
         let raw = ptr.as_ptr();
         // SAFETY: `raw` comes from a leaked Box, so it is valid, aligned and uniquely owned by
-        // us; we only take field addresses and overwrite the (Drop-free) default PROPVARIANT.
+        // us; we only take field addresses and write the PROPVARIANT in place (`write` drops
+        // nothing; the placeholder is a `ManuallyDrop` view owning nothing anyway).
         unsafe {
             let blob_data = std::ptr::addr_of_mut!((*raw).params).cast::<u8>();
-            (*raw).prop = blob_propvariant(
+            std::ptr::addr_of_mut!((*raw).prop).write(ManuallyDrop::new(blob_propvariant(
                 blob_data,
                 std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-            );
+            )));
         }
         Self(ptr)
     }
 
     /// The `VT_BLOB` PROPVARIANT, valid while `self` lives.
     fn prop(&self) -> *const PROPVARIANT {
-        // SAFETY: the allocation is live until `self` drops; only a field address is taken.
-        unsafe { std::ptr::addr_of!((*self.0.as_ptr()).prop) }
+        // SAFETY: the allocation is live until `self` drops; only a field address is taken
+        // (`ManuallyDrop<T>` is `repr(transparent)`, so the cast is exact).
+        unsafe { std::ptr::addr_of!((*self.0.as_ptr()).prop).cast::<PROPVARIANT>() }
     }
 }
 
 impl Drop for ActivationParams {
     fn drop(&mut self) {
-        // SAFETY: the pointer came from `Box::leak` in `new` and is reclaimed exactly once. The
-        // PROPVARIANT's blob points into this allocation, so it is not PropVariantClear'ed
-        // (the windows-crate PROPVARIANT has no Drop).
+        // SAFETY: the pointer came from `Box::leak` in `new` and is reclaimed exactly once.
+        // The PROPVARIANT is a `ManuallyDrop` view whose blob points into this allocation, so
+        // it is deliberately not dropped (the windows crate's `Drop` would `PropVariantClear`
+        // it and hand `pBlobData` to `CoTaskMemFree`).
         drop(unsafe { Box::from_raw(self.0.as_ptr()) });
     }
 }
 
 /// A `VT_BLOB` PROPVARIANT pointing at `len` bytes at `data` (not owned by the PROPVARIANT).
+///
+/// The result must never be dropped or `PropVariantClear`ed (that would free `data` with
+/// `CoTaskMemFree`): wrap it in `ManuallyDrop`, as [`ActivationParams`] does.
 fn blob_propvariant(data: *mut u8, len: u32) -> PROPVARIANT {
     PROPVARIANT {
         Anonymous: PROPVARIANT_0 {
