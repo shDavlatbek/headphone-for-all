@@ -133,13 +133,20 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --manifest-path "$MANIFEST" -p hfa-ffi --target aarch64-apple-ios --locked -- -D warnings
 
+  # The end-to-end check of the real-time path (paced tone senders, encoder, UDP, jitter buffer,
+  # mixer, paced WAV output) on every desktop OS: each schedules those threads differently.
   selftest:
-    name: CLI selftest (loss 5 %, jitter 20 ms)
-    runs-on: ubuntu-latest
+    name: CLI selftest (loss 5 %, jitter 20 ms, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ${{ env.LINUX_DEPS }}
@@ -149,8 +156,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core
+          key: selftest
       # In-process hub (WAV/null output) + tone sender over localhost; non-zero exit on failure.
       - name: hfa selftest
+        shell: bash
         run: cargo run --manifest-path "$MANIFEST" --release --locked -p hfa-cli -- selftest --seconds 8 --loss 5 --jitter 20
 
   pipewire-live:

@@ -357,9 +357,11 @@ version from `app/pubspec.yaml`.
 
 The Linux packages do not bundle GTK 3 or **libpipewire-0.3**: they come from the host, so that the
 library matches the running PipeWire daemon. glibc is not bundled either, so build the AppImage on the
-oldest distribution you want to support. CI builds it in an `ubuntu:22.04` container (glibc 2.35,
-libpipewire 0.3.48) on an `ubuntu-latest` runner, so the AppImage runs on Ubuntu 22.04, Debian 12 and
-newer.
+oldest distribution you want to support. CI builds it in an `ubuntu:24.04` container (glibc 2.39,
+libpipewire 1.0) on an `ubuntu-latest` runner, so the AppImage runs on 2024+ distributions (Ubuntu
+24.04, Debian 13, Fedora 40 and newer). It cannot be built older: the PipeWire bindings (pipewire-rs
+0.10, `libspa`) do not compile against the PipeWire 0.3.48 of Ubuntu 22.04. Older distributions use the
+Flatpak, whose runtime brings its own glibc and libpipewire.
 
 ## Continuous integration
 
@@ -377,7 +379,7 @@ the older run (except on `main`). Workflows have read-only repository access (on
 | clippy + test | ubuntu, windows, macos (-latest) | `clippy --workspace --all-targets -D warnings`, `cargo test --workspace --no-fail-fast` (every crate's tests run even when one fails; includes the WASAPI and Core Audio backends' unit tests) |
 | Android | ubuntu-latest | `cargo ndk -t arm64-v8a clippy -p hfa-ffi` with the runner's newest NDK |
 | iOS | macos-latest | `cargo check` + `clippy -p hfa-ffi --target aarch64-apple-ios` (default features: bundled libopus + frb) |
-| CLI selftest | ubuntu-latest | `hfa selftest --seconds 8 --loss 5 --jitter 20` (release) |
+| CLI selftest | ubuntu, windows, macos (-latest) | `hfa selftest --seconds 8 --loss 5 --jitter 20` (release): the whole real-time path on each OS's scheduler |
 | PipeWire live tests | ubuntu-latest | headless PipeWire + WirePlumber with a null sink, then the `live_*` tests |
 
 **`flutter.yml`**
@@ -387,7 +389,7 @@ the older run (except on `main`). Workflows have read-only repository access (on
 | analyze + test | ubuntu-latest | `flutter analyze`, `flutter test` | — |
 | flutter_rust_bridge drift check | ubuntu-latest | `flutter_rust_bridge_codegen generate`, then `git status` must be clean | — |
 | Linux build | ubuntu-latest | integration test under `xvfb-run`, `flutter build linux --release` | `headphone_for_all-linux-x64` (tar.gz) |
-| Linux AppImage | ubuntu-latest, `ubuntu:22.04` container | its own `flutter build linux --release` on the oldest supported glibc, then `packaging/linux/build-appimage.sh`; does nothing until that script is on the branch | `headphone_for_all-linux-appimage` |
+| Linux AppImage | ubuntu-latest, `ubuntu:24.04` container | its own `flutter build linux --release` on the oldest supported glibc, then `packaging/linux/build-appimage.sh`; does nothing until that script is on the branch | `headphone_for_all-linux-appimage` |
 | Linux Flatpak | ubuntu-latest, Flathub's `flatpak-github-actions:freedesktop-26.08` container (privileged) | `packaging/linux/build-flatpak.sh` on the Linux build's bundle (after its integration test) | `headphone_for_all-linux-flatpak` |
 | Android APK | ubuntu-latest | JDK 17, SDK 36 + NDK 29.0.14206865, `flutter build apk --release`, Kotlin unit tests + lint if present; release runs also `flutter build appbundle --release` | `headphone_for_all-android-apk`, release runs `…-android-aab` |
 | Windows build | windows-latest | `flutter build windows --release`, Inno Setup installer if `packaging/windows/build-installer.ps1` exists | `headphone_for_all-windows-x64` (zip), `…-windows-x64-setup` |
@@ -421,8 +423,8 @@ python3 -c "import yaml,glob; [yaml.safe_load(open(f)) for f in glob.glob('.gith
 2. **App packages:** calls `flutter.yml` with `release: true`, i.e. every job of an ordinary run (so the
    analysis, tests and codegen drift check gate the release) plus the Android App Bundle and signing
    where the secrets below are set.
-3. **CLI:** `hfa` for `linux-x86_64` (built in an `ubuntu:22.04` container; needs glibc ≥ 2.35 and the
-   host's libpipewire-0.3), `windows-x86_64` (MSVC) and `macos-universal` (lipo of both Mac
+3. **CLI:** `hfa` for `linux-x86_64` (built in an `ubuntu:24.04` container; needs glibc ≥ 2.39 and the
+   host's libpipewire-0.3, i.e. a 2024+ distribution), `windows-x86_64` (MSVC) and `macos-universal` (lipo of both Mac
    architectures), each archived with the licence files.
 4. **Publish** (tags only): a GitHub release with generated notes (a tag with a `-`, e.g. `v1.2.0-beta.1`,
    becomes a pre-release), the files below and `SHA256SUMS`.

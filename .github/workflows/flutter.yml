@@ -146,20 +146,21 @@ jobs:
           retention-days: 14
 
   # The AppImage does not bundle glibc, so it runs only on distributions at least as new as the
-  # build machine: it is built in an Ubuntu 22.04 container (glibc 2.35, libpipewire 0.3.48), the
-  # oldest supported baseline that packaging/README.md specifies. A container and not the
-  # ubuntu-22.04 runner label: GitHub is retiring the Ubuntu 22.04 runner images
-  # (actions/runner-images#14254), while the ubuntu:22.04 image keeps the baseline independent of
-  # the host. The container runs as root and has none of the runner image's tools, so the first
-  # step installs what checkout, flutter-action (curl, jq, unzip, xz), rustup (curl) and the builds
-  # need. build-appimage.sh sets APPIMAGE_EXTRACT_AND_RUN=1, so FUSE is not needed. The job does
-  # nothing until packaging/linux (feat/desktop) is on the branch; `hashFiles` is not available in
-  # a job-level `if`, hence the check step.
+  # build machine: it is built in an Ubuntu 24.04 container (glibc 2.39, libpipewire 1.0), the
+  # baseline that packaging/README.md specifies. Not older: the PipeWire bindings (pipewire-rs
+  # 0.10, libspa) do not compile against PipeWire 0.3.48 of Ubuntu 22.04. Older distributions are
+  # covered by the Flatpak, which brings its own runtime. A container and not the runner label,
+  # so the baseline stays fixed when ubuntu-latest moves on. The container runs as root and has
+  # none of the runner image's tools, so the first step installs what checkout, flutter-action
+  # (curl, jq, unzip, xz), rustup (curl) and the builds need. build-appimage.sh sets
+  # APPIMAGE_EXTRACT_AND_RUN=1, so FUSE is not needed. The job does nothing until packaging/linux
+  # (feat/desktop) is on the branch; `hashFiles` is not available in a job-level `if`, hence the
+  # check step.
   linux-appimage:
-    name: Linux AppImage (Ubuntu 22.04 container)
+    name: Linux AppImage (Ubuntu 24.04 container)
     runs-on: ubuntu-latest
     container:
-      image: ubuntu:22.04
+      image: ubuntu:24.04
     timeout-minutes: 60
     env:
       DEBIAN_FRONTEND: noninteractive

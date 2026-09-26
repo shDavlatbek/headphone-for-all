@@ -16,7 +16,7 @@ on the same local network (same Wi-Fi or LAN, no guest network).
 | OS | Package | Notes |
 |---|---|---|
 | Windows 10 2004+ / 11 | `Headphone_for_All-<ver>-windows-x64-setup.exe` | Installs for the current user (no admin rights). Choose "install for all users" if you want the optional firewall rule (see [Windows](#windows)). |
-| Linux (PipeWire) | `…-x86_64.AppImage` or `…-x86_64.flatpak` | The AppImage needs glibc 2.35+ (Ubuntu 22.04, Debian 12 or newer), GTK 3 and PipeWire from the system: `chmod +x` it and run it. Flatpak: `flatpak install --user Headphone_for_All-*.flatpak`. |
+| Linux (PipeWire) | `…-x86_64.AppImage` or `…-x86_64.flatpak` | The AppImage is for 2024+ distributions (glibc 2.39+: Ubuntu 24.04, Debian 13, Fedora 40 or newer) and needs GTK 3 and PipeWire from the system: `chmod +x` it and run it. On older distributions use the Flatpak: `flatpak install --user Headphone_for_All-*.flatpak`. |
 | macOS 12+ (sending needs 14.2+) | `…-macos.dmg` | Drag the app to Applications. Unsigned test builds are blocked at first launch: allow them in System Settings → Privacy & Security → "Open Anyway". |
 | Android 10+ | `…-android.apk` | Allow installing from your browser or file manager when Android asks. |
 | iOS 15+ | — | No public build yet; build it from source (docs/BUILDING.md). |

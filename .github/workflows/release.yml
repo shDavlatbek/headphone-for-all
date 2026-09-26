@@ -70,11 +70,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Built in an Ubuntu 22.04 container like the AppImage: glibc 2.35 and libpipewire 0.3.48
-          # (linked dynamically) are the oldest baseline it runs on.
+          # Built in an Ubuntu 24.04 container like the AppImage: glibc 2.39 and libpipewire 1.0
+          # (linked dynamically) are the oldest baseline it runs on (the PipeWire bindings do not
+          # compile against the PipeWire 0.3.48 of Ubuntu 22.04).
           - name: linux-x86_64
             os: ubuntu-latest
-            container: ubuntu:22.04
+            container: ubuntu:24.04
           - name: windows-x86_64
             os: windows-latest
             container: ""

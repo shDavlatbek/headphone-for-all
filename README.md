@@ -75,7 +75,9 @@ Any device can be the hub.
 
 - **Released builds:** tagged versions are published on the
   [GitHub releases page](https://github.com/shDavlatbek/headphone-for-all/releases) (Windows installer,
-  AppImage, Flatpak, macOS DMG, Android APK, and the `hfa` CLI), with `SHA256SUMS`.
+  AppImage, Flatpak, macOS DMG, Android APK, and the `hfa` CLI), with `SHA256SUMS`. On Linux the
+  AppImage needs a 2024+ distribution (Ubuntu 24.04, Debian 13, Fedora 40 or newer); the Flatpak also
+  covers older ones.
 - **Test builds:** every CI run on `main` keeps its packages for 14 days (Actions → a "Flutter" run →
   Artifacts; needs a GitHub login). They are unsigned; the APK is debug-signed.
 - **From source:** [docs/BUILDING.md](docs/BUILDING.md) (core, CLI and app on every platform) and

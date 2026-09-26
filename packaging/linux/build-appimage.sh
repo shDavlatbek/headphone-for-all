@@ -8,7 +8,8 @@
 #
 # Prerequisite: `flutter build linux --release` (run from app/), which produces
 # app/build/linux/<x64|arm64>/release/bundle. Build on the oldest distribution
-# you want to support (glibc is not bundled; CI uses Ubuntu 22.04).
+# you want to support (glibc is not bundled; CI uses Ubuntu 24.04, the oldest
+# base the PipeWire bindings build on).
 #
 # The AppImage bundles the app and its Flutter/plugin libraries only. It
 # requires from the host, like every Flutter Linux app: GTK 3, GLib, libepoxy,
