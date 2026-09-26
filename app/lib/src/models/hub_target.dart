@@ -47,8 +47,10 @@ class HubTarget {
   );
 
   /// A paired device that is not currently discovered: the core looks it up
-  /// over mDNS by id (no [address]), or it is dialled at its last known
-  /// [address] (iOS, which cannot browse mDNS). It is [trusted] only if this
+  /// by id through discovery (mDNS, or native Bonjour on iOS; no [address]),
+  /// or it is dialled at its last known [address] (a hub discovery does not
+  /// find, and the iOS broadcast extension, which cannot browse and needs an
+  /// address from the app). It is [trusted] only if this
   /// device paired with it as a sender ([TrustedPeerDto.pairedAsHub]); a peer
   /// that only paired with this device's hub still needs a PIN. [hubKey] is
   /// the hub's public key when it is known (e.g. a remembered hub).

@@ -2293,8 +2293,11 @@ updatedAtMs?}`**, `state` ∈ `idle|connecting|streaming|reconnecting|failed|sto
 also accepts the older answer `{broadcasting, state?, message?, timestamp?}` of §8.9.1: its `started` / `finished`
 states, `broadcasting: true` without a known state → `streaming`, `finished` → `stopped`, `broadcasting: false`
 with a running state → `stopped`, `timestamp` in seconds (or milliseconds when > 1e11); anything unknown → `idle`.
-`broadcastStarted` / `broadcastFinished` keep working. On iOS the sender controller asks `getBroadcastStatus` when
-it is built and on every app resume (`AppLifecycleListener.onResume`); a `failed` state shows its message as the
+The producer side is §8.9.2 (`BroadcastStatusReport` in `HfaPlatformChannel.swift`): it already maps legacy
+status files (`started` → `connecting`, `finished` → `failed` with a message, else `stopped`), always sends
+`updatedAtMs` and `broadcasting`, and never sends a running state with `broadcasting: false`, so the legacy
+fallbacks here only matter for an app build older than §8.9.2. `broadcastStarted` / `broadcastFinished` keep
+working. On iOS the sender controller asks `getBroadcastStatus` when it is built and on every app resume (`AppLifecycleListener.onResume`); a `failed` state shows its message as the
 error. The sender card (broadcast source) titles the state ("Broadcast connecting…", "Broadcasting", "Broadcast
 reconnecting…", "Broadcast failed", "Broadcast stopped") and shows a line (key `broadcast-status`) with the hub,
 the message and the update time. Other platforms are never asked; a `MissingPluginException` (not implemented)
