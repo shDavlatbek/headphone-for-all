@@ -626,6 +626,29 @@ Modules:
   block (a broken file still fails there); a read error while playing (file truncated or replaced) ends the playback
   and sets `error()`. `start` after `stop` plays from the beginning (`Format` error if the file changed its format).
 
+### 5.6 Refinements made by `fix/ci-2` (the code and module docs in `core/hfa-capture` are authoritative)
+
+- **Thread scheduling (`rt.rs`, public).** `hfa_capture::rt::promote_current_thread(period: Duration) -> RtGuard`
+  promotes the calling thread for soft real-time work waking about every `period` (clamped to 1..=100 ms) and
+  never fails; `RtGuard::promotion() -> Promotion { None, Raised, RealTime }` says what it achieved, and dropping
+  the guard (`!Send`, on the same thread) undoes it. macOS/iOS: QoS `USER_INTERACTIVE`, then the Mach
+  time-constraint policy (period, computation = period / 2, constraint = 0.9 · period, preemptible). Windows:
+  MMCSS "Pro Audio" + `timeBeginPeriod(1)` (reverted / `timeEndPeriod` on drop). Linux/Android: best-effort
+  nice −10 (`setpriority` on the thread id; needs `CAP_SYS_NICE`/`RLIMIT_NICE`). No rtkit/D-Bus. **Every soft
+  real-time thread calls it once at its start**: the paced threads of §5.3 (tone, WAV source, WAV/null outputs,
+  with their block period), the hub mixer and the sender encoder (§6.6), the selftest's onset tone (§7.3).
+  Reason: on a loaded machine, and on macOS for any process rated as background work (CI runners), plain
+  sleeps overshoot by tens of milliseconds (a CI run showed 10 ms sleeps taking ~30 ms), which the pipeline hears
+  as dropouts. `libc` is now a dependency of `hfa-capture` on every Unix.
+- `PacedThread::spawn(name, period, body)` (crate-internal) promotes the thread before `body`; pacing itself is
+  unchanged (deadline-based from the frame count, every due block back to back after a late wake-up, skip ahead
+  beyond 250 ms).
+- **Windows process loopback:** `ActivationParamsData.prop` is a `ManuallyDrop<PROPVARIANT>`. The windows crate
+  implements `Drop` for `PROPVARIANT` (`PropVariantClear`), which for the `VT_BLOB` view over the Rust-owned
+  `AUDIOCLIENT_ACTIVATION_PARAMS` freed Rust memory with `CoTaskMemFree` (heap corruption,
+  `STATUS_HEAP_CORRUPTION` in the unit tests). A `PROPVARIANT` that only points at memory it does not own is
+  never dropped or cleared.
+
 ## 6. `hfa-core` (networking + engines; tokio)
 
 - `config.rs`: `Settings { device_name, port, bitrate, frame_ms, fec, jitter_min_ms, jitter_max_ms, output: OutputTarget, data_dir }`
@@ -1095,6 +1118,21 @@ still turned into a retryable `HubNotFound`. Advertising stays **IPv4-only** (§
 dual-stack (§6.5): every advertised address is reachable, and the sender still dials IPv6 hosts typed in directly.
 Re-enabling IPv6 advertising is a later, separate change.
 
+### 6.6 Refinements made by `fix/ci-2` (the code and module docs in `core/hfa-core` are authoritative)
+
+- The **mixer** (`hfa-mixer`, period `MIX_FRAME_MS`) and **encoder** (`hfa-encoder`, period `frame_ms`) threads
+  call `hfa_capture::rt::promote_current_thread` (§5.6) before their loops.
+- **Media socket buffers.** `media::MEDIA_SOCKET_BUFFER = 256 KiB`: the hub's UDP socket, every sender's media
+  socket and the `netsim` relay ask for that much send and receive buffer (`SO_SNDBUF`/`SO_RCVBUF` via
+  `socket2::SockRef`, best effort; the OS may cap it). The defaults are tiny (macOS: ~9 KiB to send), so a sender
+  catching up after a late wake-up, or a briefly descheduled receive task, dropped datagrams.
+- **`MediaSender::send`** retries a full buffer (`WouldBlock`/`EAGAIN`, `ENOBUFS`/`WSAENOBUFS`) up to
+  `SEND_RETRIES = 2` times, `SEND_RETRY_PAUSE = 250 µs` apart, before it reports the transient drop
+  (`Ok(false)`); other transient errors are not retried.
+- **`SenderHandle::send_drops() -> u64`** (new): datagrams dropped at the sender (transient send errors after the
+  retry; their `seq` is consumed). `packets_sent()` no longer counts them. The selftest report shows them
+  (`DROPPED`), next to the hub's `OVERFLOW` and `SKIPPED` jitter-buffer counters.
+
 ## 7. `hfa-cli` (`hfa` binary, clap)
 
 - `hfa hub [--port N] [--out default|device:<name>|wav:<path>|null] [--no-mdns] [--pair]`: prints the PIN and URI and shows a live sources table.
@@ -1185,6 +1223,14 @@ Re-enabling IPv6 advertising is a later, separate change.
 - **`hfa-core` (feat/core-engine-owned, minimal additive change):** `HubHandle::current_pairing() ->
   Option<PairingInfo>` (the open window, from `PairingManager::current`), so the CLI sees when the guess budget
   closed a window.
+
+### 7.3 Refinements made by `fix/ci-2` (the code in `core/hfa-cli` is authoritative)
+
+- **Onset tone (`onset.rs`).** `OnsetTrigger::arm` records when it was called; the tone starts with the first
+  block whose capture time (`start + k · 10 ms`, the generator's device clock) is not before that instant, so
+  the recorded onset lies in `[arm, arm + 10 ms)` whatever the thread's wake-up latency (it used to be the block
+  being delivered, up to a catch-up backlog earlier). The generator thread is promoted (§5.6) and skips ahead
+  instead of bursting after a stall of more than 250 ms.
 
 ## 8. `hfa-ffi` + Flutter app
 
@@ -2255,3 +2301,24 @@ changes that touch only `**.md`, `docs/**` or `LICENSE-*` do not run CI. Concurr
 - **Docs.** CI push triggers are `main` and `claude/**` (feature branches get CI through pull requests).
   New: `docs/USER_GUIDE.md` (end-user guide), `docs/ANDROID_APPS.md` (compatibility rules + list, filled from the
   `.github/ISSUE_TEMPLATE/app-compatibility.yml` reports), "Releasing" in `docs/BUILDING.md`.
+
+### 12.3 Refinements made by `fix/ci-2` (override §12.1 and §12.2 where they differ)
+
+- **AppImage baseline: Ubuntu 24.04.** `linux-appimage` runs in `container: ubuntu:24.04` (glibc 2.39,
+  libpipewire 1.0), and so does the `linux-x86_64` CLI of `release.yml`. pipewire-rs 0.10 (`libspa`) does not
+  compile against the PipeWire 0.3.48 of Ubuntu 22.04, so the "libpipewire 0.3.48 / no `v0_3_49`+ features" rule
+  is dropped: the AppImage and the Linux CLI target 2024+ distributions, the Flatpak (own runtime) covers older
+  ones. The GLib < 2.74 compile definition of `app/linux/CMakeLists.txt` stays (harmless).
+- **CLI selftest on every desktop OS:** the `selftest` job of `rust.yml` is a matrix over ubuntu-, windows- and
+  macos-latest (`shell: bash`, Linux deps on Linux only).
+- **Timer diagnostics:** `hfa_capture::rt::tests::timer_quality_report` never fails; it writes the sleep
+  overshoot percentiles of a plain and a promoted thread straight to stderr (uncaptured), so every `cargo test`
+  log shows the runner's timer quality.
+- **Line endings:** `.gitattributes` stores and checks out every text file with LF on all platforms (`* text=auto
+  eol=lf`), keeps CRLF for the Windows-only `*.bat`, `*.cmd`, `*.ps1`, `*.rc`, `*.iss`, and marks images, fonts,
+  audio, archives, keys and binaries `binary`. Tests that compare file contents must not depend on the checkout's
+  line endings anyway (the hfa-ffi header test normalises `\r\n`).
+- **Icon SVG:** the explanatory comment of `packaging/icon/hfa.svg` (and its byte-identical copy
+  `app/linux/icons/hicolor/scalable/apps/io.github.shdavlatbek.hfa.svg`) sits inside the `<svg>` element: image
+  loaders sniff the first bytes for `<svg`, and with ~600 bytes of comment before it the Flatpak build's
+  `appstreamcli compose` rejected the icon (`icon-file-read-error`).
