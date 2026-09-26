@@ -444,7 +444,9 @@ fn tcp_listener(stack: Stack, port: u16) -> std::io::Result<TcpListener> {
 
 fn udp_socket(stack: Stack, port: u16) -> std::io::Result<UdpSocket> {
     let socket = new_socket(stack, socket2::Type::DGRAM, port)?;
-    UdpSocket::from_std(socket.into())
+    let socket = UdpSocket::from_std(socket.into())?;
+    crate::media::enlarge_buffers(&socket);
+    Ok(socket)
 }
 
 /// Binds TCP and UDP on the same port number in `stack` (port 0: any number free for both).

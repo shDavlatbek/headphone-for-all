@@ -41,6 +41,30 @@ pub const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Largest payload one datagram can carry (`MAX_DATAGRAM` minus header and tag).
 pub const MAX_MEDIA_PAYLOAD: usize =
     hfa_proto::MAX_DATAGRAM - hfa_proto::MEDIA_HEADER_LEN - hfa_proto::AEAD_TAG_LEN;
+/// Send and receive buffer size asked for on every media socket ([`enlarge_buffers`]).
+/// The OS defaults are small (macOS: about 9 KiB to send), so a sender that catches up after
+/// a late wake-up, or a hub whose receive task was briefly descheduled, would drop datagrams.
+/// 256 KiB hold well over a second of audio of a stream.
+pub const MEDIA_SOCKET_BUFFER: usize = 256 * 1024;
+/// How often [`MediaSender::send`] tries again when the socket buffer is full.
+const SEND_RETRIES: u32 = 2;
+/// Pause before each of those retries (the buffer drains at link speed, so this is plenty).
+const SEND_RETRY_PAUSE: Duration = Duration::from_micros(250);
+
+/// Asks for [`MEDIA_SOCKET_BUFFER`] bytes of send and receive buffer on a media socket. Best
+/// effort: the OS may cap the size (Linux: `net.core.{w,r}mem_max`) or refuse, which only
+/// leaves its default in place (logged at debug level).
+pub(crate) fn enlarge_buffers(socket: &UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    for (what, result) in [
+        ("send", sock.set_send_buffer_size(MEDIA_SOCKET_BUFFER)),
+        ("receive", sock.set_recv_buffer_size(MEDIA_SOCKET_BUFFER)),
+    ] {
+        if let Err(e) = result {
+            tracing::debug!(error = %e, "cannot enlarge the media socket's {what} buffer");
+        }
+    }
+}
 
 /// Sends sealed media datagrams of one stream. Usable from a non-async thread (the encoder
 /// thread): `send` never blocks and never waits for the tokio reactor. It sends through a
@@ -125,10 +149,11 @@ impl MediaSender {
     /// Seals and sends one packet with the next sequence number. Returns `Ok(false)` if the
     /// packet was dropped because of a transient condition (its `seq` is still consumed; FEC
     /// and the hub's jitter buffer cover the gap): the socket buffer is full (`EAGAIN`, or
-    /// `ENOBUFS`, which is how macOS/iOS and some Wi-Fi drivers report a full queue), or the
-    /// network is briefly unusable (host/network unreachable or down, host down, connection
-    /// refused, interrupted). Never blocks and never allocates (the datagram buffer is
-    /// reused).
+    /// `ENOBUFS`, which is how macOS/iOS and some Wi-Fi drivers report a full queue) and
+    /// stayed full over [`SEND_RETRIES`] short retries ([`SEND_RETRY_PAUSE`] apart, at most
+    /// 0.5 ms in all), or the network is briefly unusable (host/network unreachable or down,
+    /// host down, connection refused, interrupted). Never blocks on the socket and never
+    /// allocates (the datagram buffer is reused).
     ///
     /// # Errors
     /// [`crate::CoreError::Proto`] (`FrameTooLarge`) if `payload` exceeds
@@ -156,9 +181,19 @@ impl MediaSender {
         };
         self.sealer.seal(&header, payload, &mut self.buf)?;
         self.next_seq = seq.checked_add(1);
-        let sent = match &self.raw {
-            Some(raw) => raw.send_to(&self.buf, self.dest),
-            None => self.socket.try_send_to(&self.buf, self.dest),
+        let mut retries = 0;
+        let sent = loop {
+            let sent = match &self.raw {
+                Some(raw) => raw.send_to(&self.buf, self.dest),
+                None => self.socket.try_send_to(&self.buf, self.dest),
+            };
+            match sent {
+                Err(e) if retries < SEND_RETRIES && is_buffer_full(&e) => {
+                    retries += 1;
+                    std::thread::sleep(SEND_RETRY_PAUSE);
+                }
+                sent => break sent,
+            }
         };
         match sent {
             Ok(_) => Ok(true),
@@ -171,6 +206,30 @@ impl MediaSender {
     pub fn next_seq(&self) -> Option<u32> {
         self.next_seq
     }
+}
+
+/// `true` for a full socket send buffer / interface queue (`EAGAIN`/`EWOULDBLOCK`,
+/// `ENOBUFS`): worth a short retry, since it drains within a fraction of a millisecond.
+fn is_buffer_full(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    let Some(code) = e.raw_os_error() else {
+        return false;
+    };
+    #[cfg(unix)]
+    let full = code == libc::ENOBUFS;
+    #[cfg(windows)]
+    let full = {
+        const WSAENOBUFS: i32 = 10055;
+        code == WSAENOBUFS
+    };
+    #[cfg(not(any(unix, windows)))]
+    let full = {
+        let _ = code;
+        false
+    };
+    full
 }
 
 /// `true` for UDP send errors that only mean "this packet cannot go out right now" (see
@@ -440,6 +499,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn only_a_full_buffer_is_retried() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_buffer_full(&Error::from(ErrorKind::WouldBlock)));
+        for kind in [
+            ErrorKind::HostUnreachable,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::InvalidInput,
+        ] {
+            assert!(!is_buffer_full(&Error::from(kind)), "{kind:?}");
+        }
+        #[cfg(unix)]
+        {
+            assert!(is_buffer_full(&Error::from_raw_os_error(libc::ENOBUFS)));
+            assert!(is_buffer_full(&Error::from_raw_os_error(libc::EAGAIN)));
+            assert!(!is_buffer_full(&Error::from_raw_os_error(libc::EHOSTDOWN)));
+        }
+        #[cfg(windows)]
+        {
+            assert!(is_buffer_full(&Error::from_raw_os_error(10055)));
+            assert!(is_buffer_full(&Error::from_raw_os_error(10035)));
+        }
+    }
+
+    /// The media sockets ask for large buffers; the OS may cap them but never shrinks them.
+    #[tokio::test]
+    async fn media_socket_buffers_are_enlarged() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let sock = socket2::SockRef::from(&socket);
+        let before = (
+            sock.send_buffer_size().expect("sndbuf"),
+            sock.recv_buffer_size().expect("rcvbuf"),
+        );
+        enlarge_buffers(&socket);
+        let after = (
+            sock.send_buffer_size().expect("sndbuf"),
+            sock.recv_buffer_size().expect("rcvbuf"),
+        );
+        assert!(
+            after.0 >= before.0 && after.1 >= before.1,
+            "{before:?} → {after:?}"
+        );
+        // Every desktop OS allows far more than its (small) UDP defaults without privileges.
+        assert!(
+            after.0 >= 64 * 1024 && after.1 >= 64 * 1024,
+            "{before:?} → {after:?}"
+        );
     }
 
     #[tokio::test]

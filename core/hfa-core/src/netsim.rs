@@ -98,7 +98,10 @@ impl UdpImpairProxy {
             IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
             IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
         };
-        let socket = Arc::new(UdpSocket::bind((bind_ip, 0)).await?);
+        let socket = UdpSocket::bind((bind_ip, 0)).await?;
+        // Like the real media sockets: the relay must not add drops of its own.
+        crate::media::enlarge_buffers(&socket);
+        let socket = Arc::new(socket);
         let local_addr = socket.local_addr()?;
         let counters = Arc::new(Counters::default());
         let (stop, mut stopped) = watch::channel(false);

@@ -7,7 +7,7 @@ use hfa_audio::{AudioError, AudioFormat};
 
 use crate::pacer::{PacedThread, Pacer};
 use crate::ring::PcmSink;
-use crate::tone::BLOCK_MS;
+use crate::tone::{block_period, BLOCK_MS};
 use crate::{CaptureError, CaptureSource, Result};
 
 /// Maps a `hound` error: I/O failures become [`CaptureError::Io`], everything else (bad
@@ -231,18 +231,19 @@ impl CaptureSource for WavFileSource {
         };
         self.failed = Arc::new(OnceLock::new());
         let failed = Arc::clone(&self.failed);
-        self.worker.spawn("hfa-wav-source", move |stop| {
-            let mut pacer = Pacer::new(format.sample_rate, format.frames_for_ms(BLOCK_MS));
-            let mut block = vec![0.0f32; pacer.block_frames() * usize::from(format.channels)];
-            while pacer.wait_next(&stop) {
-                if let Err(e) = reader.fill(&mut block) {
-                    tracing::warn!(error = %e, "WAV source cannot read its file; it stops");
-                    let _ = failed.set(e.to_string());
-                    return;
+        self.worker
+            .spawn("hfa-wav-source", block_period(), move |stop| {
+                let mut pacer = Pacer::new(format.sample_rate, format.frames_for_ms(BLOCK_MS));
+                let mut block = vec![0.0f32; pacer.block_frames() * usize::from(format.channels)];
+                while pacer.wait_next(&stop) {
+                    if let Err(e) = reader.fill(&mut block) {
+                        tracing::warn!(error = %e, "WAV source cannot read its file; it stops");
+                        let _ = failed.set(e.to_string());
+                        return;
+                    }
+                    sink.push(&block);
                 }
-                sink.push(&block);
-            }
-        })
+            })
     }
 
     fn stop(&mut self) {

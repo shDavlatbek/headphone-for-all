@@ -420,12 +420,20 @@ impl SenderHandle {
         self.events.subscribe()
     }
 
-    /// Audio datagrams and DTX keep-alives sent so far (all streams), for diagnostics.
+    /// Audio datagrams and DTX keep-alives sent so far (all streams), for diagnostics. Drops
+    /// ([`SenderHandle::send_drops`]) are not counted.
     pub fn packets_sent(&self) -> (u64, u64) {
         (
             self.shared.packets_sent.load(Ordering::Relaxed),
             self.shared.keepalives_sent.load(Ordering::Relaxed),
         )
+    }
+
+    /// Datagrams (audio or keep-alive) dropped at this end because the socket would not take
+    /// them even after a short retry (a full send buffer, or a briefly unusable network); not
+    /// included in [`SenderHandle::packets_sent`]. For diagnostics.
+    pub fn send_drops(&self) -> u64 {
+        self.shared.send_drops.load(Ordering::Relaxed)
     }
 
     /// Stops streaming (sends `StreamStop` + `Bye`), stops the capture and waits for all tasks.
@@ -711,7 +719,9 @@ impl Control {
             IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
             IpAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
         };
-        let socket = Arc::new(UdpSocket::bind(bind).await?);
+        let socket = UdpSocket::bind(bind).await?;
+        crate::media::enlarge_buffers(&socket);
+        let socket = Arc::new(socket);
         let stream_id = loop {
             let id = rand::random::<u32>();
             if id != 0 {

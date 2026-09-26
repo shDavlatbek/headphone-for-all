@@ -16,17 +16,24 @@ use hfa_capture::{CaptureError, CaptureSource, PcmSink};
 /// Block period of the generator thread (like a sound card delivering 10 ms buffers).
 pub const BLOCK_MS: u32 = 10;
 
+/// A generator thread that falls further behind than this (a long stall) skips the missed
+/// blocks instead of delivering them in one burst.
+const MAX_LAG: Duration = Duration::from_millis(250);
+
 /// Arms the onset and reports when it happened. Cloneable; shared with the source's thread.
 #[derive(Debug, Clone, Default)]
 pub struct OnsetTrigger {
-    armed: Arc<AtomicBool>,
+    /// When [`OnsetTrigger::arm`] was first called.
+    armed: Arc<OnceLock<Instant>>,
     onset: Arc<OnceLock<Instant>>,
 }
 
 impl OnsetTrigger {
-    /// Starts the tone at the next block boundary.
+    /// Starts the tone at the next block boundary: the first block whose capture time is not
+    /// before this call (so the onset never precedes the arming, even when the generator
+    /// thread runs late and catches up).
     pub fn arm(&self) {
-        self.armed.store(true, Ordering::Release);
+        let _ = self.armed.set(Instant::now());
     }
 
     /// When the first sample of the tone was captured (`None` until the tone started).
@@ -85,13 +92,15 @@ impl CaptureSource for OnsetToneSource {
         let thread = std::thread::Builder::new()
             .name("hfa-onset-tone".into())
             .spawn(move || {
+                let _rt = hfa_capture::rt::promote_current_thread(block_period);
                 let mut block = vec![0.0f32; block_frames * channels];
                 let mut phase: Option<f64> = None;
                 let start = Instant::now();
                 let mut blocks: u32 = 0;
                 while !stop.load(Ordering::Acquire) {
                     // Block `k` covers [start + k·T, start + (k+1)·T) and is delivered at
-                    // its end, like a capture device.
+                    // its end, like a capture device. A late wake-up delivers every block
+                    // that is due, back to back.
                     let block_start = start + block_period * blocks;
                     let due = block_start + block_period;
                     let now = Instant::now();
@@ -99,7 +108,19 @@ impl CaptureSource for OnsetToneSource {
                         std::thread::sleep(due - now);
                         continue;
                     }
-                    if phase.is_none() && trigger.armed.load(Ordering::Acquire) {
+                    if now - due > MAX_LAG {
+                        // Far behind: resume with the block that ends now.
+                        let elapsed = now.saturating_duration_since(start).as_nanos();
+                        let due_blocks = elapsed / block_period.as_nanos().max(1);
+                        blocks = u32::try_from(due_blocks.saturating_sub(1)).unwrap_or(u32::MAX);
+                        continue;
+                    }
+                    if phase.is_none()
+                        && trigger
+                            .armed
+                            .get()
+                            .is_some_and(|armed| block_start >= *armed)
+                    {
                         let _ = trigger.onset.set(block_start);
                         phase = Some(0.0);
                     }
@@ -152,14 +173,17 @@ mod tests {
         assert!(buf.iter().all(|v| *v == 0.0), "silent before arming");
         assert!(trigger.onset().is_none());
 
-        let armed_at = Instant::now();
+        let before_arm = Instant::now();
         trigger.arm();
+        let after_arm = Instant::now();
         std::thread::sleep(Duration::from_millis(100));
         src.stop();
         let onset = trigger.onset().expect("onset recorded");
+        // The next block boundary after arming (a block capture time, so it does not depend
+        // on how late the generator thread woke up).
         assert!(
-            onset + Duration::from_millis(25) >= armed_at,
-            "{onset:?} vs {armed_at:?}"
+            onset >= before_arm && onset < after_arm + Duration::from_millis(u64::from(BLOCK_MS)),
+            "{onset:?} vs {before_arm:?}..{after_arm:?}"
         );
         let mut buf = vec![0.0f32; source.available()];
         source.pull(&mut buf);

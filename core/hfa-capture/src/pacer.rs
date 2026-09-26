@@ -93,12 +93,14 @@ impl PacedThread {
     }
 
     /// Spawns `body`, which receives the stop flag and must return soon after it is set
-    /// (typically by looping on [`Pacer::wait_next`]).
+    /// (typically by looping on [`Pacer::wait_next`]). The thread is promoted for soft
+    /// real-time work with blocks of `period` ([`crate::rt::promote_current_thread`]) before
+    /// `body` runs.
     ///
     /// # Errors
     /// [`CaptureError::AlreadyRunning`] if a thread is running, [`CaptureError::Backend`] if
     /// the OS cannot spawn a thread.
-    pub(crate) fn spawn<F>(&mut self, name: &str, body: F) -> Result<()>
+    pub(crate) fn spawn<F>(&mut self, name: &str, period: Duration, body: F) -> Result<()>
     where
         F: FnOnce(Arc<AtomicBool>) + Send + 'static,
     {
@@ -109,7 +111,10 @@ impl PacedThread {
         let flag = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name(name.to_owned())
-            .spawn(move || body(flag))
+            .spawn(move || {
+                let _rt = crate::rt::promote_current_thread(period);
+                body(flag);
+            })
             .map_err(|e| CaptureError::Backend(format!("cannot spawn thread {name}: {e}")))?;
         self.stop = stop;
         self.handle = Some(handle);
@@ -246,7 +251,7 @@ mod tests {
     fn stop_wakes_a_sleeping_thread() {
         let mut worker = PacedThread::default();
         worker
-            .spawn("test-pacer", |stop| {
+            .spawn("test-pacer", Duration::from_secs(10), |stop| {
                 // One block per 10 s: only the stop flag can end this promptly.
                 let mut pacer = Pacer::new(1, 10);
                 while pacer.wait_next(&stop) {}
@@ -254,7 +259,7 @@ mod tests {
             .expect("spawn");
         assert!(worker.is_running());
         assert_eq!(
-            worker.spawn("again", |_| {}).err(),
+            worker.spawn("again", Duration::ZERO, |_| {}).err(),
             Some(CaptureError::AlreadyRunning)
         );
         let t0 = Instant::now();

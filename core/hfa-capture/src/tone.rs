@@ -14,6 +14,11 @@ pub const TONE_AMPLITUDE: f32 = 0.25;
 /// Block period of the generator thread.
 pub(crate) const BLOCK_MS: u32 = 10;
 
+/// [`BLOCK_MS`] as a duration (the period the paced thread is promoted for).
+pub(crate) fn block_period() -> std::time::Duration {
+    std::time::Duration::from_millis(u64::from(BLOCK_MS))
+}
+
 /// Generates a sine tone in real time: one 10 ms block per 10 ms on a background thread,
 /// scheduled against a monotonic clock (no cumulative drift). Every channel carries the same
 /// signal.
@@ -76,7 +81,7 @@ impl CaptureSource for ToneSource {
     fn start(&mut self, mut sink: PcmSink) -> Result<()> {
         let format = self.format;
         let mut osc = Oscillator::new(self.freq_hz, format);
-        self.worker.spawn("hfa-tone", move |stop| {
+        self.worker.spawn("hfa-tone", block_period(), move |stop| {
             let mut pacer = Pacer::new(format.sample_rate, format.frames_for_ms(BLOCK_MS));
             let mut block = vec![0.0f32; pacer.block_frames() * usize::from(format.channels)];
             while pacer.wait_next(&stop) {

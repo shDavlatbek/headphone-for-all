@@ -48,8 +48,9 @@ fn spawn_puller<F>(
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
+    let period = std::time::Duration::from_millis(u64::from(block_ms(buffer_ms)));
     let block_frames = format.frames_for_ms(block_ms(buffer_ms)).max(1);
-    worker.spawn(name, move |stop| {
+    worker.spawn(name, period, move |stop| {
         let mut pacer = Pacer::new(format.sample_rate, block_frames);
         let mut block = vec![0.0f32; block_frames * usize::from(format.channels.max(1))];
         while pacer.wait_next(&stop) {

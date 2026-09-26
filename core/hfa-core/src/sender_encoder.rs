@@ -107,6 +107,9 @@ pub(crate) struct EncoderShared {
     pub packets_sent: AtomicU64,
     /// DTX keep-alives sent (all streams).
     pub keepalives_sent: AtomicU64,
+    /// Datagrams (audio or keep-alive) the socket would not take even after a short retry
+    /// (a full send buffer or a briefly unusable network); their `seq` was consumed.
+    pub send_drops: AtomicU64,
 }
 
 impl EncoderShared {
@@ -116,6 +119,7 @@ impl EncoderShared {
             level_db: AtomicU32::new(hfa_audio::meter::SILENCE_DB.to_bits()),
             packets_sent: AtomicU64::new(0),
             keepalives_sent: AtomicU64::new(0),
+            send_drops: AtomicU64::new(0),
         }
     }
 
@@ -194,9 +198,11 @@ pub(crate) fn spawn(
 ) -> Result<JoinHandle<()>, CoreError> {
     let mut worker = EncoderThread::new(source, input, params, shared, commands, events)?;
     let mut capture = capture;
+    let period = Duration::from_millis(u64::from(params.frame_ms));
     thread::Builder::new()
         .name("hfa-encoder".into())
         .spawn(move || {
+            let _rt = hfa_capture::rt::promote_current_thread(period);
             worker.run(capture.as_ref());
             capture.stop();
         })
@@ -440,8 +446,11 @@ impl EncoderThread {
         let result = encode_and_send(st, &self.frame, flags);
         st.timestamp = st.timestamp.wrapping_add(frame_samples);
         match result {
-            Ok(()) => {
+            Ok(true) => {
                 self.shared.packets_sent.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {
+                self.shared.send_drops.fetch_add(1, Ordering::Relaxed);
             }
             Err(Failure::Warning(message)) => self.warn(message),
             Err(Failure::Fatal(error)) => self.fail_stream(error),
@@ -490,8 +499,11 @@ impl EncoderThread {
         let ts = dtx.ts0.wrapping_add(elapsed_samples(dtx.since, now));
         st.prev_seq = None;
         match st.media.send(FLAG_DTX, ts, &[]) {
-            Ok(_) => {
+            Ok(true) => {
                 self.shared.keepalives_sent.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {
+                self.shared.send_drops.fetch_add(1, Ordering::Relaxed);
             }
             Err(error) => self.fail_stream(error),
         }
@@ -517,7 +529,8 @@ enum Failure {
 }
 
 /// Encodes one frame and sends it (with the previous frame as redundancy when enabled).
-fn encode_and_send(st: &mut Stream, frame: &[f32], mut flags: u8) -> Result<(), Failure> {
+/// `Ok(false)`: the datagram was dropped by a transient send error ([`MediaSender::send`]).
+fn encode_and_send(st: &mut Stream, frame: &[f32], mut flags: u8) -> Result<bool, Failure> {
     let n = st
         .opus
         .encode(frame, &mut st.packet)
@@ -548,7 +561,7 @@ fn encode_and_send(st: &mut Stream, frame: &[f32], mut flags: u8) -> Result<(), 
     st.prev.clear();
     st.prev.extend_from_slice(primary);
     st.prev_seq = Some(seq);
-    sent.map(drop).map_err(Failure::Fatal)
+    sent.map_err(Failure::Fatal)
 }
 
 #[cfg(test)]

@@ -29,6 +29,7 @@ pub mod output_cpal;
 pub mod output_file;
 mod pacer;
 pub mod ring;
+pub mod rt;
 pub mod tone;
 pub mod wav_source;
 

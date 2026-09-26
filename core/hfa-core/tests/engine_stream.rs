@@ -50,7 +50,12 @@ async fn paired_tone_sender_reaches_the_wav() {
     assert!(status.level_db > -20.0, "{status:?}");
     let counters = hub.hub.stream_counters(stream_id).expect("counters");
     assert!(counters.played > 200, "{counters:?}");
-    assert_eq!(counters.lost, 0, "no loss on localhost: {counters:?}");
+    assert_eq!(
+        counters.lost,
+        0,
+        "no loss on localhost: {counters:?}, dropped by the sender: {}",
+        sender.sender.send_drops()
+    );
 
     sender.sender.stop().await;
     hub.hub.stop().await;

@@ -640,7 +640,12 @@ pub(crate) fn spawn(
     };
     thread::Builder::new()
         .name("hfa-mixer".into())
-        .spawn(move || worker.run())
+        .spawn(move || {
+            let _rt = hfa_capture::rt::promote_current_thread(Duration::from_millis(u64::from(
+                MIX_FRAME_MS,
+            )));
+            worker.run();
+        })
         .map_err(|e| CoreError::Io(format!("cannot start the mixer thread: {e}")))
 }
 
@@ -1432,6 +1437,7 @@ mod tests {
         let (events, _) = broadcast::channel(8);
         let stop = Arc::new(AtomicBool::new(false));
         let latency = Arc::new(AtomicU32::new(0));
+        let spawned = Instant::now();
         let handle = spawn(
             output,
             sink,
@@ -1453,14 +1459,29 @@ mod tests {
                 t0.elapsed().as_micros() as u64,
                 Instant::now(),
             );
-            std::thread::sleep(Duration::from_millis(10));
+            // One packet per 10 ms against the clock (a late wake-up of this thread delays
+            // one packet, not the whole run), like a real sender.
+            sleep_until(t0 + Duration::from_millis(10 * (seq as u64 + 1)));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        sleep_until(t0 + Duration::from_millis(700));
         stop.store(true, Ordering::Release);
         handle.join().expect("join");
+        let elapsed = spawned.elapsed();
         let st = shared.state.lock();
         assert!(st.mix.played >= 40, "{:?}", st.mix);
-        // Ring target (2 ticks + the output's 10 ms) plus the output's 10 ms.
-        assert!((f32::from_bits(latency.load(Ordering::Relaxed)) - 40.0).abs() < 0.01);
+        // Ring target (2 ticks + the output's 10 ms) plus the output's 10 ms. (Extra fill
+        // could only come from an output underrun between the thread's first two refreshes,
+        // 1 s and 2 s after it started; the run is over well before that.)
+        let published = f32::from_bits(latency.load(Ordering::Relaxed));
+        assert!(elapsed < 2 * OUTPUT_REFRESH, "the run took {elapsed:?}");
+        assert!((published - 40.0).abs() < 0.01, "published {published} ms");
+    }
+
+    /// Sleeps until `deadline` (no-op if it has passed).
+    fn sleep_until(deadline: Instant) {
+        let now = Instant::now();
+        if deadline > now {
+            std::thread::sleep(deadline - now);
+        }
     }
 }

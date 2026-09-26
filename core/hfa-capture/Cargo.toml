@@ -22,11 +22,14 @@ hound = { workspace = true }
 parking_lot = { workspace = true }
 cpal = { workspace = true }
 
+# Scheduling of the audio threads (`rt.rs`) on every Unix, and the Linux and macOS backends.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 # OS-specific backends. Declared here up front so the per-OS work packages
 # (feat/capture-linux, -windows, -macos) only edit their `src/<os>.rs`.
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = { workspace = true }
-libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }
@@ -39,7 +42,6 @@ objc2-core-audio = { workspace = true }
 objc2-core-audio-types = { workspace = true }
 objc2-core-foundation = { workspace = true }
 block2 = { workspace = true }
-libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
