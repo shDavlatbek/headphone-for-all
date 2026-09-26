@@ -1,18 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  Headphone for All: application icon, the source of every raster icon.
-  A headphone that receives two incoming "waves" (the audio other devices
-  stream to the hub over the LAN). Drawn on a 256 x 256 grid; strokes are
-  at least 18 units wide and gaps at least 16 units, so the glyph stays
-  readable at 16 x 16 px (1 px = 16 units).
-
-  packaging/icon/generate.py renders the rasters from this file and derives
-  the platform variants from the element ids: "tile" (background) and
-  "glyph" (headphone + waves). Keep both ids when editing.
-
-  SPDX-License-Identifier: MIT OR Apache-2.0
--->
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!--
+    Headphone for All: application icon, the source of every raster icon.
+    A headphone that receives two incoming "waves" (the audio other devices
+    stream to the hub over the LAN). Drawn on a 256 x 256 grid; strokes are
+    at least 18 units wide and gaps at least 16 units, so the glyph stays
+    readable at 16 x 16 px (1 px = 16 units).
+
+    packaging/icon/generate.py renders the rasters from this file and derives
+    the platform variants from the element ids: "tile" (background) and
+    "glyph" (headphone + waves). Keep both ids when editing.
+
+    The comment sits inside <svg>: image loaders (gdk-pixbuf, so AppStream's
+    icon check in the Flatpak build) sniff the first bytes for the <svg> tag.
+
+    SPDX-License-Identifier: MIT OR Apache-2.0
+  -->
   <title>Headphone for All</title>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
