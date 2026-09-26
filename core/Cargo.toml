@@ -104,7 +104,7 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell_PropertiesSystem",
 ] }
 # Must stay on the same minor as `windows` (0.62) for `#[implement]` / interface macros.
-windows-core = "0.62.2"
+windows-core = "0.100.0"
 # Linux: PipeWire (same major as cpal's optional pipewire backend).
 pipewire = "0.10.1"
 # macOS: Core Audio process taps. The objc2 0.6 / framework 0.3 family is mutually compatible.
