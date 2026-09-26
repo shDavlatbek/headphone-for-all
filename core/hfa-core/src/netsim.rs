@@ -100,7 +100,7 @@ impl UdpImpairProxy {
         };
         let socket = UdpSocket::bind((bind_ip, 0)).await?;
         // Like the real media sockets: the relay must not add drops of its own.
-        crate::media::enlarge_buffers(&socket);
+        crate::media::enlarge_buffers(socket2::SockRef::from(&socket));
         let socket = Arc::new(socket);
         let local_addr = socket.local_addr()?;
         let counters = Arc::new(Counters::default());

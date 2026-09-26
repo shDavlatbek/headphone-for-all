@@ -56,8 +56,7 @@ const SEND_RETRY_PAUSE: Duration = Duration::from_micros(250);
 /// 1 MiB to receive on some Linux hosts, ~768 KiB on macOS). Best effort: the OS may cap the
 /// size (Linux: `net.core.{w,r}mem_max`) or refuse, which only leaves its default in place
 /// (logged at debug level).
-pub(crate) fn enlarge_buffers(socket: &UdpSocket) {
-    let sock = socket2::SockRef::from(socket);
+pub(crate) fn enlarge_buffers(sock: socket2::SockRef<'_>) {
     if !sock
         .send_buffer_size()
         .is_ok_and(|size| size >= MEDIA_SOCKET_BUFFER)
@@ -544,7 +543,7 @@ mod tests {
             sock.send_buffer_size().expect("sndbuf"),
             sock.recv_buffer_size().expect("rcvbuf"),
         );
-        enlarge_buffers(&socket);
+        enlarge_buffers(socket2::SockRef::from(&socket));
         let after = (
             sock.send_buffer_size().expect("sndbuf"),
             sock.recv_buffer_size().expect("rcvbuf"),
@@ -570,7 +569,7 @@ mod tests {
             sock.send_buffer_size().expect("sndbuf"),
             sock.recv_buffer_size().expect("rcvbuf"),
         );
-        enlarge_buffers(&big);
+        enlarge_buffers(socket2::SockRef::from(&big));
         let after = (
             sock.send_buffer_size().expect("sndbuf"),
             sock.recv_buffer_size().expect("rcvbuf"),

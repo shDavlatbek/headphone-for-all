@@ -720,7 +720,7 @@ impl Control {
             IpAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
         };
         let socket = UdpSocket::bind(bind).await?;
-        crate::media::enlarge_buffers(&socket);
+        crate::media::enlarge_buffers(socket2::SockRef::from(&socket));
         let socket = Arc::new(socket);
         let stream_id = loop {
             let id = rand::random::<u32>();

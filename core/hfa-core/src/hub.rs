@@ -31,8 +31,11 @@
 //!     restart: they are saved in `<data_dir>/`[`HUB_CONTROLS_FILE`] (at most
 //!     [`PREFS_SAVE_DELAY`] after a change, and when the hub stops) and loaded on start;
 //!     devices that are no longer trusted are left out.
-//! - **Receive task** (tokio): UDP (a 64 KiB buffer, so an oversize datagram cannot make the
-//!   receive fail on Windows; per-datagram errors never pause the loop) →
+//! - **Receive thread** (`hfa-media-rx`, soft real-time like the mixer: arrival times feed
+//!   the jitter estimate, and a starved tokio worker would let every jitter buffer run dry at
+//!   once): UDP (a 64 KiB buffer, so an oversize datagram cannot make the receive fail on
+//!   Windows; per-datagram errors never pause the loop; it checks for shutdown every
+//!   [`RECEIVE_POLL`]) →
 //!   [`MediaDemux::open`] (authentication, replay window) →
 //!   the stream's jitter buffer (see `hub_mixer.rs`: DTX keep-alives only refresh the
 //!   stream's activity; a `FLAG_RESET` packet, or the first audio after keep-alives, restarts
@@ -70,7 +73,7 @@ use hfa_proto::control::{
 use hfa_proto::{ControlMessage, MediaKey};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
@@ -128,8 +131,13 @@ const PORT_ATTEMPTS: usize = 16;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// UDP receive buffer: larger than any UDP datagram.
 const RECV_BUFFER: usize = 65_536;
-/// Consecutive UDP receive errors after which the receive task pauses 10 ms.
+/// Consecutive UDP receive errors after which the receive thread pauses 10 ms.
 const ERRORS_BEFORE_BACKOFF: u32 = 100;
+/// Longest the receive thread blocks in `recv_from` before it checks for shutdown.
+const RECEIVE_POLL: Duration = Duration::from_millis(50);
+/// Period the receive thread is promoted for ([`hfa_capture::rt::promote_current_thread`]):
+/// the shortest frame a sender sends.
+const RECEIVE_PERIOD: Duration = Duration::from_millis(10);
 
 /// Everything needed to start a hub.
 pub struct HubConfig {
@@ -374,16 +382,14 @@ impl HubEngine {
             next_conn: AtomicU64::new(1),
             pending: Mutex::new(VecDeque::new()),
         });
+        let receiver_stop = Arc::new(AtomicBool::new(false));
+        let receiver = spawn_receiver(Arc::clone(&shared), udp, Arc::clone(&receiver_stop))
+            .inspect_err(|_| mixer_stop.store(true, Ordering::Release))?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let tasks = vec![
             tokio::spawn(accept_loop(
                 Arc::clone(&shared),
                 listener,
-                shutdown_rx.clone(),
-            )),
-            tokio::spawn(receive_loop(
-                Arc::clone(&shared),
-                Arc::new(udp),
                 shutdown_rx.clone(),
             )),
             tokio::spawn(stats_loop(Arc::clone(&shared), shutdown_rx.clone())),
@@ -396,6 +402,8 @@ impl HubEngine {
             shared,
             shutdown,
             tasks,
+            receiver: Some(receiver),
+            receiver_stop,
             mixer: Some(mixer),
             mixer_stop,
             advertiser,
@@ -442,15 +450,20 @@ fn tcp_listener(stack: Stack, port: u16) -> std::io::Result<TcpListener> {
     TcpListener::from_std(socket.into())
 }
 
-fn udp_socket(stack: Stack, port: u16) -> std::io::Result<UdpSocket> {
+/// The media socket, blocking with a [`RECEIVE_POLL`] timeout (the receive thread owns it).
+fn udp_socket(stack: Stack, port: u16) -> std::io::Result<std::net::UdpSocket> {
     let socket = new_socket(stack, socket2::Type::DGRAM, port)?;
-    let socket = UdpSocket::from_std(socket.into())?;
-    crate::media::enlarge_buffers(&socket);
-    Ok(socket)
+    crate::media::enlarge_buffers(socket2::SockRef::from(&socket));
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(RECEIVE_POLL))?;
+    Ok(socket.into())
 }
 
 /// Binds TCP and UDP on the same port number in `stack` (port 0: any number free for both).
-fn bind_stack(stack: Stack, port: u16) -> std::result::Result<(TcpListener, UdpSocket), BindError> {
+fn bind_stack(
+    stack: Stack,
+    port: u16,
+) -> std::result::Result<(TcpListener, std::net::UdpSocket), BindError> {
     if port != 0 {
         let tcp = tcp_listener(stack, port).map_err(|e| ("TCP", e))?;
         let udp = udp_socket(stack, port).map_err(|e| ("UDP", e))?;
@@ -476,7 +489,7 @@ fn bind_stack(stack: Stack, port: u16) -> std::result::Result<(TcpListener, UdpS
 
 /// Binds TCP and UDP on the same port number (see the module docs): dual-stack (IPv6 and
 /// IPv4) where the host supports IPv6, else IPv4 only.
-async fn bind(port: u16) -> Result<(TcpListener, UdpSocket)> {
+async fn bind(port: u16) -> Result<(TcpListener, std::net::UdpSocket)> {
     let port_error = |(proto, e): BindError| {
         if port == 0 {
             CoreError::Io(format!("cannot bind a {proto} port: {e}"))
@@ -1152,25 +1165,36 @@ async fn on_message(
     Flow::Continue
 }
 
-async fn receive_loop(
+/// Starts the media receive thread (`hfa-media-rx`) on the hub's UDP socket (blocking, with
+/// a [`RECEIVE_POLL`] read timeout). It runs until `stop` is set.
+fn spawn_receiver(
     shared: Arc<Shared>,
-    socket: Arc<UdpSocket>,
-    mut shutdown: watch::Receiver<bool>,
-) {
+    socket: std::net::UdpSocket,
+    stop: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("hfa-media-rx".into())
+        .spawn(move || {
+            let _rt = hfa_capture::rt::promote_current_thread(RECEIVE_PERIOD);
+            receive_loop(&shared, &socket, &stop);
+        })
+        .map_err(|e| CoreError::Io(format!("cannot start the media receive thread: {e}")))
+}
+
+fn receive_loop(shared: &Shared, socket: &std::net::UdpSocket, stop: &AtomicBool) {
+    use std::io::ErrorKind;
     // Room for any UDP datagram: a buffer that is too small makes Windows fail the receive
     // with WSAEMSGSIZE (after consuming the datagram) instead of truncating it.
     let mut buf = vec![0u8; RECV_BUFFER];
     let mut errors_in_a_row = 0u32;
-    loop {
-        let received = tokio::select! {
-            r = socket.recv_from(&mut buf) => r,
-            _ = wait_stop(&mut shutdown) => break,
-        };
-        let n = match received {
+    while !stop.load(Ordering::Acquire) {
+        let n = match socket.recv_from(&mut buf) {
             Ok((n, _)) => {
                 errors_in_a_row = 0;
                 n
             }
+            // The read timeout: nothing arrived, look at `stop` again.
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
             Err(e) => {
                 // Per-datagram errors (Windows reports an earlier ICMP "port unreachable" as
                 // ConnectionReset, an oversize datagram as WSAEMSGSIZE) must not slow the loop
@@ -1180,7 +1204,7 @@ async fn receive_loop(
                 if errors_in_a_row > ERRORS_BEFORE_BACKOFF {
                     tracing::debug!(error = %e, "UDP receive keeps failing");
                     errors_in_a_row = 0;
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 continue;
             }
@@ -1274,6 +1298,8 @@ pub struct HubHandle {
     shared: Arc<Shared>,
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
+    receiver: Option<std::thread::JoinHandle<()>>,
+    receiver_stop: Arc<AtomicBool>,
     mixer: Option<std::thread::JoinHandle<()>>,
     mixer_stop: Arc<AtomicBool>,
     advertiser: Option<Advertiser>,
@@ -1430,6 +1456,15 @@ impl HubHandle {
                 tracing::debug!(error = %e, "stopping mDNS advertising");
             }
         }
+        self.receiver_stop.store(true, Ordering::Release);
+        if let Some(receiver) = self.receiver.take() {
+            if tokio::task::spawn_blocking(move || receiver.join())
+                .await
+                .is_err()
+            {
+                tracing::warn!("media receive thread join failed");
+            }
+        }
         self.mixer_stop.store(true, Ordering::Release);
         if let Some(mixer) = self.mixer.take() {
             if tokio::task::spawn_blocking(move || mixer.join())
@@ -1445,8 +1480,10 @@ impl HubHandle {
 
 impl Drop for HubHandle {
     fn drop(&mut self) {
-        // After `stop` this is a no-op; otherwise the tasks and the mixer wind down on their own.
+        // After `stop` this is a no-op; otherwise the tasks, the receive thread and the mixer
+        // wind down on their own.
         let _ = self.shutdown.send(true);
+        self.receiver_stop.store(true, Ordering::Release);
         self.mixer_stop.store(true, Ordering::Release);
     }
 }

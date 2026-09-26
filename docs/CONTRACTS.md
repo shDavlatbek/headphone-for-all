@@ -1122,6 +1122,12 @@ Re-enabling IPv6 advertising is a later, separate change.
 
 - The **mixer** (`hfa-mixer`, period `MIX_FRAME_MS`) and **encoder** (`hfa-encoder`, period `frame_ms`) threads
   call `hfa_capture::rt::promote_current_thread` (§5.6) before their loops.
+- **Hub media receive thread.** The hub's UDP receive loop is no longer a tokio task but a promoted OS thread
+  (`hfa-media-rx`, period 10 ms) owning the (blocking) UDP socket with a 50 ms read timeout (`RECEIVE_POLL`),
+  after which it checks its stop flag; `HubHandle::stop` joins it, dropping the handle stops it. Same rules as
+  before (64 KiB buffer, per-datagram errors never pause the loop, a pause of 10 ms after 100 errors in a row).
+  Reason: on a loaded machine a starved tokio worker left every stream's jitter buffer dry at once (a 65 ms
+  dropout of both tones on the macOS runner) and skewed the arrival times the jitter estimate is built from.
 - **Media socket buffers.** `media::MEDIA_SOCKET_BUFFER = 256 KiB`: the hub's UDP socket, every sender's media
   socket and the `netsim` relay get at least that much send and receive buffer (`SO_SNDBUF`/`SO_RCVBUF` via
   `socket2::SockRef`, best effort; the OS may cap it; a larger default, e.g. macOS's ~768 KiB to receive, is
