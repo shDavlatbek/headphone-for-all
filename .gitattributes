@@ -1,0 +1,56 @@
+# Line endings. Every text file is stored with LF and checked out with LF on every platform,
+# whatever the local `core.autocrlf` says, so a Windows checkout has the same bytes as Linux and
+# macOS (tests compare file contents, e.g. the C header of hfa-ffi; shell scripts run in Linux
+# containers; generated bindings are diffed in CI).
+* text=auto eol=lf
+
+# Windows-only scripts and resources keep CRLF in the working tree, as a Windows checkout with
+# core.autocrlf always gave them (cmd.exe mis-parses LF-only batch files around labels and
+# long lines; rc.exe, Inno Setup and PowerShell are then fed exactly what they were built with).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.rc text eol=crlf
+*.iss text eol=crlf
+
+# Binary files: never converted, never diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.bmp binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.wav binary
+*.mp3 binary
+*.ogg binary
+*.flac binary
+*.opus binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tgz binary
+*.xz binary
+*.7z binary
+*.jar binary
+*.keystore binary
+*.jks binary
+*.p12 binary
+*.pfx binary
+*.der binary
+*.mobileprovision binary
+*.car binary
+*.a binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.exe binary
+*.lib binary
+*.AppImage binary
+*.flatpak binary
+*.dmg binary

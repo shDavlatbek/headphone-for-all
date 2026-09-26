@@ -903,7 +903,9 @@ mod tests {
     /// `include/hfa_ext.h` must declare the same codes and functions as this module.
     #[test]
     fn header_matches_the_rust_constants() {
-        let header = include_str!("../include/hfa_ext.h");
+        // A Windows checkout may have converted the header to CRLF line endings (the
+        // repository's .gitattributes asks for LF, but a local `core.autocrlf` can differ).
+        let header = include_str!("../include/hfa_ext.h").replace("\r\n", "\n");
         for (name, value) in [
             ("HFA_OK", HFA_OK),
             ("HFA_ERR_INVALID_ARGUMENT", HFA_ERR_INVALID_ARGUMENT),
