@@ -1123,9 +1123,10 @@ Re-enabling IPv6 advertising is a later, separate change.
 - The **mixer** (`hfa-mixer`, period `MIX_FRAME_MS`) and **encoder** (`hfa-encoder`, period `frame_ms`) threads
   call `hfa_capture::rt::promote_current_thread` (§5.6) before their loops.
 - **Media socket buffers.** `media::MEDIA_SOCKET_BUFFER = 256 KiB`: the hub's UDP socket, every sender's media
-  socket and the `netsim` relay ask for that much send and receive buffer (`SO_SNDBUF`/`SO_RCVBUF` via
-  `socket2::SockRef`, best effort; the OS may cap it). The defaults are tiny (macOS: ~9 KiB to send), so a sender
-  catching up after a late wake-up, or a briefly descheduled receive task, dropped datagrams.
+  socket and the `netsim` relay get at least that much send and receive buffer (`SO_SNDBUF`/`SO_RCVBUF` via
+  `socket2::SockRef`, best effort; the OS may cap it; a larger default, e.g. macOS's ~768 KiB to receive, is
+  never shrunk). The send defaults can be tiny (macOS: 9 KiB), so a sender catching up after a late wake-up, or
+  a briefly descheduled receive task, dropped datagrams.
 - **`MediaSender::send`** retries a full buffer (`WouldBlock`/`EAGAIN`, `ENOBUFS`/`WSAENOBUFS`) up to
   `SEND_RETRIES = 2` times, `SEND_RETRY_PAUSE = 250 µs` apart, before it reports the transient drop
   (`Ok(false)`); other transient errors are not retried.

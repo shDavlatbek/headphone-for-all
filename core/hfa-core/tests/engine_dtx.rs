@@ -69,6 +69,10 @@ async fn silence_and_stalls_become_dtx_and_audio_resumes() {
     let t0 = hub.started.elapsed().as_secs_f64();
     let pusher_feed = feed.clone();
     let pusher = std::thread::spawn(move || {
+        // This thread plays the native capture thread (Android AudioRecord, ReplayKit), which
+        // the OS schedules as an audio thread: promoted like one, so its pace (and not the
+        // test machine's timer slack) is what the hub sees.
+        let _rt = hfa_capture::rt::promote_current_thread(Duration::from_millis(10));
         let mut tone = SineGenerator::new(440.0, 0.25, format);
         push_for(&pusher_feed, Some(&mut tone), 1.0);
         push_for(&pusher_feed, None, 1.0);

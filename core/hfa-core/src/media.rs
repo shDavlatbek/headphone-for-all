@@ -51,17 +51,27 @@ const SEND_RETRIES: u32 = 2;
 /// Pause before each of those retries (the buffer drains at link speed, so this is plenty).
 const SEND_RETRY_PAUSE: Duration = Duration::from_micros(250);
 
-/// Asks for [`MEDIA_SOCKET_BUFFER`] bytes of send and receive buffer on a media socket. Best
-/// effort: the OS may cap the size (Linux: `net.core.{w,r}mem_max`) or refuse, which only
-/// leaves its default in place (logged at debug level).
+/// Asks for at least [`MEDIA_SOCKET_BUFFER`] bytes of send and receive buffer on a media
+/// socket. A buffer that is already that large is left alone (some systems default to more:
+/// 1 MiB to receive on some Linux hosts, ~768 KiB on macOS). Best effort: the OS may cap the
+/// size (Linux: `net.core.{w,r}mem_max`) or refuse, which only leaves its default in place
+/// (logged at debug level).
 pub(crate) fn enlarge_buffers(socket: &UdpSocket) {
     let sock = socket2::SockRef::from(socket);
-    for (what, result) in [
-        ("send", sock.set_send_buffer_size(MEDIA_SOCKET_BUFFER)),
-        ("receive", sock.set_recv_buffer_size(MEDIA_SOCKET_BUFFER)),
-    ] {
-        if let Err(e) = result {
-            tracing::debug!(error = %e, "cannot enlarge the media socket's {what} buffer");
+    if !sock
+        .send_buffer_size()
+        .is_ok_and(|size| size >= MEDIA_SOCKET_BUFFER)
+    {
+        if let Err(e) = sock.set_send_buffer_size(MEDIA_SOCKET_BUFFER) {
+            tracing::debug!(error = %e, "cannot enlarge the media socket's send buffer");
+        }
+    }
+    if !sock
+        .recv_buffer_size()
+        .is_ok_and(|size| size >= MEDIA_SOCKET_BUFFER)
+    {
+        if let Err(e) = sock.set_recv_buffer_size(MEDIA_SOCKET_BUFFER) {
+            tracing::debug!(error = %e, "cannot enlarge the media socket's receive buffer");
         }
     }
 }
@@ -539,13 +549,34 @@ mod tests {
             sock.send_buffer_size().expect("sndbuf"),
             sock.recv_buffer_size().expect("rcvbuf"),
         );
+        // Never shrunk (some hosts default to more than we ask for)...
         assert!(
             after.0 >= before.0 && after.1 >= before.1,
             "{before:?} → {after:?}"
         );
-        // Every desktop OS allows far more than its (small) UDP defaults without privileges.
+        // ...and every desktop OS allows far more than its smallest UDP defaults (macOS sends
+        // with 9 KiB) without privileges.
         assert!(
             after.0 >= 64 * 1024 && after.1 >= 64 * 1024,
+            "{before:?} → {after:?}"
+        );
+
+        // A socket that already has more than we would ask for keeps it.
+        let big = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let sock = socket2::SockRef::from(&big);
+        let _ = sock.set_send_buffer_size(4 * MEDIA_SOCKET_BUFFER);
+        let _ = sock.set_recv_buffer_size(4 * MEDIA_SOCKET_BUFFER);
+        let before = (
+            sock.send_buffer_size().expect("sndbuf"),
+            sock.recv_buffer_size().expect("rcvbuf"),
+        );
+        enlarge_buffers(&big);
+        let after = (
+            sock.send_buffer_size().expect("sndbuf"),
+            sock.recv_buffer_size().expect("rcvbuf"),
+        );
+        assert!(
+            after.0 >= before.0 && after.1 >= before.1,
             "{before:?} → {after:?}"
         );
     }
