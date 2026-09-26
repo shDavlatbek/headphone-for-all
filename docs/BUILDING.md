@@ -327,8 +327,9 @@ git status                             # commit everything it changed
   `flutter build ios --simulator --debug`, run
   `xcodebuild test -workspace ios/Runner.xcworkspace -scheme Runner -destination 'platform=iOS Simulator,name=<iPhone>' CODE_SIGNING_ALLOWED=NO`
   from `app/`.
-- mDNS discovery on iOS needs the restricted multicast entitlement; until the app has it, senders on iOS
-  connect by address or QR code.
+- iOS discovery does not use `mdns-sd` (it needs the restricted multicast entitlement there): the app
+  registers a native Bonjour backend (`app/ios/Runner/HfaBonjourDiscovery.swift`, C ABI
+  `core/hfa-ffi/include/hfa_discovery.h`); see `app/ios/README.md`.
 
 ## macOS notes
 

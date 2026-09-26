@@ -15,7 +15,8 @@
 #   ruby app/ios/scripts/verify_xcodeproj.rb        # prints and checks the result
 #
 # What it does:
-# - Runner: adds HfaPlatformChannel.swift, BroadcastPickerFactory.swift, Shared/HfaShared.swift
+# - Runner: adds HfaPlatformChannel.swift, BroadcastPickerFactory.swift, HfaBonjourCodec.swift,
+#   HfaBonjourDiscovery.swift (native Bonjour discovery backend) and Shared/HfaShared.swift
 #   to the Sources phase, CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements (App Group) and
 #   PRODUCT_BUNDLE_IDENTIFIER = $(HFA_BUNDLE_ID) (ios/Identity.xcconfig).
 # - RunnerTests: also compiles HfaBroadcast/PcmInterleaver.swift (unit tests of the converter).
@@ -47,7 +48,9 @@ PLUGINS_DST_SUBFOLDER_SPEC = '13'
 # FileTimestamp C617.1: files in the app / App Group container) and cpal's Core Audio backend
 # mach_absolute_time (SystemBootTime 35F9.1: elapsed time inside the app).
 PRIVACY_MANIFEST = 'PrivacyInfo.xcprivacy'
-RUNNER_SOURCES = %w[HfaPlatformChannel.swift BroadcastPickerFactory.swift].freeze
+RUNNER_SOURCES = %w[
+  HfaPlatformChannel.swift BroadcastPickerFactory.swift HfaBonjourCodec.swift HfaBonjourDiscovery.swift
+].freeze
 EXT_SOURCES = %w[SampleHandler.swift PcmInterleaver.swift].freeze
 EXT_OTHER_FILES = %w[
   Info.plist HfaBroadcast.entitlements HfaBroadcast-Bridging-Header.h HfaBroadcast.xcconfig

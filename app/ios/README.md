@@ -8,7 +8,10 @@ broadcast upload extension streams what the phone plays).
 
 | Path | What |
 |---|---|
-| `Runner/AppDelegate.swift` | registers the platform channel on the implicit Flutter engine |
+| `Runner/AppDelegate.swift` | registers the Bonjour discovery backend with Rust (before Flutter starts) and the platform channel on the implicit Flutter engine |
+| `Runner/HfaBonjourDiscovery.swift` | native Bonjour discovery backend of the Rust core: `NWBrowser` + dns_sd resolve, `DNSServiceRegister` (see Discovery below) |
+| `Runner/HfaBonjourCodec.swift` | its pure helpers: TXT records, socket addresses, the JSON exchanged with Rust |
+| `Runner/Runner-Bridging-Header.h` | imports `core/hfa-ffi/include/hfa_discovery.h` (the discovery C ABI of the app's Rust library) |
 | `Runner/HfaPlatformChannel.swift` | `MethodChannel('hfa/platform')`, `EventChannel('hfa/platform/events')`, Darwin-notification observer |
 | `Runner/BroadcastPickerFactory.swift` | platform view `hfa/broadcast_picker` (`RPSystemBroadcastPickerView`) |
 | `Runner/Info.plist`, `Runner/Runner.entitlements` | background audio, local network + Bonjour, camera (QR), App Group |
@@ -19,7 +22,7 @@ broadcast upload extension streams what the phone plays).
 | `scripts/build_rust_ext.sh` | first build phase of the extension: builds `hfa-ffi` into `$BUILT_PRODUCTS_DIR/libhfa_ext.a` |
 | `scripts/add_broadcast_extension.rb` | adds everything above to `Runner.xcodeproj` (idempotent; the result is committed) |
 | `scripts/verify_xcodeproj.rb` | prints targets / build phases and checks the project invariants |
-| `RunnerTests/RunnerTests.swift` | XCTest: config/status JSON formats and the PCM converter |
+| `RunnerTests/RunnerTests.swift` | XCTest: config/status JSON formats, the broadcast status sent to Dart, the Bonjour codecs and registration, and the PCM converter |
 | `Runner/PrivacyInfo.xcprivacy`, `HfaBroadcast/PrivacyInfo.xcprivacy` | privacy manifests (Resources of both targets): no tracking, no collected data; required-reason APIs FileTimestamp `C617.1` (Rust `std::fs` metadata → `stat`/`fstat`) and SystemBootTime `35F9.1` (cpal's Core Audio backend → `mach_absolute_time`). Re-check with `nm -u` of the built binaries when dependencies change |
 | `Identity.xcconfig` | `HFA_BUNDLE_ID` (app), `HFA_BROADCAST_BUNDLE_ID` (extension), `HFA_APP_GROUP`; override them in a git-ignored `Identity.local.xcconfig` |
 
@@ -33,25 +36,58 @@ broadcast upload extension streams what the phone plays).
 | `captureSupport` | `{supported: true, reason: "broadcast"}` |
 | `startSystemCapture` | `false` (the user starts the broadcast with the picker) |
 | `stopSystemCapture`, `acquireMulticastLock`, `releaseMulticastLock` | no-op |
-| `getBroadcastStatus` | `{broadcasting, state?, message?, timestamp?}`: whether a broadcast runs now, plus the extension's last `broadcast_status.json` |
+| `getBroadcastStatus` | `null` without `broadcast_status.json`, else `{state, message?, hubName?, updatedAtMs, broadcasting, timestamp}`: `state` is `"idle"` \| `"connecting"` \| `"streaming"` \| `"reconnecting"` \| `"failed"` \| `"stopped"` (legacy files: `started` → `connecting`, `finished` → `failed` with a message, else `stopped`; unknown → `idle`), `updatedAtMs` when the extension wrote it; `broadcasting` (a broadcast runs now) and `timestamp` (seconds) are kept for older readers |
 
 **Broadcast state re-sync.** Besides forwarding the Darwin notifications (below), the channel compares
 `broadcast_status.json` with the screen capture state (`UIWindowScene.screen.isCaptured`, and
 `sceneCaptureState` on iOS 17+) whenever Dart starts listening, the app becomes active or the capture state
-changes. A status other than `finished` while the screen is captured is a running broadcast: a new listener
-gets `broadcastStarted` (the app was relaunched while the extension kept broadcasting). A status other than
-`finished` while nothing is captured for 8 s means ReplayKit ended the extension without `broadcastFinished`
-(memory limit, crash): the app writes a `finished` status and sends `broadcastFinished` with "The broadcast
-stopped unexpectedly ...". Only changes relative to what Dart was last told are sent.
+changes. A running status (`connecting`, `streaming`, `reconnecting`) while the screen is captured is a running
+broadcast: a new listener gets `broadcastStarted` (the app was relaunched while the extension kept broadcasting).
+A running status while nothing is captured for 8 s means ReplayKit ended the extension without
+`broadcastFinished` (memory limit, crash): the app writes a `failed` status and sends `broadcastFinished` with
+"The broadcast stopped unexpectedly ...". Only changes relative to what Dart was last told are sent.
 
 Events: `{type: "broadcastStarted"}` and `{type: "broadcastFinished", message?}`, driven by the Darwin
-notifications `io.github.shdavlatbek.hfa.broadcast.started` / `.finished` that the extension posts.
+notifications `io.github.shdavlatbek.hfa.broadcast.started` / `.finished` that the extension posts, and
+`{type: "broadcastStatus", state, message?, hubName?, updatedAtMs}` (the `getBroadcastStatus` fields without the
+legacy keys) after every change of the status file: on each of those notifications, on `.status` (the extension's
+connection state changed), when Dart starts listening and when the app becomes active (a notification can be
+missed while the app is suspended); an unchanged status is not sent twice.
 Darwin notifications carry no payload, so the extension first writes
-`<container>/broadcast_status.json` (`{state, message?, timestamp}`); `message` is the reason a
+`<container>/broadcast_status.json` (`{state, message?, timestamp, hubName?}`; `state` `connecting` at the start,
+then `streaming` / `reconnecting` as `hfa_ext_sender_state` reports them, finally `failed` or `stopped`, which
+is written once and never overwritten by a late poll); `message` is the reason a
 broadcast could not start: no App Group, no or invalid `broadcast_config.json`, hub not paired (its key
 is not in the trust store), no `hub_host`, or an invalid hub key; or why it ended later: the hub refused
 this device (`hfa_ext_sender_state` reported `failed`, e.g. pairing required). An unreachable hub is
 **not** such a reason: the Rust sender keeps reconnecting in the background.
+
+## Discovery (Bonjour)
+
+The Rust core's own mDNS (`mdns-sd`) cannot run on iOS without the restricted
+`com.apple.developer.networking.multicast` entitlement. Instead `AppDelegate` registers
+`HfaBonjourDiscovery` with `hfa_discovery_register` (`core/hfa-ffi/include/hfa_discovery.h`) before Flutter
+starts; `hfa_core::discovery` then uses it for every browse (the app's hub list, finding a hub by id) and for
+advertising an iPhone hub. Info.plist declares `NSLocalNetworkUsageDescription` and `NSBonjourServices =
+[_hfa._tcp]`; iOS asks for Local Network access the first time.
+
+- **Browse:** `NWBrowser(.bonjourWithTXTRecord(type: "_hfa._tcp", domain: "local."))`. For each service a
+  dns_sd `DNSServiceResolve` (host name, port, TXT) and `DNSServiceGetAddrInfo` (IPv4 + IPv6) keep running
+  while it is visible; the app reports `{instance, txt, addrs, port}` to Rust with `hfa_discovery_resolved`
+  whenever that changes (only once it has a port and an address; IPv6 link-local addresses are dropped) and
+  `hfa_discovery_removed` when it disappears. Resolving with dns_sd sends nothing to the hub; an
+  `NWConnection` to the service would open a TCP connection to its control port just to learn the address.
+  The browser's TXT record is used, the resolved one when the browser has none. Rust applies the usual
+  validation (`v=0`, a well-formed `id`) and turns it into `Found`/`Lost`.
+- **Advertise:** `DNSServiceRegister(instance, "_hfa._tcp", "local.", port, TXT v/id/name/platform)` on the
+  port the Rust hub already listens on (`NWListener` would bind its own port; `NetService` is deprecated).
+- One serial queue runs everything; dns_sd references are scheduled on it and deallocated on it. Failures
+  (browser failed, mDNSResponder restarted) are retried after 1 s, doubling up to 30 s. Rust's callbacks only
+  enqueue work; `HFA_DISCOVERY_CLOSED` from a report stops that browse.
+- The **broadcast extension** still cannot discover (it has no Bonjour backend and ReplayKit gives it no UI):
+  the app passes the hub's address (from discovery, the QR code or a manual entry) in `broadcast_config.json`,
+  and `writeBroadcastConfig` still requires `hubHost`. If the hub's address changes during a broadcast, start
+  the broadcast again.
 
 ## Broadcast extension `HfaBroadcast`
 
@@ -68,10 +104,11 @@ this device (`hfa_ext_sender_state` reported `failed`, e.g. pairing required). A
   resamples to 48 kHz stereo). `.video` and `.audioMic` are ignored. A lock serializes pushes and
   the stop, so the handle is never used concurrently or after it was freed.
 - While the sender runs, a 1 s timer polls `hfa_ext_sender_state` (under the same lock) and logs
-  state changes. On `failed` (final: pairing required, key mismatch...) it stops the sender, writes
-  `broadcast_status.json` with the reason, posts the finished notification and calls
-  `finishBroadcastWithError`.
-- `broadcastFinished` calls `hfa_ext_sender_stop`.
+  state changes; `connecting`/`pairing`, `streaming` and `reconnecting` (with `hub_name`) are written to
+  `broadcast_status.json` and announced with the `.status` Darwin notification. On `failed` (final: pairing
+  required, key mismatch...) it stops the sender, writes a `failed` status with the reason, posts the finished
+  notification and calls `finishBroadcastWithError`.
+- `broadcastFinished` calls `hfa_ext_sender_stop` and writes a `stopped` status.
 - Memory: ReplayKit kills upload extensions above ~50 MB. The extension has no Flutter, no video
   processing, one reused sample buffer and the Rust sender (a 2-thread tokio runtime + Opus).
 
@@ -154,7 +191,8 @@ On Linux (this repository's dev container):
 - `build_rust_ext.sh` passes `shellcheck` and a dry run with stub `cargo`/`rustup`/`lipo`
   (target selection, profile, lipo),
 - the Rust side: `cargo check -p hfa-ffi --target aarch64-apple-ios --no-default-features`
-  and the C ABI unit tests (header ↔ Rust constants).
+  and the C ABI unit tests (header ↔ Rust constants), including the discovery C ABI end to end with
+  fake native callbacks (`core/hfa-ffi/tests/native_discovery.rs`).
 
 Only on macOS (CI `macos-latest`, or a Mac):
 - Swift compilation of Runner and HfaBroadcast (no `swiftc` on Linux) and the real
@@ -174,8 +212,10 @@ Only on a real iPhone (ReplayKit broadcasts do not run in the Simulator): everyt
    `$(HFA_BUNDLE_ID).broadcast` the App Groups capability with `group.$(HFA_BUNDLE_ID)` (Xcode's automatic
    signing does this). Without the App Group the app stops at start-up with `NO_APP_GROUP`.
 2. `flutter run --release` on the iPhone. Allow local network access when asked.
-3. Start a hub on another device (the app, or the `hfa` CLI), pair the iPhone (QR or PIN) and choose
-   that hub as the target: the app writes `broadcast_config.json`.
+3. Start a hub on another device (the app, or the `hfa` CLI). It must appear in the iPhone's hub list
+   (Bonjour discovery; `log stream` shows "browsing for hubs" from the `bonjour` category). Pair the
+   iPhone (pick it from the list and enter the PIN, or scan the QR code) and choose that hub as the
+   target: the app writes `broadcast_config.json`.
 4. Tap the broadcast button, pick "Headphone for All" (preselected), "Start Broadcast". The red
    status indicator appears, the app receives `broadcastStarted` and the hub shows a new source.
 5. Play music from an app without DRM (YouTube in Safari, a podcast app): it plays in the hub's
@@ -186,15 +226,17 @@ Only on a real iPhone (ReplayKit broadcasts do not run in the Simulator): everyt
    pairing any hub, so there is no `broadcast_config.json`. iOS shows the extension's error text
    ("Open Headphone for All, pair this iPhone with your headphone hub ...") and the app receives
    `broadcastFinished` with that message.
-8. Hub gone (known limitation, not a failure path): stop the hub, or make it forget the iPhone, then
-   start the broadcast. It **starts anyway**: the app receives `broadcastStarted`, the hub shows
-   nothing, and no error reaches the app while the extension keeps reconnecting in the background
-   (the C ABI has no status query). If you only stopped the hub, start it again: the source appears
-   within a few seconds.
+8. Hub gone (not a failure path): stop the hub, then start the broadcast. It **starts anyway**: the app
+   receives `broadcastStarted` and `broadcastStatus` `connecting` / `reconnecting` while the extension keeps
+   reconnecting in the background. Start the hub again: the source appears within a few seconds and the
+   status becomes `streaming`. If the hub forgot the iPhone instead, the broadcast ends with `failed`.
 9. Memory: in Xcode attach to `HfaBroadcast` (Debug → Attach to Process) and watch the memory
    gauge while streaming for several minutes; it must stay well below 50 MB.
 10. Hub mode: start the hub in the app, lock the phone: playback continues (background audio,
-   `.mixWithOthers` lets other apps keep playing).
+   `.mixWithOthers` lets other apps keep playing). Another device (desktop app, `hfa discover` on the
+   CLI) lists the iPhone hub (advertised with `DNSServiceRegister`).
+11. Connection state: while broadcasting, stop the hub for a few seconds and start it again: the app's
+   `broadcastStatus` events go `streaming` → `reconnecting` → `streaming` (with the hub's name).
 
 Logs: `log stream --predicate 'subsystem BEGINSWITH "io.github.shdavlatbek.hfa"'` on a Mac with the
 phone attached (Console.app works too).
@@ -206,11 +248,10 @@ phone attached (Console.app works too).
   `<container>/hfa/broadcast.log` instead (capped at 256 KiB, one previous part kept as
   `broadcast.log.1`); the Swift side logs every failure with `os.Logger` (subsystem
   `io.github.shdavlatbek.hfa.broadcast`).
-- A hub that disappears later is not reported to the app: the sender keeps reconnecting
-  (`hfa_ext_sender_state` says `reconnecting`; only `failed` ends the broadcast).
-- mDNS through the Rust `mdns-sd` crate (hub advertising on iOS, or `hub_host = ""` in the
-  extension) needs the restricted `com.apple.developer.networking.multicast` entitlement on
-  iOS 14+ (Apple must grant it). Without it, pairing by QR/URI with an explicit host works; the
-  app must always pass `hubHost` to `writeBroadcastConfig` (the C ABI refuses an empty `hub_host`
-  on iOS with `HFA_ERR_CONFIG`).
+- A hub that disappears later does not end the broadcast: the sender keeps reconnecting (the app sees
+  `broadcastStatus` `reconnecting`; only `failed` ends the broadcast).
+- The app discovers and advertises hubs through native Bonjour (Discovery above); the Swift side is
+  compiled and unit-tested in CI but not yet tested between real devices. The extension cannot discover:
+  the app must always pass `hubHost` to `writeBroadcastConfig` (the C ABI refuses an empty `hub_host` on
+  iOS with `HFA_ERR_CONFIG`, since `mdns-sd` would need the restricted multicast entitlement).
 - App Store review of an audio-only broadcast extension is not guaranteed (docs/ROADMAP.md).

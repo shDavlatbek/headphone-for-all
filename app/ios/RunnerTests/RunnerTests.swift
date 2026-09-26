@@ -1,6 +1,7 @@
 // RunnerTests.swift - unit tests of the iOS native code that can run without a device:
 // the data directory policy of the platform channel, the App Group file formats
-// (HfaShared.swift, compiled into Runner) and the ReplayKit PCM
+// (HfaShared.swift, compiled into Runner), the broadcast status reported to Dart, the Bonjour
+// discovery backend's codecs and its registration with Rust, and the ReplayKit PCM
 // conversion of the broadcast extension (PcmInterleaver.swift is compiled into this test target
 // too, since an app extension cannot be a test host).
 //
@@ -10,6 +11,7 @@
 import AudioToolbox
 import CoreMedia
 import Flutter
+import Foundation
 import XCTest
 
 @testable import Runner
@@ -146,6 +148,213 @@ final class BroadcastSyncTests: XCTestCase {
   func testStatusIsActiveUntilFinished() {
     XCTAssertTrue(status("started").isActive)
     XCTAssertFalse(status("finished").isActive)
+    for running in ["connecting", "streaming", "reconnecting"] {
+      XCTAssertTrue(status(running).isActive, running)
+    }
+    XCTAssertFalse(status("failed").isActive)
+    XCTAssertFalse(status("stopped").isActive)
+  }
+
+  func testFailedAndStoppedAreIdle() {
+    XCTAssertEqual(
+      BroadcastSync.evaluate(status: status("failed", "hub refused"), screenCaptured: true),
+      .idle(message: "hub refused"))
+    XCTAssertEqual(
+      BroadcastSync.evaluate(status: status("stopped"), screenCaptured: false), .idle(message: nil))
+    XCTAssertEqual(
+      BroadcastSync.evaluate(status: status("reconnecting"), screenCaptured: false), .vanished)
+  }
+}
+
+final class BroadcastStatusReportTests: XCTestCase {
+  private func status(_ state: String, _ message: String? = nil, hub: String? = nil)
+    -> BroadcastStatus
+  {
+    BroadcastStatus(state: state, message: message, timestamp: 1_700_000_000.1234, hubName: hub)
+  }
+
+  func testStatesFollowTheExtension() {
+    for state in ["connecting", "streaming", "reconnecting", "failed", "stopped"] {
+      XCTAssertEqual(BroadcastStatusReport.state(of: status(state)), state)
+    }
+    XCTAssertEqual(BroadcastStatusReport.state(of: status("pairing")), "connecting")
+  }
+
+  /// Files written by older builds.
+  func testLegacyStates() {
+    XCTAssertEqual(BroadcastStatusReport.state(of: status("started")), "connecting")
+    XCTAssertEqual(BroadcastStatusReport.state(of: status("finished")), "stopped")
+    XCTAssertEqual(BroadcastStatusReport.state(of: status("finished", "")), "stopped")
+    XCTAssertEqual(BroadcastStatusReport.state(of: status("finished", "not paired")), "failed")
+    XCTAssertEqual(BroadcastStatusReport.state(of: status("something new")), "idle")
+    let legacy = Data(#"{"state":"finished","message":"boom","timestamp":12.5}"#.utf8)
+    let decoded = try? JSONDecoder().decode(BroadcastStatus.self, from: legacy)
+    XCTAssertEqual(decoded, BroadcastStatus(state: "finished", message: "boom", timestamp: 12.5))
+    XCTAssertNil(decoded?.hubName)
+  }
+
+  func testEveryReportedStateIsInTheContract() {
+    for state in ["connecting", "pairing", "streaming", "reconnecting", "failed", "stopped",
+      "started", "finished", "x"]
+    {
+      XCTAssertTrue(
+        BroadcastStatusReport.states.contains(BroadcastStatusReport.state(of: status(state))),
+        state)
+    }
+  }
+
+  func testFields() {
+    let fields = BroadcastStatusReport.fields(of: status("streaming", hub: "Desk"))
+    XCTAssertEqual(
+      fields, ["state": "streaming", "hubName": "Desk", "updatedAtMs": 1_700_000_000_123])
+    let failed = BroadcastStatusReport.fields(of: status("failed", "hub refused", hub: ""))
+    XCTAssertEqual(
+      failed, ["state": "failed", "message": "hub refused", "updatedAtMs": 1_700_000_000_123])
+    let map = BroadcastStatusReport.channelMap(failed)
+    XCTAssertEqual(map["updatedAtMs"] as? Int, 1_700_000_000_123)
+    XCTAssertEqual(map["message"] as? String, "hub refused")
+    XCTAssertNil(map["hubName"])
+  }
+
+  func testMillisecondsAreSane() {
+    XCTAssertEqual(BroadcastStatusReport.milliseconds(1.5), 1_500)
+    XCTAssertEqual(BroadcastStatusReport.milliseconds(.nan), 0)
+    XCTAssertEqual(BroadcastStatusReport.milliseconds(.infinity), 0)
+    XCTAssertEqual(BroadcastStatusReport.milliseconds(-3), 0)
+    XCTAssertEqual(BroadcastStatusReport.milliseconds(1e300), 0)
+  }
+
+  func testSenderStatesMapToBroadcastStates() {
+    XCTAssertEqual(BroadcastStatus.state(forSenderState: "connecting"), "connecting")
+    XCTAssertEqual(BroadcastStatus.state(forSenderState: "pairing"), "connecting")
+    XCTAssertEqual(BroadcastStatus.state(forSenderState: "streaming"), "streaming")
+    XCTAssertEqual(BroadcastStatus.state(forSenderState: "reconnecting"), "reconnecting")
+    XCTAssertNil(BroadcastStatus.state(forSenderState: "failed"))
+    XCTAssertNil(BroadcastStatus.state(forSenderState: "stopped"))
+  }
+
+  func testStatusWithHubNameRoundTrips() throws {
+    let original = status("streaming", hub: "Desk")
+    let data = try JSONEncoder().encode(original)
+    XCTAssertEqual(try JSONDecoder().decode(BroadcastStatus.self, from: data), original)
+  }
+}
+
+final class BonjourCodecTests: XCTestCase {
+  private typealias Entry = HfaBonjourCodec.TXTEntry
+
+  func testTXTRecordRoundTrips() {
+    let entries = [
+      Entry(key: "v", value: "0"), Entry(key: "id", value: "ab12-cd34"),
+      Entry(key: "name", value: "Küche = Desk"), Entry(key: "platform", value: "ios"),
+    ]
+    let data = HfaBonjourCodec.txtRecordData(entries)
+    XCTAssertEqual(Array(data.prefix(4)), [3, UInt8(ascii: "v"), UInt8(ascii: "="), UInt8(ascii: "0")])
+    XCTAssertEqual(
+      HfaBonjourCodec.parseTXTRecord(data),
+      ["v": "0", "id": "ab12-cd34", "name": "Küche = Desk", "platform": "ios"])
+  }
+
+  func testTXTRecordSkipsInvalidEntries() {
+    let long = String(repeating: "x", count: 254)
+    let data = HfaBonjourCodec.txtRecordData([
+      Entry(key: "", value: "a"), Entry(key: "a=b", value: "c"), Entry(key: "n", value: long),
+      Entry(key: "ok", value: "1"),
+    ])
+    XCTAssertEqual(HfaBonjourCodec.parseTXTRecord(data), ["ok": "1"])
+    XCTAssertEqual(HfaBonjourCodec.txtRecordData([]), Data([0]), "an empty TXT record is one empty string")
+    let fits = HfaBonjourCodec.txtRecordData([Entry(key: "n", value: String(long.dropLast()))])
+    XCTAssertEqual(fits.count, 256)
+  }
+
+  func testTXTParsingRules() {
+    var bytes: [UInt8] = []
+    for entry in ["ID=first", "id=second", "flag", "=novalue", "name="] {
+      bytes.append(UInt8(entry.utf8.count))
+      bytes.append(contentsOf: Array(entry.utf8))
+    }
+    bytes += [2, 0xFF, 0xFE]  // not UTF-8
+    bytes += [9, UInt8(ascii: "x")]  // truncated
+    XCTAssertEqual(
+      HfaBonjourCodec.parseTXTRecord(Data(bytes)), ["id": "first", "flag": "", "name": ""])
+    XCTAssertEqual(HfaBonjourCodec.parseTXTRecord(Data()), [:])
+    XCTAssertEqual(HfaBonjourCodec.parseTXTRecord(Data([0])), [:])
+    XCTAssertEqual(HfaBonjourCodec.normalizedTXT(["ID": "a", "id": "b", "Name": "c"]), ["id": "a", "name": "c"])
+  }
+
+  /// `HfaBonjourCodec.ipString` of a socket address holding `text` (IPv4 or IPv6).
+  private func ipString(of text: String) -> String? {
+    if text.contains(":") {
+      var address = sockaddr_in6()
+      address.sin6_family = sa_family_t(AF_INET6)
+      address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      XCTAssertEqual(inet_pton(AF_INET6, text, &address.sin6_addr), 1, text)
+      return withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { HfaBonjourCodec.ipString($0) }
+      }
+    }
+    var address = sockaddr_in()
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    XCTAssertEqual(inet_pton(AF_INET, text, &address.sin_addr), 1, text)
+    return withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { HfaBonjourCodec.ipString($0) }
+    }
+  }
+
+  func testSocketAddressesBecomeNumericHosts() {
+    XCTAssertEqual(ipString(of: "192.168.1.20"), "192.168.1.20")
+    XCTAssertEqual(ipString(of: "fd00::20"), "fd00::20")
+    XCTAssertNil(ipString(of: "fe80::1"), "link-local IPv6 is useless without its zone")
+    var unix = sockaddr()
+    unix.sa_family = sa_family_t(AF_UNIX)
+    XCTAssertNil(withUnsafePointer(to: &unix) { HfaBonjourCodec.ipString($0) })
+  }
+
+  func testResolvedJSONForRust() throws {
+    let json = try XCTUnwrap(
+      HfaBonjourCodec.resolvedJSON(
+        instance: "Desk (ab12)", txt: ["v": "0"], addresses: ["192.168.1.20", "fd00::20"],
+        port: 47_810))
+    let object = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+    XCTAssertEqual(object["instance"] as? String, "Desk (ab12)")
+    XCTAssertEqual(object["txt"] as? [String: String], ["v": "0"])
+    XCTAssertEqual(object["addrs"] as? [String], ["192.168.1.20", "fd00::20"])
+    XCTAssertEqual(object["port"] as? Int, 47_810)
+  }
+
+  func testAdvertFromRust() {
+    let json = #"{"instance":"Desk (ab12)","type":"_hfa._tcp","domain":"local.","port":47810,"txt":[["v","0"],["name","Desk"]]}"#
+    XCTAssertEqual(
+      HfaBonjourCodec.decodeAdvert(json),
+      HfaBonjourCodec.Advert(
+        instance: "Desk (ab12)", type: "_hfa._tcp", domain: "local.", port: 47_810,
+        txt: [Entry(key: "v", value: "0"), Entry(key: "name", value: "Desk")]))
+    for bad in [
+      "not json",
+      #"{"instance":"a","type":"_hfa._tcp","domain":"local.","port":0,"txt":[]}"#,
+      #"{"instance":"a","type":"_hfa._tcp","domain":"local.","port":70000,"txt":[]}"#,
+      #"{"instance":"","type":"_hfa._tcp","domain":"local.","port":1,"txt":[]}"#,
+      #"{"instance":"a","type":"_hfa._tcp","domain":"local.","port":1,"txt":[["v"]]}"#,
+    ] {
+      XCTAssertNil(HfaBonjourCodec.decodeAdvert(bad), bad)
+    }
+  }
+
+  func testServiceTypeIsDeclaredInInfoPlist() {
+    let services = Bundle.main.object(forInfoDictionaryKey: "NSBonjourServices") as? [String]
+    XCTAssertEqual(services, [HfaBonjourCodec.serviceType])
+    XCTAssertNotNil(Bundle.main.object(forInfoDictionaryKey: "NSLocalNetworkUsageDescription"))
+  }
+}
+
+/// The app registers its Bonjour backend with the Rust library at launch (this also proves that
+/// the Runner binary links the `hfa_discovery_*` symbols of the cargokit framework).
+final class BonjourRegistrationTests: XCTestCase {
+  func testBackendIsRegisteredAtLaunch() {
+    XCTAssertTrue(HfaBonjourDiscovery.shared.isRegistered)
+    XCTAssertTrue(HfaBonjourDiscovery.shared.register(), "registering again is harmless")
   }
 }
 

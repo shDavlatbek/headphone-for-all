@@ -58,7 +58,10 @@ if runner && ext
   end
 
   sources = ->(t) { t.source_build_phase.files_references.map(&:path) }
-  %w[AppDelegate.swift HfaPlatformChannel.swift BroadcastPickerFactory.swift HfaShared.swift].each do |f|
+  %w[
+    AppDelegate.swift HfaPlatformChannel.swift BroadcastPickerFactory.swift HfaShared.swift
+    HfaBonjourCodec.swift HfaBonjourDiscovery.swift
+  ].each do |f|
     check.call(sources.call(runner).include?(f), "Runner does not compile #{f}")
   end
   %w[SampleHandler.swift PcmInterleaver.swift HfaShared.swift].each do |f|
@@ -68,8 +71,16 @@ if runner && ext
   check.call(tests && sources.call(tests).include?('PcmInterleaver.swift'),
              'RunnerTests does not compile PcmInterleaver.swift')
   check.call(!sources.call(runner).include?('PcmInterleaver.swift'), 'Runner must not compile PcmInterleaver.swift')
-  %w[AppDelegate.swift HfaPlatformChannel.swift].each do |f|
+  %w[AppDelegate.swift HfaPlatformChannel.swift HfaBonjourDiscovery.swift].each do |f|
     check.call(!sources.call(ext).include?(f), "HfaBroadcast must not compile #{f}")
+  end
+  # The Bonjour backend calls the hfa_discovery_* C ABI through Runner's bridging header.
+  runner.build_configurations.each do |config|
+    header = config.build_settings['SWIFT_OBJC_BRIDGING_HEADER']
+    path = header && File.join(IOS_DIR, header)
+    check.call(path && File.exist?(path) && File.read(path).include?('core/hfa-ffi/include/hfa_discovery.h') &&
+               File.exist?(File.expand_path('../../../core/hfa-ffi/include/hfa_discovery.h', File.dirname(path))),
+               "Runner [#{config.name}] bridging header does not import hfa_discovery.h")
   end
 
   # App Store Connect rejects binaries whose required-reason API use is not declared.

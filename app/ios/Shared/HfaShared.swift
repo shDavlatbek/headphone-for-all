@@ -35,6 +35,10 @@ enum HfaShared {
   /// Darwin notification posted by the extension when the broadcast ends (normally or not).
   static let broadcastFinishedNotification = "\(broadcastExtensionBundleId).finished"
 
+  /// Darwin notification posted by the extension after it wrote a new connection state
+  /// (`connecting` / `streaming` / `reconnecting`, with the hub's name) while broadcasting.
+  static let broadcastStatusNotification = "\(broadcastExtensionBundleId).status"
+
   /// A non-empty string value of the current bundle's Info.plist, or `nil` (missing, or a build
   /// setting that was not expanded).
   static func infoString(_ key: String) -> String? {
@@ -138,17 +142,47 @@ struct BroadcastConfig: Codable, Equatable {
 }
 
 /// `broadcast_status.json`: written by the extension before it posts a Darwin notification.
+///
+/// `state` is one of `BroadcastStatus.connecting`, `.streaming`, `.reconnecting` (the extension
+/// runs), `.failed`, `.stopped` (it ended). Files written by older builds use `"started"` (runs)
+/// and `"finished"` (ended); readers treat any other value like a running broadcast.
 struct BroadcastStatus: Codable, Equatable {
-  /// `"started"` or `"finished"`. Readers treat any other value like `"started"` (a running
-  /// broadcast), so the extension may report finer states later.
+  /// The Rust sender runs and connects to (or pairs with) the hub.
+  static let connecting = "connecting"
+  /// Audio reaches the hub.
+  static let streaming = "streaming"
+  /// The connection to the hub was lost and is being re-established.
+  static let reconnecting = "reconnecting"
+  /// The broadcast ended with an error (`message` says why).
+  static let failed = "failed"
+  /// The broadcast ended normally.
+  static let stopped = "stopped"
+  /// States of a broadcast that ended (including the legacy `"finished"`).
+  static let endedStates: Set<String> = [failed, stopped, "finished"]
+
+  /// See the type's documentation.
   var state: String
-  /// Why the broadcast finished (an error description), or `nil`.
+  /// Why the broadcast failed (an error description), or `nil`.
   var message: String?
   /// Seconds since 1970 when the status was written.
   var timestamp: Double
+  /// Name of the hub the extension streams to, once the hub told it.
+  var hubName: String? = nil
 
-  /// Whether the extension was running when it wrote this status (anything but `finished`).
-  var isActive: Bool { state != "finished" }
+  /// Whether the extension was running when it wrote this status (not an ended state).
+  var isActive: Bool { !Self.endedStates.contains(state) }
+
+  /// The broadcast state that a Rust sender state (`hfa_ext_sender_state`'s `state`) is
+  /// published as while the extension runs; `nil` for the final `failed` / `stopped` (the
+  /// extension ends the broadcast and writes those itself) and unknown values.
+  static func state(forSenderState senderState: String) -> String? {
+    switch senderState {
+    case "connecting", "pairing": return connecting
+    case "streaming": return streaming
+    case "reconnecting": return reconnecting
+    default: return nil
+    }
+  }
 
   /// Reads the status file; `nil` when it is missing or unreadable.
   static func read() -> BroadcastStatus? {

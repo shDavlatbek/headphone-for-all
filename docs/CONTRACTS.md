@@ -1016,8 +1016,8 @@ Modules:
     `resolved(instance, txt, addrs, port) -> bool`, `removed(instance) -> bool`, `is_closed()`; it applies the same
     validation and `Found`/`Lost` rules as the `mdns-sd` path (shared code) and returns `false` once the `Browser` is
     dropped. On iOS without a registered backend, `browse()` and `Advertiser::start` fail with `Discovery(..)`
-    instead of finding nothing. **Open:** the Swift `NWBrowser`/`NWListener` backend and its registration through
-    `hfa-ffi` (owned by the Apple/FFI areas).
+    instead of finding nothing. The iOS backend (Swift `NWBrowser` + dns_sd, registered through `hfa-ffi`'s C ABI
+    `include/hfa_discovery.h`) is described in §8.9.2.
 - Tests: `tests/net_persist.rs` (shared stores, lost-update and resurrection regressions, merge with another
   process's write, lazy/forced reload, corrupt file, roles + legacy files), `tests/net_control.rs` (id mismatch
   before pairing, one-way pairing), `tests/engine_control.rs` (forgetting a connected sender disconnects it),
@@ -1352,11 +1352,16 @@ Desktop Windows/Linux don't register the channel, so Dart must treat `MissingPlu
 | `writeBroadcastConfig` | `{hubHost, hubPort, hubDeviceId, hubKey, label}` | `null` | – | writes `broadcast_config.json` into the App Group container for the extension | – |
 | `captureSupport` | – | `{supported:bool, reason:String}` | API ≥ 29 | `{supported:true, reason:"broadcast"}` | – |
 | `captureStatus` | – | `{running:bool, endedWhileAway:String?}` | capture service state (§8.8.1) | – (`notImplemented`) | – |
+| `getBroadcastStatus` | – | `null` or `{state:String, message:String?, hubName:String?, updatedAtMs:int}` (+ legacy `broadcasting:bool`, `timestamp:double` seconds) | – | the broadcast extension's last status (§8.9.2); `null` when it never wrote one | – |
 
 iOS also registers the platform view `hfa/broadcast_picker`, which wraps an `RPSystemBroadcastPickerView`
 whose `preferredExtension` is the broadcast extension's bundle id.
 
-Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `{type: "captureStopped"|"captureError"|"broadcastStarted"|"broadcastFinished", message?: String}`.
+Events from native to Dart use `EventChannel('hfa/platform/events')` with maps `{type: "captureStopped"|"captureError"|"broadcastStarted"|"broadcastFinished", message?: String}`,
+and on iOS `{type: "broadcastStatus", state: String, message: String?, hubName: String?, updatedAtMs: int}` (the
+`getBroadcastStatus` fields without the legacy keys) whenever the extension's status changes. `state` is one of
+`"idle"`, `"connecting"`, `"streaming"`, `"reconnecting"`, `"failed"`, `"stopped"` (§8.9.2). These names are a
+contract between the iOS runner and `app/lib`: do not rename them.
 
 ### 8.4 Refinements made by `feat/scaffold`
 
@@ -1928,6 +1933,76 @@ extension's live connection state (`hfa_ext_sender_state`, ending the broadcast 
 forwarding `connecting`/`reconnecting` to the app (a `broadcast_status.json` state other than `started`, which the
 re-sync above already treats as running) can build on it after the merge. The running engines' trust-store
 snapshot is `fix/core-sec`'s shared store.
+
+### 8.9.2 Refinements made by `feat/ios-native` (the code in `app/ios` and `core/hfa-ffi/src/native_discovery.rs` is authoritative; overrides §8.9 and §8.9.1 where they differ)
+
+**Native Bonjour discovery on iOS.** Closes §8.9 "Open" (3) and the discovery part of §8.9.1 "Not done". `mdns-sd`
+cannot run on iOS without the restricted multicast entitlement, so the app plugs a Swift backend into hfa-core's
+platform hook (§6.4) through a small C ABI in `hfa-ffi`:
+- **C ABI** `core/hfa-ffi/include/hfa_discovery.h` ↔ `core/hfa-ffi/src/native_discovery.rs` (a unit test keeps the
+  header in sync). `HfaDiscoveryCallbacks {ctx, browse_start(ctx, browse_id) -> i32, browse_stop(ctx, browse_id),
+  advertise_start(ctx, advert_id, service_json) -> i32, advertise_stop(ctx, advert_id)}` (all required) is
+  registered with `hfa_discovery_register` (copied; calls `set_platform_backend`), removed with
+  `hfa_discovery_unregister`. Rust → native: a `browse()` session calls `browse_start` with a fresh id and
+  `browse_stop` when its `Browser` is dropped; `Advertiser::start` calls `advertise_start` with
+  `{"instance", "type": "_hfa._tcp", "domain": "local.", "port", "txt": [[k, v], ...]}` (valid during the call)
+  and `advertise_stop` when stopped. A non-zero start return fails the browse/registration with
+  `CoreError::Discovery` (the hub then shows its existing "cannot advertise" error). Callbacks are never called
+  under a lock of the module and must return quickly. Native → Rust: `hfa_discovery_resolved(browse_id,
+  {"instance", "txt": {k: v}, "addrs": [ip strings], "port"})` and `hfa_discovery_removed(browse_id, instance)`
+  feed the browse's `DiscoveryFeed` (same validation and `Found`/`Lost` rules as `mdns-sd`); unparsable,
+  unspecified, multicast and IPv6 link-local addresses (a `%zone` suffix is stripped) are dropped and a report
+  without a usable address is ignored. They return `HFA_DISCOVERY_OK (0)`, `HFA_DISCOVERY_CLOSED (1)` (unknown or
+  dropped browse: stop it), `HFA_DISCOVERY_ERR_INVALID_ARGUMENT (-1)` (null, non-UTF-8, bad JSON) or
+  `HFA_DISCOVERY_ERR_INTERNAL (-5)` (caught panic); `hfa_discovery_last_error()` is thread-local like
+  `hfa_ext_last_error`. Browse ids map to feeds in a Rust table (no pointers cross the boundary). The functions
+  are `#[no_mangle]` on iOS only (elsewhere plain Rust functions, so `cargo test` covers them on the host:
+  unit tests plus `core/hfa-ffi/tests/native_discovery.rs` with fake extern callbacks).
+- **Linking.** The app's Rust library is the cargokit pod framework `rust_lib_headphone_for_all`
+  (`use_frameworks!`, `-force_load libhfa_ffi.a`), which Runner links through the CocoaPods xcconfig; the
+  `#[no_mangle]` symbols are global and exported like flutter_rust_bridge's. `Runner/Runner-Bridging-Header.h`
+  imports the header by relative path (`../../../core/hfa-ffi/include/hfa_discovery.h`; `verify_xcodeproj.rb`
+  checks it). The broadcast extension's `libhfa_ext.a` contains the functions too but nothing there calls them.
+- **Why a C ABI and not Dart.** Discovery runs inside the Rust engine (the sender's find-by-id, the hub's
+  advertising, `discover_hubs`); a Dart-mediated path would need a platform channel round trip for every
+  browse/advert start and result, would only work while a Flutter engine runs, and would duplicate the
+  lifetime rules. The C ABI is registered once at launch (`AppDelegate`, before `super.application`, so before
+  `initApp` and any browse or hub start) and needs no Dart change.
+- **Swift** (`Runner/HfaBonjourDiscovery.swift`, pure helpers in `Runner/HfaBonjourCodec.swift`, XCTest
+  `BonjourCodecTests` / `BonjourRegistrationTests`): browse = `NWBrowser(.bonjourWithTXTRecord(type: "_hfa._tcp",
+  domain: "local."))`; each visible service is resolved with dns_sd `DNSServiceResolve` → `DNSServiceGetAddrInfo`
+  (IPv4 + IPv6, kept running for updates) and reported once it has a port and an address, and again when
+  that changes (the browser's TXT record wins over the resolved one when not empty; keys are lower-cased).
+  dns_sd was chosen over an `NWConnection` to the service (which would open a TCP connection to the hub's
+  control port just to learn its address) and `NetService` (deprecated). Advertise = `DNSServiceRegister` on
+  the hub's existing port (`NWListener` would bind its own). One serial queue, dns_sd references scheduled
+  and deallocated on it; failures retried after 1 s doubling to 30 s. Info.plist: `NSLocalNetworkUsageDescription`,
+  `NSBonjourServices = [_hfa._tcp]` (checked by an XCTest).
+- **Still true:** the broadcast extension cannot discover (no backend there); `writeBroadcastConfig` still
+  requires `hubHost` and the app passes the address it knows (a discovered hub's first address).
+
+**Broadcast connection state (iOS).** `broadcast_status.json` is now `{state, message?, timestamp, hubName?}` with
+`state` `connecting` (written at start, and for the sender states `connecting`/`pairing`), `streaming`,
+`reconnecting` (from `hfa_ext_sender_state`, polled every second, written only on change, with `hub_name`),
+then `failed` (start failure, sender `failed`, or the app's vanish check) or `stopped` (`broadcastFinished`).
+A final state is written once; a late poll never overwrites it. Running states are announced with the new
+Darwin notification `<broadcastExtensionBundleId>.status` (start/end keep `.started`/`.finished`). Readers
+treat every state except `failed`, `stopped` and the legacy `finished` as running (`BroadcastStatus.isActive`).
+- `getBroadcastStatus` → `null` without a status file, else `{state, message?, hubName?, updatedAtMs}` plus the
+  legacy `broadcasting` (a broadcast runs now) and `timestamp` (seconds) keys. `state` ∈ `idle`, `connecting`,
+  `streaming`, `reconnecting`, `failed`, `stopped`; legacy files map `started` → `connecting` and `finished` →
+  `failed` (non-empty message) or `stopped`; unknown values → `idle`. `updatedAtMs` = `timestamp` × 1000
+  (0 if not a sane number). Empty `message`/`hubName` are left out. (`BroadcastStatusReport`, XCTest
+  `BroadcastStatusReportTests`.)
+- Event `{type: "broadcastStatus", state, message?, hubName?, updatedAtMs}` after every change of the status
+  file: on the `.started`, `.finished` and `.status` notifications, when Dart starts listening, when the app
+  becomes active or the capture state changes (a notification can be missed while suspended), and after the
+  vanish check wrote `failed`. An identical status is not sent twice to the same listener.
+  `broadcastStarted` / `broadcastFinished` are unchanged.
+
+**Already done before this package (verified):** `getDataDir`'s strict `NO_APP_GROUP` (Swift
+`HfaPlatformChannel.resolveDataDir`, XCTest `DataDirTests`; Dart bootstrap strict on iOS, §8.7/§8.9.1) and the
+relaunch / jetsam handling of the extension (`BroadcastSync`, vanish check, XCTest `BroadcastSyncTests`, §8.9.1).
 
 ### 8.10 Refinements made by `feat/desktop` (the code in `app/windows`, `app/linux` and `packaging/` is authoritative)
 

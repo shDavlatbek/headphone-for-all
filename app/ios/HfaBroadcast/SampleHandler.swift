@@ -41,6 +41,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
   /// Queue of `stateTimer`; `lastSenderState` is only used on it.
   private let stateQueue = DispatchQueue(label: "\(HfaShared.broadcastExtensionBundleId).state")
   private var lastSenderState: String?
+  /// Guards `statusFinal` and orders the writes of `broadcast_status.json`.
+  private let statusLock = NSLock()
+  /// Set once a final status (`failed` / `stopped`) was written: a state poll that raced with
+  /// the end of the broadcast must not overwrite it with a running state.
+  private var statusFinal = false
+  /// The last running status published (`state`, `hubName`), guarded by `statusLock`.
+  private var publishedRunning: (state: String, hubName: String?)?
   /// How often the sender state is polled.
   private static let statePollInterval = DispatchTimeInterval.seconds(1)
 
@@ -53,18 +60,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
       lock.lock()
       sender = handle
       lock.unlock()
-      startStatePolling()
       Self.log.info("broadcast started")
-      BroadcastStatus(state: "started", message: nil, timestamp: Date().timeIntervalSince1970)
-        .write()
-      HfaShared.postDarwinNotification(HfaShared.broadcastStartedNotification)
+      publishStatus(
+        BroadcastStatus.connecting, notification: HfaShared.broadcastStartedNotification)
+      startStatePolling()
     case let .failure(error):
       Self.log.error("cannot start: \(error.localizedDescription, privacy: .public)")
-      BroadcastStatus(
-        state: "finished", message: error.localizedDescription,
-        timestamp: Date().timeIntervalSince1970
-      ).write()
-      HfaShared.postDarwinNotification(HfaShared.broadcastFinishedNotification)
+      publishStatus(
+        BroadcastStatus.failed, message: error.localizedDescription,
+        notification: HfaShared.broadcastFinishedNotification)
       finishBroadcastWithError(error)
     }
   }
@@ -77,12 +81,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
   override func broadcastFinished() {
     // After a failed start `finishBroadcastWithError` already reported the reason; do not
-    // overwrite that status with a plain "finished".
+    // overwrite that status with a plain "stopped" (`publishStatus` also refuses to).
     guard stopSender() else { return }
     Self.log.info("broadcast finished")
-    BroadcastStatus(state: "finished", message: nil, timestamp: Date().timeIntervalSince1970)
-      .write()
-    HfaShared.postDarwinNotification(HfaShared.broadcastFinishedNotification)
+    publishStatus(BroadcastStatus.stopped, notification: HfaShared.broadcastFinishedNotification)
   }
 
   override func processSampleBuffer(
@@ -191,6 +193,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
   private struct SenderStateInfo: Decodable {
     let state: String
     let error: String?
+    let hubName: String?
+
+    enum CodingKeys: String, CodingKey {
+      case state
+      case error
+      case hubName = "hub_name"
+    }
   }
 
   /// The connection to the hub is made in the background after `hfa_ext_sender_start`, and a
@@ -230,6 +239,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
     if info.state == "failed" {
       failBroadcast(reason: info.error ?? "unknown error")
+    } else if let state = BroadcastStatus.state(forSenderState: info.state) {
+      // The app shows the connection state (getBroadcastStatus / broadcastStatus events).
+      publishStatus(
+        state, hubName: info.hubName, notification: HfaShared.broadcastStatusNotification)
     }
   }
 
@@ -259,12 +272,37 @@ final class SampleHandler: RPBroadcastSampleHandler {
       "The headphone hub did not accept this iPhone (\(reason)). Pair this iPhone with the hub again in the Headphone for All app, then start the broadcast again."
     )
     Self.log.error("sender failed: \(reason, privacy: .public)")
-    BroadcastStatus(
-      state: "finished", message: error.localizedDescription,
-      timestamp: Date().timeIntervalSince1970
-    ).write()
-    HfaShared.postDarwinNotification(HfaShared.broadcastFinishedNotification)
+    publishStatus(
+      BroadcastStatus.failed, message: error.localizedDescription,
+      notification: HfaShared.broadcastFinishedNotification)
     finishBroadcastWithError(error)
+  }
+
+  // MARK: - Status for the app
+
+  /// Writes `broadcast_status.json` and posts `notification` so the app can follow the
+  /// broadcast. Running states are written only when they (or the hub name) change and never
+  /// after a final `failed` / `stopped`, which is written once.
+  private func publishStatus(
+    _ state: String, message: String? = nil, hubName: String? = nil, notification: String
+  ) {
+    statusLock.lock()
+    defer { statusLock.unlock() }
+    guard !statusFinal else { return }
+    let isFinal = BroadcastStatus.endedStates.contains(state)
+    if isFinal {
+      statusFinal = true
+    } else {
+      // Keep the hub name once known (the sender reports it after the handshake).
+      let name = hubName ?? publishedRunning?.hubName
+      if let last = publishedRunning, last.state == state, last.hubName == name { return }
+      publishedRunning = (state, name)
+    }
+    let status = BroadcastStatus(
+      state: state, message: message, timestamp: Date().timeIntervalSince1970,
+      hubName: publishedRunning?.hubName)
+    status.write()
+    HfaShared.postDarwinNotification(notification)
   }
 
   // MARK: - Helpers

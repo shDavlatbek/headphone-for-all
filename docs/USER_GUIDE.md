@@ -106,14 +106,18 @@ one on the hub.
   broadcast runs: that is normal and cannot be hidden. Only audio is sent, never the screen.
 - **DRM-protected audio** (Apple Music, Netflix, many streaming apps) is silent in a broadcast; this is
   an iOS rule.
-- iOS does not list hubs on the network yet: pair with **Scan QR**, the pairing link, or the hub's
-  address.
+- Hubs on the same network are listed automatically (Bonjour). The first time, iOS asks whether Headphone
+  for All may find devices on your local network: allow it (or later in Settings → Privacy & Security →
+  Local Network). **Scan QR**, the pairing link and the hub's address work too.
+- The broadcast streams to the hub's address as the app knew it when the broadcast started: if the hub
+  gets a new address (a router restart), stop the broadcast and start it again.
 
 ## 5. Network troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| The sender does not list the hub | mDNS (UDP 5353) blocked, different networks or VLANs, guest Wi-Fi, iOS | Use **Add by address** or the QR code/link; put both devices on the same network |
+| The sender does not list the hub | mDNS (UDP 5353) blocked, different networks or VLANs, guest Wi-Fi | Use **Add by address** or the QR code/link; put both devices on the same network |
+| An iPhone or iPad lists no hubs (or is not found as a hub) | Local Network access denied for Headphone for All | Settings → Privacy & Security → Local Network → turn Headphone for All on, then reopen the app |
 | Pairing or connecting times out | Firewall on the hub, AP / client isolation | Allow TCP+UDP 47810 on the hub ([Windows](#windows), [Linux](#linux)); turn off client isolation or use a network without it (a phone hotspot works) |
 | It worked, then stopped after a network change | The hub's address changed | Discovery finds it again; for manual addresses, re-add it or give the hub a fixed IP in the router |
 | Dropouts or crackles | Weak Wi-Fi, 2.4 GHz congestion | Move closer, prefer 5 GHz, or wire the hub; the hub shows loss and jitter per source |

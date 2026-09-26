@@ -18,12 +18,13 @@ import os
 /// | `captureSupport` | `{supported: true, reason: "broadcast"}` |
 /// | `startSystemCapture` | `false` (capture runs in the broadcast extension) |
 /// | `stopSystemCapture`, `acquireMulticastLock`, `releaseMulticastLock` | no-op |
-/// | `getBroadcastStatus` | `{broadcasting, state?, message?, timestamp?}` |
+/// | `getBroadcastStatus` | `{state, message?, hubName?, updatedAtMs, broadcasting, timestamp}`, `nil` without a status file |
 ///
 /// Broadcast events: `broadcastStarted` / `broadcastFinished` follow the extension's Darwin
 /// notifications and are re-synchronized with `broadcast_status.json` and the screen capture
 /// state when a listener starts, the app becomes active or the capture state changes (see
-/// `syncBroadcastState()`).
+/// `syncBroadcastState()`). `broadcastStatus` events (`{type, state, message?, hubName?,
+/// updatedAtMs}`, see `BroadcastStatusReport`) follow every change of the status file.
 final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   /// Name of the method channel.
   static let methodChannelName = "hfa/platform"
@@ -44,9 +45,11 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   private var reportedBroadcasting = false
   /// Pending re-check of a broadcast that looks `vanished`.
   private var vanishCheck: DispatchWorkItem?
+  /// The last `broadcastStatus` event sent (to send only changes); reset for a new listener.
+  private var reportedStatus: [String: AnyHashable]?
 
   /// How long a broadcast may look `vanished` before it counts as ended: the extension writes
-  /// its `finished` status after ReplayKit stopped capturing the screen and after it stopped the
+  /// its `stopped` status after ReplayKit stopped capturing the screen and after it stopped the
   /// Rust sender (`hfa_ext_sender_stop` waits up to 2 s for its runtime).
   static let vanishGrace: TimeInterval = 8
 
@@ -71,7 +74,10 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     eventChannel.setStreamHandler(self)
     registrar.register(BroadcastPickerFactory(), withId: BroadcastPickerFactory.viewType)
     broadcastObserver = DarwinNotificationObserver(
-      names: [HfaShared.broadcastStartedNotification, HfaShared.broadcastFinishedNotification]
+      names: [
+        HfaShared.broadcastStartedNotification, HfaShared.broadcastFinishedNotification,
+        HfaShared.broadcastStatusNotification,
+      ]
     ) { [weak self] name in
       self?.broadcastNotification(name)
     }
@@ -273,6 +279,7 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     // A new listener (the app just started, or Dart subscribed again) assumes that no broadcast
     // runs; the extension outlives the app, so tell it about one that does.
     reportedBroadcasting = false
+    reportedStatus = nil
     DispatchQueue.main.async { [weak self] in self?.syncBroadcastState() }
     return nil
   }
@@ -282,8 +289,10 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     return nil
   }
 
-  /// Turns an extension notification into a `{type, message?}` event.
+  /// Turns an extension notification into a `{type, message?}` event, followed by a
+  /// `broadcastStatus` event with the new status.
   private func broadcastNotification(_ name: String) {
+    defer { reportBroadcastStatus() }
     var event: [String: Any]
     switch name {
     case HfaShared.broadcastStartedNotification:
@@ -294,7 +303,7 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
       cancelVanishCheck()
       reportedBroadcasting = false
       event = ["type": "broadcastFinished"]
-      if let status = BroadcastStatus.read(), status.state == "finished",
+      if let status = BroadcastStatus.read(), !status.isActive,
         let message = status.message, !message.isEmpty
       {
         event["message"] = message
@@ -311,8 +320,10 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   /// capture state. The Darwin notifications cover the normal cases; this covers a broadcast
   /// that runs while the app starts (the notification was posted before), and an extension that
   /// ReplayKit killed (memory limit, crash) without calling `broadcastFinished`, which never
-  /// writes a `finished` status nor posts its notification.
+  /// writes a final status nor posts its notification.
   private func syncBroadcastState() {
+    // A notification may have been missed while the app was suspended.
+    reportBroadcastStatus()
     guard let captured = Self.screenCaptured() else { return }
     switch BroadcastSync.evaluate(status: BroadcastStatus.read(), screenCaptured: captured) {
     case .running:
@@ -338,8 +349,8 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   }
 
   /// A `vanished` broadcast that still looks so after `vanishGrace` ended without the extension
-  /// noticing: record a `finished` status (so a later app start does not take the stale
-  /// `started` for a running broadcast) and tell Dart.
+  /// noticing: record a `failed` status (so a later app start does not take the stale running
+  /// state for a running broadcast) and tell Dart.
   private func scheduleVanishCheck() {
     guard vanishCheck == nil else { return }
     let check = DispatchWorkItem { [weak self] in
@@ -354,9 +365,11 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
       }
       Self.log.error("the broadcast extension ended without finishing the broadcast")
       BroadcastStatus(
-        state: "finished", message: Self.vanishedMessage, timestamp: Date().timeIntervalSince1970
+        state: BroadcastStatus.failed, message: Self.vanishedMessage,
+        timestamp: Date().timeIntervalSince1970, hubName: status?.hubName
       ).write()
       self.report(broadcasting: false, message: Self.vanishedMessage)
+      self.reportBroadcastStatus()
     }
     vanishCheck = check
     DispatchQueue.main.asyncAfter(deadline: .now() + Self.vanishGrace, execute: check)
@@ -367,19 +380,26 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
     vanishCheck = nil
   }
 
-  /// `getBroadcastStatus`: `{broadcasting, state?, message?, timestamp?}` — whether a broadcast
-  /// runs now (`BroadcastSync.running`) and the extension's last `broadcast_status.json`.
-  private func broadcastStatusResult() -> [String: Any] {
-    let status = BroadcastStatus.read()
+  /// Sends a `broadcastStatus` event when the status file differs from the last one sent.
+  private func reportBroadcastStatus() {
+    guard let eventSink, let status = BroadcastStatus.read() else { return }
+    let fields = BroadcastStatusReport.fields(of: status)
+    guard fields != reportedStatus else { return }
+    reportedStatus = fields
+    var event = BroadcastStatusReport.channelMap(fields)
+    event["type"] = "broadcastStatus"
+    eventSink(event)
+  }
+
+  /// `getBroadcastStatus`: `nil` without a status file, else `BroadcastStatusReport.fields`
+  /// plus the older keys `broadcasting` (a broadcast runs now, `BroadcastSync.running`) and
+  /// `timestamp` (seconds since 1970).
+  private func broadcastStatusResult() -> Any? {
+    guard let status = BroadcastStatus.read() else { return nil }
     let sync = BroadcastSync.evaluate(status: status, screenCaptured: Self.screenCaptured() ?? false)
-    var answer: [String: Any] = ["broadcasting": sync == .running]
-    if let status {
-      answer["state"] = status.state
-      answer["timestamp"] = status.timestamp
-      if let message = status.message {
-        answer["message"] = message
-      }
-    }
+    var answer = BroadcastStatusReport.channelMap(BroadcastStatusReport.fields(of: status))
+    answer["broadcasting"] = sync == .running
+    answer["timestamp"] = status.timestamp
     return answer
   }
 
@@ -397,6 +417,59 @@ final class HfaPlatformChannel: NSObject, FlutterStreamHandler {
   }
 }
 
+/// The broadcast status as Dart sees it (`getBroadcastStatus`, `broadcastStatus` events;
+/// docs/CONTRACTS.md §8.3): `{state, message?, hubName?, updatedAtMs}`.
+enum BroadcastStatusReport {
+  /// Every `state` Dart can receive.
+  static let states: Set<String> = [
+    "idle", "connecting", "streaming", "reconnecting", "failed", "stopped",
+  ]
+
+  /// The Dart state of a status file: the extension's state, with the legacy `started` →
+  /// `connecting` and `finished` → `failed` (with a message) or `stopped`; unknown values →
+  /// `idle`.
+  static func state(of status: BroadcastStatus) -> String {
+    switch status.state {
+    case BroadcastStatus.connecting, "pairing", "started":
+      return BroadcastStatus.connecting
+    case BroadcastStatus.streaming, BroadcastStatus.reconnecting, BroadcastStatus.failed,
+      BroadcastStatus.stopped:
+      return status.state
+    case "finished":
+      return (status.message?.isEmpty ?? true) ? BroadcastStatus.stopped : BroadcastStatus.failed
+    default:
+      return "idle"
+    }
+  }
+
+  /// Milliseconds since 1970 of a status timestamp in seconds (0 when it is not a sane value).
+  static func milliseconds(_ seconds: Double) -> Int {
+    let ms = (seconds * 1000).rounded()
+    guard ms.isFinite, ms >= 0, ms < 1e15 else { return 0 }
+    return Int(ms)
+  }
+
+  /// The map sent to Dart; `message` and `hubName` are left out when empty.
+  static func fields(of status: BroadcastStatus) -> [String: AnyHashable] {
+    var fields: [String: AnyHashable] = [
+      "state": state(of: status),
+      "updatedAtMs": milliseconds(status.timestamp),
+    ]
+    if let message = status.message, !message.isEmpty {
+      fields["message"] = message
+    }
+    if let hubName = status.hubName, !hubName.isEmpty {
+      fields["hubName"] = hubName
+    }
+    return fields
+  }
+
+  /// `fields` with plain values for the Flutter codec (`AnyHashable` unwrapped).
+  static func channelMap(_ fields: [String: AnyHashable]) -> [String: Any] {
+    fields.mapValues { $0.base }
+  }
+}
+
 /// What the app tells Dart about the broadcast, from the extension's last status and whether the
 /// screen is being captured.
 enum BroadcastSync: Equatable {
@@ -405,11 +478,11 @@ enum BroadcastSync: Equatable {
   /// No broadcast runs; `message` says why the last one ended, if it failed.
   case idle(message: String?)
   /// The status says that the extension runs, but the screen is no longer captured: either the
-  /// extension is finishing right now (its `finished` status follows within moments), or
+  /// extension is finishing right now (its final status follows within moments), or
   /// ReplayKit ended it without `broadcastFinished`.
   case vanished
 
-  /// A status other than `finished` counts as running only while the screen is captured.
+  /// A status that is not an ended state counts as running only while the screen is captured.
   static func evaluate(status: BroadcastStatus?, screenCaptured: Bool) -> BroadcastSync {
     guard let status else { return .idle(message: nil) }
     guard status.isActive else { return .idle(message: status.message) }
