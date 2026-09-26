@@ -7,8 +7,37 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/app.dart';
 import 'package:headphone_for_all/src/platform/native_channel.dart';
+import 'package:headphone_for_all/src/platform/sign_in_launcher.dart';
 import 'package:headphone_for_all/src/state/core_providers.dart';
 import 'package:headphone_for_all/src/state/navigation.dart';
+import 'package:headphone_for_all/src/util/links.dart';
+
+/// Records the links the app opens; answers [opens].
+class RecordingLinkOpener {
+  /// Whether "the browser" takes the links.
+  bool opens = true;
+
+  /// Every link opened, in order.
+  final List<Uri> opened = [];
+
+  /// The [LinkOpener] to inject.
+  Future<bool> call(Uri uri) async {
+    opened.add(uri);
+    return opens;
+  }
+}
+
+/// A [SignInLauncher] in memory.
+class MemorySignInLauncher implements SignInLauncher {
+  /// Whether the app starts at sign-in.
+  bool enabled = false;
+
+  @override
+  Future<bool?> isEnabled() async => enabled;
+
+  @override
+  Future<void> setEnabled(bool enabled) async => this.enabled = enabled;
+}
 
 /// A [NativeChannel] that records calls instead of talking to a platform.
 class RecordingNativeChannel extends NativeChannel {
@@ -86,19 +115,46 @@ class RecordingNativeChannel extends NativeChannel {
     calls.add('writeBroadcastConfig');
     lastBroadcastConfig = config;
   }
+
+  /// What [getBroadcastStatus] answers (`null`: not implemented here).
+  BroadcastStatus? broadcastStatusAnswer;
+
+  /// How often [getBroadcastStatus] was asked (not recorded in [calls]).
+  int broadcastStatusQueries = 0;
+
+  @override
+  Future<BroadcastStatus?> getBroadcastStatus() async {
+    broadcastStatusQueries++;
+    return broadcastStatusAnswer;
+  }
+
+  @override
+  Future<void> beginStreaming() async => calls.add('beginStreaming');
+
+  @override
+  Future<void> endStreaming() async => calls.add('endStreaming');
 }
 
-/// Provider overrides wiring [fake] (and [native]) into the app.
+/// Provider overrides wiring [fake] (and [native]) into the app. Links go to
+/// [links] (default: a browser that takes every link), starting at sign-in to
+/// [signIn] (default: not switchable, as on Windows).
 List<Override> overridesFor(
   FakeHfaApi fake, {
   NativeChannel? native,
   Duration pollInterval = const Duration(hours: 1),
+  RecordingLinkOpener? links,
+  SignInLauncher? signIn,
+  String? dataDir,
 }) => [
   hfaApiProvider.overrideWithValue(fake),
   initialAppInfoProvider.overrideWithValue(fake.appInfo),
   nativeChannelProvider.overrideWithValue(native ?? RecordingNativeChannel()),
   // Polling is exercised in the provider tests; keep widget tests event-driven.
   pollIntervalProvider.overrideWithValue(pollInterval),
+  linkOpenerProvider.overrideWithValue((links ?? RecordingLinkOpener()).call),
+  // Never the real autostart folder of the machine running the tests.
+  signInLauncherProvider.overrideWithValue(signIn),
+  if (dataDir != null) dataDirProvider.overrideWithValue(dataDir),
 ];
 
 /// A container for provider unit tests.
@@ -106,9 +162,15 @@ ProviderContainer containerFor(
   FakeHfaApi fake, {
   NativeChannel? native,
   Duration pollInterval = const Duration(hours: 1),
+  String? dataDir,
 }) {
   return ProviderContainer.test(
-    overrides: overridesFor(fake, native: native, pollInterval: pollInterval),
+    overrides: overridesFor(
+      fake,
+      native: native,
+      pollInterval: pollInterval,
+      dataDir: dataDir,
+    ),
     retry: (retryCount, error) => null,
   );
 }
@@ -120,6 +182,9 @@ Future<ProviderContainer> pumpApp(
   NativeChannel? native,
   AppSection section = AppSection.home,
   Size size = const Size(1000, 1800),
+  RecordingLinkOpener? links,
+  SignInLauncher? signIn,
+  List<Override> extra = const [],
 }) async {
   tester.view.physicalSize = size;
   tester.view.devicePixelRatio = 1;
@@ -127,7 +192,10 @@ Future<ProviderContainer> pumpApp(
   await tester.pumpWidget(
     ProviderScope(
       retry: (retryCount, error) => null,
-      overrides: overridesFor(fake, native: native),
+      overrides: [
+        ...overridesFor(fake, native: native, links: links, signIn: signIn),
+        ...extra,
+      ],
       child: const HfaApp(),
     ),
   );

@@ -35,6 +35,10 @@ class RustHfaApi implements HfaApi {
       app.parsePairingUri(uri: uri);
 
   @override
+  Future<String> fingerprintOfKey(String keyB64) =>
+      app.fingerprintOfKey(keyB64: keyB64);
+
+  @override
   Future<HubStatusDto> hubStart() => hub.hubStart();
 
   @override

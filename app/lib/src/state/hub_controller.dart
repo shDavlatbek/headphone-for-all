@@ -18,6 +18,9 @@ class HubState {
     this.port = 0,
     this.sources = const [],
     this.masterGain = 1,
+    this.addresses = const [],
+    this.advertised = false,
+    this.advertiseError,
     this.error,
   });
 
@@ -33,8 +36,20 @@ class HubState {
   /// Incoming streams, in arrival order.
   final List<SourceDto> sources;
 
-  /// Master linear gain (0..=4).
+  /// Master linear gain (0..=4), as the core saved it (`HubStatusDto`).
   final double masterGain;
+
+  /// Where senders can reach the running hub (`ip:port`, IPv4 first).
+  final List<String> addresses;
+
+  /// The running hub is announced over mDNS (senders find it by themselves).
+  final bool advertised;
+
+  /// Why announcing the running hub failed, if it did.
+  final String? advertiseError;
+
+  /// The hub runs but senders cannot find it: they must add it by address.
+  bool get notDiscoverable => running && !advertised;
 
   /// The last error, kept until [HubController.clearError], a successful
   /// start or a stop: the app shell shows it in a snack bar wherever the
@@ -50,6 +65,9 @@ class HubState {
     int? port,
     List<SourceDto>? sources,
     double? masterGain,
+    List<String>? addresses,
+    bool? advertised,
+    Object? advertiseError = _keep,
     Object? error = _keep,
   }) {
     return HubState(
@@ -58,9 +76,25 @@ class HubState {
       port: port ?? this.port,
       sources: sources ?? this.sources,
       masterGain: masterGain ?? this.masterGain,
+      addresses: addresses ?? this.addresses,
+      advertised: advertised ?? this.advertised,
+      advertiseError: identical(advertiseError, _keep)
+          ? this.advertiseError
+          : advertiseError as String?,
       error: identical(error, _keep) ? this.error : error as String?,
     );
   }
+
+  /// A copy with what [status] reports (running hub or not: the master gain
+  /// is the core's saved value either way).
+  HubState withStatus(HubStatusDto status) => copyWith(
+    running: status.running,
+    port: status.port,
+    masterGain: status.masterGain,
+    addresses: status.addresses,
+    advertised: status.advertised,
+    advertiseError: status.advertiseError,
+  );
 
   static const _keep = Object();
 }
@@ -74,11 +108,19 @@ final hubControllerProvider = NotifierProvider<HubController, HubState>(
 ///
 /// Sources arrive through `hubEvents` (added / updated about once per second /
 /// removed) and are refreshed with `hubSources` every [pollIntervalProvider]
-/// while the hub runs, so the list heals if an event was skipped.
+/// while the hub runs, so the list heals if an event was skipped; the status
+/// (addresses, advertising) is refreshed with them.
+///
+/// The master gain lives in the core (`HubStatusDto.masterGain`, saved in
+/// its settings and applied by every hub start), so the slider shows the
+/// saved value from the first frame on, also while the hub is stopped.
 class HubController extends Notifier<HubState> {
   StreamSubscription<HubEventDto>? _events;
   Timer? _poll;
-  double _appliedMasterGain = 1;
+
+  /// A master gain change is in flight: a status read meanwhile must not
+  /// move the slider back.
+  int _gainChanges = 0;
 
   HfaApi get _api => ref.read(hfaApiProvider);
 
@@ -101,10 +143,35 @@ class HubController extends Notifier<HubState> {
   Future<void> _syncStatus() async {
     try {
       final status = await _api.hubStatus();
-      if (!ref.mounted || !status.running || state.running) return;
-      state = state.copyWith(running: true, port: status.port);
+      if (!ref.mounted) return;
+      if (_gainChanges == 0) {
+        state = state.copyWith(masterGain: status.masterGain);
+      }
+      if (!status.running || state.running || state.busy) return;
+      state = _applyStatus(status);
       _startPolling();
       await refreshSources();
+    } catch (e) {
+      debugPrint('hub status: ${describeError(e)}');
+    }
+  }
+
+  /// [state] with [status] applied, keeping a master gain that is being set.
+  HubState _applyStatus(HubStatusDto status) {
+    final next = state.withStatus(status);
+    return _gainChanges == 0
+        ? next
+        : next.copyWith(masterGain: state.masterGain);
+  }
+
+  /// Reloads the running hub's status (addresses change with the network).
+  Future<void> refreshStatus() async {
+    try {
+      final status = await _api.hubStatus();
+      if (!ref.mounted || !state.running || state.busy || !status.running) {
+        return;
+      }
+      state = _applyStatus(status);
     } catch (e) {
       debugPrint('hub status: ${describeError(e)}');
     }
@@ -127,27 +194,9 @@ class HubController extends Notifier<HubState> {
       state = state.copyWith(busy: false, error: describeError(e));
       return;
     }
-    // The hub runs from here on; a later failure is only reported, so the
-    // UI, the core and the native service keep agreeing that it runs.
-    String? error;
-    if (state.masterGain != 1) {
-      try {
-        await _api.hubSetMasterGain(state.masterGain);
-        _appliedMasterGain = state.masterGain;
-      } catch (e) {
-        // A new hub mixes at unity gain until the slider is moved again.
-        _appliedMasterGain = 1;
-        error = describeError(e);
-      }
-    }
+    // The hub runs from here on (with the master gain the core saved).
     if (!ref.mounted) return;
-    state = state.copyWith(
-      running: true,
-      busy: false,
-      port: status.port,
-      masterGain: error == null ? null : 1.0,
-      error: error,
-    );
+    state = _applyStatus(status).copyWith(running: true, busy: false);
     _startPolling();
     await refreshSources();
   }
@@ -201,6 +250,7 @@ class HubController extends Notifier<HubState> {
     _poll?.cancel();
     _poll = Timer.periodic(ref.read(pollIntervalProvider), (_) {
       refreshSources();
+      refreshStatus();
     });
   }
 
@@ -227,22 +277,25 @@ class HubController extends Notifier<HubState> {
     state = state.copyWith(masterGain: gain);
   }
 
-  /// Sets the master gain (remembered while stopped, applied on start).
+  /// Sets the master gain. The core saves it (also while the hub is
+  /// stopped) and every hub start applies it; if the core refuses, the
+  /// slider goes back to the saved value.
   Future<void> setMasterGain(double gain) async {
+    _gainChanges++;
     state = state.copyWith(masterGain: gain);
-    if (!state.running) {
-      _appliedMasterGain = gain;
-      return;
-    }
     try {
       await _api.hubSetMasterGain(gain);
-      _appliedMasterGain = gain;
     } catch (e) {
+      double? saved;
+      try {
+        saved = (await _api.hubStatus()).masterGain;
+      } catch (e) {
+        debugPrint('hub status: ${describeError(e)}');
+      }
       if (!ref.mounted) return;
-      state = state.copyWith(
-        masterGain: _appliedMasterGain,
-        error: describeError(e),
-      );
+      state = state.copyWith(masterGain: saved, error: describeError(e));
+    } finally {
+      _gainChanges--;
     }
   }
 

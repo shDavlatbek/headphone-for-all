@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/core_providers.dart';
 import '../state/hub_controller.dart';
 import '../util/format.dart';
+import '../widgets/dialogs.dart';
 import '../widgets/source_tile.dart';
 import 'pairing_sheet.dart';
 
@@ -96,8 +98,13 @@ class _HubHeader extends ConsumerWidget {
                       ),
                       Text(
                         hub.running
-                            ? '"${info.deviceName}" is visible on port '
-                                  '${hub.port}. Audio plays on this device.'
+                            ? hub.advertised
+                                  ? '"${info.deviceName}" is visible on port '
+                                        '${hub.port}. Audio plays on this '
+                                        'device.'
+                                  : '"${info.deviceName}" listens on port '
+                                        '${hub.port}. Audio plays on this '
+                                        'device.'
                             : 'Turn it on to hear other devices here.',
                         style: theme.textTheme.bodyMedium,
                       ),
@@ -106,6 +113,14 @@ class _HubHeader extends ConsumerWidget {
                 ),
               ],
             ),
+            if (hub.notDiscoverable) ...[
+              const SizedBox(height: 12),
+              _NotDiscoverable(reason: hub.advertiseError),
+            ],
+            if (hub.running && hub.addresses.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              _HubAddresses(addresses: hub.addresses),
+            ],
             if (hub.error != null) ...[
               const SizedBox(height: 12),
               _HubError(message: hub.error!, onDismiss: controller.clearError),
@@ -165,6 +180,114 @@ class _HubHeader extends ConsumerWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Senders cannot find this hub by themselves (mDNS advertising failed):
+/// they must add it by address.
+class _NotDiscoverable extends StatelessWidget {
+  const _NotDiscoverable({required this.reason});
+
+  final String? reason;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final reason = this.reason;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // A chip that wraps (a Material Chip keeps its label on one line,
+        // which does not fit phone widths).
+        Container(
+          key: const Key('not-discoverable'),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.tertiaryContainer,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.visibility_off_outlined,
+                size: 18,
+                color: theme.colorScheme.onTertiaryContainer,
+              ),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  'Not discoverable — senders must add this hub by address',
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    color: theme.colorScheme.onTertiaryContainer,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (reason != null && reason.trim().isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(left: 4, top: 4),
+            child: Text(
+              'Reason: ${reason.trim()}',
+              key: const Key('not-discoverable-reason'),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+/// The addresses a sender can type in ("Add by address"), each with a copy
+/// button.
+class _HubAddresses extends StatelessWidget {
+  const _HubAddresses({required this.addresses});
+
+  final List<String> addresses;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          addresses.length == 1
+              ? 'Address for senders'
+              : 'Addresses for senders',
+          style: theme.textTheme.labelLarge,
+        ),
+        for (var i = 0; i < addresses.length; i++)
+          Row(
+            children: [
+              Expanded(
+                child: SelectableText(
+                  addresses[i],
+                  key: Key('hub-address-$i'),
+                  style: theme.textTheme.bodyLarge?.copyWith(
+                    fontFamily: 'monospace',
+                  ),
+                ),
+              ),
+              IconButton(
+                key: Key('copy-hub-address-$i'),
+                tooltip: 'Copy address',
+                icon: const Icon(Icons.copy, size: 18),
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: addresses[i]));
+                  if (context.mounted) {
+                    showMessage(context, 'Copied ${addresses[i]}');
+                  }
+                },
+              ),
+            ],
+          ),
+      ],
     );
   }
 }

@@ -16,7 +16,8 @@ pub struct HubInfoDto {
     pub port: u16,
     /// Hub platform.
     pub platform: String,
-    /// The hub is paired with this device (no PIN needed).
+    /// This device paired with the hub as a sender (`TrustedPeerDto.paired_as_hub`), so no
+    /// PIN is needed. A hub that only paired as a sender with this device's hub is not.
     pub trusted: bool,
 }
 

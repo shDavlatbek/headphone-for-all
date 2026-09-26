@@ -9,7 +9,9 @@ import '../state/discovery_controller.dart';
 import '../state/hub_address_book.dart';
 import '../state/sender_controller.dart';
 import '../state/settings_controller.dart';
+import '../platform/native_channel.dart';
 import '../util/format.dart';
+import '../util/links.dart';
 import '../widgets/broadcast_picker.dart';
 import '../widgets/dialogs.dart';
 import '../widgets/level_meter.dart';
@@ -54,7 +56,7 @@ HubTarget? refreshSelectedHub(WidgetRef ref) {
       for (final hub in ref.read(discoveryControllerProvider).hubs.values)
         if (hub.deviceId != info.deviceId) hub.deviceId: hub,
     },
-    peers: ref.read(trustedPeersProvider).value ?? const [],
+    peers: ref.read(trustedPeersProvider).value,
     addresses: info.isIos ? ref.read(hubAddressBookProvider) : const {},
   );
   if (fresh != selected) {
@@ -151,7 +153,10 @@ class SenderStatusCard extends ConsumerWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        sender.broadcasting
+                        isBroadcast && !sender.isLive
+                            ? broadcastTitle(sender) ??
+                                  senderStateLabel(status.state)
+                            : sender.broadcasting
                             ? 'Broadcasting'
                             : senderStateLabel(status.state),
                         key: const Key('sender-state'),
@@ -168,6 +173,26 @@ class SenderStatusCard extends ConsumerWidget {
             ),
             const SizedBox(height: 12),
             Align(alignment: Alignment.centerRight, child: action),
+            if (sender.isLive && hubControlChips(status).isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 4,
+                children: [
+                  for (final chip in hubControlChips(status))
+                    Chip(
+                      key: Key(chip.key),
+                      avatar: Icon(chip.icon, size: 18),
+                      label: Text(chip.label),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                ],
+              ),
+            ],
+            if (isBroadcast && _showsBroadcastStatus(sender.broadcast)) ...[
+              const SizedBox(height: 8),
+              _BroadcastStatusLine(status: sender.broadcast),
+            ],
             if (sender.isLive) ...[
               const SizedBox(height: 12),
               LevelMeter(levelDb: status.levelDb),
@@ -266,6 +291,10 @@ class SenderStatusCard extends ConsumerWidget {
     );
   }
 
+  /// Whether the broadcast status says more than "idle".
+  static bool _showsBroadcastStatus(BroadcastStatus status) =>
+      status.state != BroadcastState.idle;
+
   static String _subtitle(SenderState sender) {
     final target = sender.target;
     final hubName = sender.status.hubName ?? target?.name;
@@ -309,7 +338,13 @@ class _HubPicker extends ConsumerWidget {
     final locked = sender.isLive || sender.busy;
     final selected = sender.target;
 
-    final peerIds = {for (final p in peers) p.deviceId};
+    // Only peers this device paired with as a sender are hubs to send to
+    // (a phone that paired with this device's hub is not one).
+    final hubPeers = [
+      for (final p in peers)
+        if (p.pairedAsHub) p,
+    ];
+    final peerIds = {for (final p in hubPeers) p.deviceId};
     final discovered = [
       for (final hub in discovery.hubs.values)
         if (hub.deviceId != info.deviceId)
@@ -321,7 +356,7 @@ class _HubPicker extends ConsumerWidget {
     final seen = {for (final t in discovered) t.deviceId};
     final addresses = _pairedAddresses(ref, info);
     final paired = [
-      for (final peer in peers)
+      for (final peer in hubPeers)
         if (!seen.contains(peer.deviceId) && peer.deviceId != info.deviceId)
           HubTarget.paired(peer, address: addresses[peer.deviceId]),
     ];
@@ -553,6 +588,26 @@ class _SourcePicker extends ConsumerWidget {
             ),
             if (selected?.kind == SourceKind.app)
               _AppChooser(selected: selected?.app, enabled: enabled),
+            if (selected?.kind == SourceKind.deviceAudio)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 0, 16, 0),
+                child: TextButton.icon(
+                  key: const Key('android-apps-link'),
+                  icon: const Icon(Icons.help_outline),
+                  label: const Text('Which apps work?'),
+                  onPressed: () => openLink(context, ref, androidAppsUrl),
+                ),
+              ),
+            if (selected?.kind == SourceKind.broadcast)
+              const _Note(
+                key: Key('ios-recording-note'),
+                icon: Icons.fiber_manual_record,
+                text:
+                    'While broadcasting, iOS shows a red recording indicator '
+                    '(status bar or Dynamic Island). Only the audio is sent: '
+                    'the screen is never recorded or streamed. Tap the '
+                    'indicator to stop the broadcast.',
+              ),
             if (caps.mutesLocalOutput &&
                 (selected?.kind == SourceKind.system ||
                     selected?.kind == SourceKind.systemExceptThisApp ||
@@ -630,7 +685,7 @@ class _AppChooser extends ConsumerWidget {
 }
 
 class _Note extends StatelessWidget {
-  const _Note({required this.icon, required this.text});
+  const _Note({super.key, required this.icon, required this.text});
 
   final IconData icon;
   final String text;
@@ -655,6 +710,103 @@ class _Note extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// A chip the sender card shows about how the hub plays this stream.
+typedef HubControlChip = ({String key, IconData icon, String label});
+
+/// What the hub does with this stream (`SenderStatusDto.hub_*`): muted, a
+/// volume other than 100 %, priority. Empty when the hub plays it as sent.
+List<HubControlChip> hubControlChips(SenderStatusDto status) {
+  final percent = (status.hubGain * 100).round();
+  return [
+    if (status.hubMuted)
+      (
+        key: 'hub-muted-chip',
+        icon: Icons.volume_off_outlined,
+        label: 'Muted on the hub',
+      ),
+    if (!status.hubMuted && percent != 100)
+      (
+        key: 'hub-volume-chip',
+        icon: Icons.volume_down_outlined,
+        label: 'Volume $percent% on the hub',
+      ),
+    if (status.hubPriority)
+      (key: 'hub-priority-chip', icon: Icons.star_outline, label: 'Priority'),
+  ];
+}
+
+/// The card's title for an iOS broadcast that is not idle, else `null`.
+String? broadcastTitle(SenderState sender) {
+  return switch (sender.broadcast.state) {
+    BroadcastState.idle => sender.broadcasting ? 'Broadcasting' : null,
+    BroadcastState.connecting => 'Broadcast connecting…',
+    BroadcastState.streaming => 'Broadcasting',
+    BroadcastState.reconnecting => 'Broadcast reconnecting…',
+    BroadcastState.failed => 'Broadcast failed',
+    BroadcastState.stopped => 'Broadcast stopped',
+  };
+}
+
+/// [text] without a trailing full stop (sentences are joined with one).
+String _withoutPeriod(String text) =>
+    text.endsWith('.') ? text.substring(0, text.length - 1) : text;
+
+/// The iOS broadcast's state in words: hub, message, last update.
+class _BroadcastStatusLine extends StatelessWidget {
+  const _BroadcastStatusLine({required this.status});
+
+  final BroadcastStatus status;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final failed = status.state == BroadcastState.failed;
+    final hub = status.hubName;
+    final parts = [
+      switch (status.state) {
+        BroadcastState.connecting => 'Connecting to ${hub ?? 'the hub'}',
+        BroadcastState.streaming => 'Sending to ${hub ?? 'the hub'}',
+        BroadcastState.reconnecting =>
+          'Connection to ${hub ?? 'the hub'} lost, reconnecting',
+        BroadcastState.failed => 'The broadcast failed',
+        BroadcastState.stopped => 'The broadcast has ended',
+        BroadcastState.idle => 'No broadcast',
+      },
+      ?status.message,
+    ];
+    final updated = status.updatedAt;
+    return Row(
+      key: const Key('broadcast-status'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(
+          failed
+              ? Icons.error_outline
+              : status.state.isRunning
+              ? Icons.podcasts
+              : Icons.info_outline,
+          size: 20,
+          color: failed
+              ? theme.colorScheme.error
+              : theme.colorScheme.onSurfaceVariant,
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            '${parts.map(_withoutPeriod).join('. ')}.'
+            '${updated == null ? '' : ' (${formatClock(updated)})'}',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: failed
+                  ? theme.colorScheme.error
+                  : theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

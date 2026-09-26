@@ -54,6 +54,9 @@
 //!   after [`REMOVE_AFTER`] it is removed and its connection closed. So is the stream of a
 //!   device that is no longer trusted (the store is shared with the rest of the process and
 //!   re-read from disk every 5 s, see [`TrustStore`]).
+//! - **Master gain:** the mixer starts with [`Settings::master_gain`] (persisted by the
+//!   caller, e.g. the app saves it whenever the master slider moves);
+//!   [`HubHandle::set_master_gain`] changes it while the hub runs.
 //! - [`HubHandle::stop`] closes every connection with `Bye`, stops advertising, the tasks,
 //!   the mixer and the output.
 
@@ -328,6 +331,9 @@ impl HubEngine {
 
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (mixer_tx, mixer_rx) = std::sync::mpsc::channel();
+        // The saved master gain (validated above) is the mixer's first command, so the hub
+        // plays at the listener's volume from its first frame.
+        let _ = mixer_tx.send(MixerCommand::Master(settings.master_gain));
         let mixer_stop = Arc::new(AtomicBool::new(false));
         let output_latency = Arc::new(AtomicU32::new(0));
         let mixer = crate::hub_mixer::spawn(
@@ -1392,6 +1398,7 @@ impl HubHandle {
     }
 
     /// Sets the master linear gain (clamped to 0.0..=4.0; non-finite values are ignored).
+    /// Not saved: the hub starts with `Settings::master_gain`, which the caller persists.
     pub fn set_master_gain(&self, gain: f32) {
         if gain.is_finite() {
             let _ = self

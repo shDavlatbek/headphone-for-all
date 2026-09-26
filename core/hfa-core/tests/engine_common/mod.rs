@@ -65,6 +65,11 @@ pub struct TestHub {
 }
 
 pub async fn start_hub(dev: &Device, port: u16, out: Out) -> TestHub {
+    start_hub_with(dev.settings(port), out).await
+}
+
+/// Like [`start_hub`] with explicit settings (e.g. a saved master gain).
+pub async fn start_hub_with(settings: Settings, out: Out) -> TestHub {
     let output: Box<dyn AudioOutput> = match out {
         Out::Wav(path) => {
             Box::new(WavFileOutput::create(&path, AudioFormat::INTERNAL, 10).expect("wav output"))
@@ -72,7 +77,7 @@ pub async fn start_hub(dev: &Device, port: u16, out: Out) -> TestHub {
         Out::Null => Box::new(NullOutput::new(AudioFormat::INTERNAL, 10)),
     };
     let hub = HubEngine::start(HubConfig {
-        settings: dev.settings(port),
+        settings,
         output,
         advertise: false,
     })

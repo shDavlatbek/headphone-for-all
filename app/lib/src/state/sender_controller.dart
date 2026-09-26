@@ -2,12 +2,14 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show PlatformException;
+import 'package:flutter/widgets.dart' show AppLifecycleListener;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/hfa_api.dart';
 import '../models/hub_target.dart';
 import '../models/source_choice.dart';
 import '../platform/native_channel.dart';
+import 'app_prefs.dart';
 import 'core_providers.dart';
 import 'hub_address_book.dart';
 import 'settings_controller.dart';
@@ -36,6 +38,7 @@ class SenderState {
     this.error,
     this.broadcastReady = false,
     this.broadcasting = false,
+    this.broadcast = BroadcastStatus.idle,
   });
 
   /// The core's sender status.
@@ -59,6 +62,10 @@ class SenderState {
   /// iOS: the broadcast extension is streaming.
   final bool broadcasting;
 
+  /// iOS: what the broadcast extension last reported (`getBroadcastStatus`,
+  /// `broadcastStatus` events); [BroadcastStatus.idle] when nothing is known.
+  final BroadcastStatus broadcast;
+
   /// A sender is live in the core.
   bool get isLive => liveSenderStates.contains(status.state);
 
@@ -79,6 +86,7 @@ class SenderState {
     String? error,
     bool? broadcastReady,
     bool? broadcasting,
+    BroadcastStatus? broadcast,
   }) {
     return SenderState(
       status: status ?? this.status,
@@ -88,6 +96,7 @@ class SenderState {
       error: error,
       broadcastReady: broadcastReady ?? this.broadcastReady,
       broadcasting: broadcasting ?? this.broadcasting,
+      broadcast: broadcast ?? this.broadcast,
     );
   }
 }
@@ -139,6 +148,13 @@ class SenderController extends Notifier<SenderState> {
   /// iOS pairing run in progress (its target is updated when it ends).
   bool _pairingOnly = false;
 
+  /// macOS: this sender holds the App Nap opt-out (`beginStreaming`).
+  bool _holdsActivity = false;
+
+  /// The user picked a hub or a source, or a start ran: the remembered ones
+  /// are no longer preselected.
+  bool _chosen = false;
+
   HfaApi get _api => ref.read(hfaApiProvider);
   NativeChannel get _native => ref.read(nativeChannelProvider);
 
@@ -151,17 +167,157 @@ class SenderController extends Notifier<SenderState> {
       onError: (Object e) => _setError(describeError(e)),
     );
     _nativeSub = native.events.listen(_onNativeEvent);
+    final info = ref.read(appInfoProvider);
+    AppLifecycleListener? lifecycle;
+    if (info.isIos) {
+      // The extension runs while the app is in the background; what it did
+      // meanwhile is asked for again when the app comes back.
+      lifecycle = AppLifecycleListener(
+        onResume: () => unawaited(refreshBroadcastStatus()),
+      );
+      Future.microtask(refreshBroadcastStatus);
+    }
     ref.onDispose(() {
       _statusSub?.cancel();
       _nativeSub?.cancel();
+      lifecycle?.dispose();
       _releaseMulticast(native);
+      _endActivity(native);
     });
-    final info = ref.read(appInfoProvider);
+    // The hub and source this device last sent with, once the prefs loaded.
+    ref.listen(appPrefsProvider, (_, prefs) => _preselect(prefs));
+    Future.microtask(() {
+      if (ref.mounted) _preselect(ref.read(appPrefsProvider));
+    });
     final sources = availableSources(info);
     if (info.isAndroid) unawaited(_syncNativeCapture());
     return SenderState(
       status: idleSenderStatus,
       source: sources.isEmpty ? null : SourceChoice(sources.first),
+    );
+  }
+
+  /// Preselects the remembered hub and source (see [AppPrefs.lastHub]) until
+  /// the user chooses or starts something.
+  void _preselect(AppPrefs prefs) {
+    final hub = prefs.lastHub;
+    if (_chosen || _startedHere || hub == null) return;
+    if (state.target != null || state.busy || state.isLive) return;
+    final info = ref.read(appInfoProvider);
+    // Not this device's own hub (e.g. prefs copied from another device).
+    if (hub.deviceId == info.deviceId) return;
+    final source = prefs.lastSource;
+    final available = availableSources(info);
+    state = state.copyWith(
+      target: hub.toTarget(trusted: _trustedAsHub(hub.deviceId)),
+      source: source != null && available.contains(source.kind)
+          ? source.toChoice()
+          : null,
+    );
+    if (source?.kind == SourceKind.app && source?.appName != null) {
+      unawaited(_findRememberedApp(source!, preselected: true));
+    }
+    // The trust store decides whether a PIN is needed.
+    unawaited(_refreshRememberedTrust(hub));
+  }
+
+  /// Whether the loaded trust store has [deviceId] as a hub.
+  bool _trustedAsHub(String? deviceId) {
+    if (deviceId == null) return false;
+    final peers = ref.read(trustedPeersProvider).value ?? const [];
+    return peers.any((p) => p.deviceId == deviceId && p.pairedAsHub);
+  }
+
+  Future<void> _refreshRememberedTrust(LastHub hub) async {
+    final id = hub.deviceId;
+    if (id == null) return;
+    try {
+      final peers = await ref.read(trustedPeersProvider.future);
+      if (!ref.mounted || _chosen || _startedHere) return;
+      final target = state.target;
+      if (target == null || target.deviceId != id) return;
+      final trusted = peers.any((p) => p.deviceId == id && p.pairedAsHub);
+      if (trusted != target.trusted) {
+        state = state.copyWith(target: hub.toTarget(trusted: trusted));
+      }
+    } catch (e) {
+      debugPrint('trusted peers: ${describeError(e)}');
+    }
+  }
+
+  /// Selects the remembered app again if it runs now. [preselected]: the
+  /// app is only preselected, so a choice the user made meanwhile wins.
+  Future<void> _findRememberedApp(
+    LastSource source, {
+    required bool preselected,
+  }) async {
+    try {
+      final apps = await ref.read(hfaApiProvider).listCaptureApps();
+      if (!ref.mounted || state.busy || state.isLive) return;
+      if (preselected && (_chosen || _startedHere)) return;
+      final choice = source.toChoice(apps);
+      if (choice.app != null && state.source?.kind == SourceKind.app) {
+        state = state.copyWith(source: choice);
+      }
+    } catch (e) {
+      debugPrint('capture apps: ${describeError(e)}');
+    }
+  }
+
+  /// Selects the hub and source this device last sent with ("Send to …" on
+  /// the home screen), trusted as the trust store says. Returns `false` when
+  /// nothing is remembered or a sender is live.
+  Future<bool> useRemembered() async {
+    final prefs = ref.read(appPrefsProvider);
+    final hub = prefs.lastHub;
+    if (hub == null || state.isLive || state.busy) return false;
+    _chosen = true;
+    var trusted = false;
+    final id = hub.deviceId;
+    if (id != null) {
+      try {
+        final peers = await ref.read(trustedPeersProvider.future);
+        trusted = peers.any((p) => p.deviceId == id && p.pairedAsHub);
+      } catch (e) {
+        debugPrint('trusted peers: ${describeError(e)}');
+      }
+    }
+    if (!ref.mounted || state.isLive || state.busy) return false;
+    final source = prefs.lastSource;
+    final available = availableSources(ref.read(appInfoProvider));
+    state = state.copyWith(
+      target: hub.toTarget(trusted: trusted),
+      source: source != null && available.contains(source.kind)
+          ? source.toChoice()
+          : null,
+      broadcastReady: false,
+    );
+    if (source?.kind == SourceKind.app && source?.appName != null) {
+      await _findRememberedApp(source!, preselected: false);
+    }
+    return ref.mounted;
+  }
+
+  /// iOS: asks the extension's state again (`getBroadcastStatus`). A no-op
+  /// where the platform does not report one.
+  Future<void> refreshBroadcastStatus() async {
+    BroadcastStatus? status;
+    try {
+      status = await _native.getBroadcastStatus();
+    } catch (e) {
+      debugPrint('broadcast status: ${describeError(e)}');
+    }
+    if (status == null || !ref.mounted) return;
+    _applyBroadcast(status);
+  }
+
+  void _applyBroadcast(BroadcastStatus status) {
+    state = state.copyWith(
+      broadcast: status,
+      broadcasting: status.state.isRunning,
+      error: status.state == BroadcastState.failed
+          ? (status.message ?? 'The broadcast failed.')
+          : state.error,
     );
   }
 
@@ -223,6 +379,17 @@ class SenderController extends Notifier<SenderState> {
         ? target.asPaired()
         : null;
     state = state.copyWith(status: status, target: paired, error: state.error);
+    // Offered again next time ("Send to …", preselected).
+    final source = state.source;
+    if (status.state == 'streaming' &&
+        target != null &&
+        source != null &&
+        !_pairingOnly &&
+        _startedHere) {
+      ref
+          .read(appPrefsProvider.notifier)
+          .rememberSend(paired ?? target, source);
+    }
     // The core saved the hub as trusted: refresh the lists that show it.
     if (paired != null) ref.invalidate(trustedPeersProvider);
     // Where the hub was reached: iOS cannot find it by id later (§8.9).
@@ -240,6 +407,7 @@ class SenderController extends Notifier<SenderState> {
     }
     if (!live) {
       _releaseMulticast(_native);
+      _endActivity(_native);
       if (_nativeCapture) {
         // The engine ended by itself (failed / stopped), possibly while the
         // consent dialog was open: stop (or cancel) the capture too.
@@ -294,7 +462,18 @@ class SenderController extends Notifier<SenderState> {
       case NativeEventType.broadcastStarted:
         state = state.copyWith(broadcasting: true);
       case NativeEventType.broadcastFinished:
-        state = state.copyWith(broadcasting: false, error: event.message);
+        state = state.copyWith(
+          broadcasting: false,
+          error: event.message,
+          broadcast: BroadcastStatus(
+            state: BroadcastState.stopped,
+            message: event.message,
+            hubName: state.broadcast.hubName,
+          ),
+        );
+      case NativeEventType.broadcastStatus:
+        final status = event.broadcast;
+        if (status != null) _applyBroadcast(status);
       case NativeEventType.unknown:
         break;
     }
@@ -302,6 +481,7 @@ class SenderController extends Notifier<SenderState> {
 
   /// Selects the hub to stream to.
   void selectTarget(HubTarget? target) {
+    _chosen = true;
     state = target == null
         ? state.copyWith(clearTarget: true, broadcastReady: false)
         : state.copyWith(target: target, broadcastReady: false);
@@ -309,6 +489,7 @@ class SenderController extends Notifier<SenderState> {
 
   /// Selects what to capture.
   void selectSource(SourceChoice source) {
+    _chosen = true;
     state = state.copyWith(source: source, broadcastReady: false);
   }
 
@@ -347,6 +528,7 @@ class SenderController extends Notifier<SenderState> {
         case SourceKind.broadcast:
           await _prepareBroadcast(target, source);
         default:
+          await _beginActivity();
           await _api.senderStart(
             target.toRequest(source.toDto(), label: source.label),
           );
@@ -355,9 +537,26 @@ class SenderController extends Notifier<SenderState> {
       state = state.copyWith(busy: false);
     } catch (e) {
       _releaseMulticast(_native);
+      _endActivity(_native);
       if (!ref.mounted) return;
       state = state.copyWith(busy: false, error: describeError(e));
     }
+  }
+
+  /// macOS: keeps App Nap away while this device sends (a Mac that sends
+  /// usually hides its window). Only macOS implements it (CONTRACTS §8.9).
+  Future<void> _beginActivity() async {
+    if (_holdsActivity || ref.read(appInfoProvider).platform != 'macos') {
+      return;
+    }
+    _holdsActivity = true;
+    await _quietly(_native.beginStreaming);
+  }
+
+  void _endActivity(NativeChannel native) {
+    if (!_holdsActivity) return;
+    _holdsActivity = false;
+    unawaited(_quietly(native.endStreaming));
   }
 
   Future<void> _startAndroid(HubTarget target, SourceChoice source) async {
@@ -437,11 +636,16 @@ class SenderController extends Notifier<SenderState> {
   /// The extension never pairs and needs the hub's key or a trusted device
   /// id (CONTRACTS.md §8.5), so a hub typed in by address is identified
   /// after pairing by the device the pairing added to the trust store.
+  ///
+  /// Without a secret the hub must be in the trust store as a hub: its id
+  /// (or its key's fingerprint) is looked up there. A key alone (e.g. kept
+  /// from a QR code of a hub that was forgotten since) proves nothing, so
+  /// it asks for a PIN instead of writing a config the extension could not
+  /// use.
   Future<void> _prepareBroadcast(HubTarget target, SourceChoice source) async {
     var deviceId = target.deviceId;
-    final identified =
-        target.hubKey != null || (deviceId != null && target.trusted);
-    if (target.pairingSecret == null && !identified) {
+    if (target.pairingSecret == null &&
+        !await _pairedAsHub(deviceId, target.hubKey)) {
       throw const HfaApiException(
         'Pair with this hub first: enter the PIN shown on it.',
       );
@@ -482,10 +686,32 @@ class SenderController extends Notifier<SenderState> {
       ),
     );
     if (!ref.mounted) return;
-    state = state.copyWith(
-      target: target.asPaired(deviceId: deviceId),
-      broadcastReady: true,
-    );
+    final ready = target.asPaired(deviceId: deviceId);
+    state = state.copyWith(target: ready, broadcastReady: true);
+    // Offered again next time ("Send to …", preselected).
+    ref.read(appPrefsProvider.notifier).rememberSend(ready, source);
+  }
+
+  /// Whether the trust store holds the hub [deviceId] (else the device of
+  /// [hubKey]) as a hub this device paired with. Asks the core, not the
+  /// target's (possibly stale) `trusted` flag.
+  Future<bool> _pairedAsHub(String? deviceId, String? hubKey) async {
+    String? id = deviceId;
+    if (hubKey != null) {
+      final String keyId;
+      try {
+        keyId = await _api.fingerprintOfKey(hubKey);
+      } catch (e) {
+        debugPrint('hub key: ${describeError(e)}');
+        return false;
+      }
+      // A key that is not this device id's is no identification at all.
+      if (id != null && id != keyId) return false;
+      id = keyId;
+    }
+    if (id == null) return false;
+    final peers = await _api.trustedPeers();
+    return peers.any((p) => p.deviceId == id && p.pairedAsHub);
   }
 
   /// Runs a sender on an empty external feed until it streams (paired and
@@ -576,6 +802,7 @@ class SenderController extends Notifier<SenderState> {
   Future<void> stop() async {
     if (state.busy) return;
     state = state.copyWith(busy: true);
+    _endActivity(_native);
     try {
       // On Android always: a capture may run that this controller did not
       // start (§8.8: idempotent, no event).

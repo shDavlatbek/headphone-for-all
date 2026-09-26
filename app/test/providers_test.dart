@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/services.dart' show PlatformException;
+import 'package:flutter/widgets.dart' show AppLifecycleState;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
@@ -49,6 +50,8 @@ final trustedPeer = TrustedPeerDto(
   deviceId: trustedHub.deviceId,
   name: trustedHub.name,
   pairedAtUnix: 1767225600,
+  pairedAsHub: true,
+  pairedAsSender: true,
 );
 
 const strangerHub = HubInfoDto(
@@ -61,6 +64,9 @@ const strangerHub = HubInfoDto(
 );
 
 void main() {
+  // The iOS sender listens to app lifecycle changes (AppLifecycleListener).
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('HubController', () {
     test('start runs the hub service and loads existing sources', () async {
       final fake = FakeHfaApi()..addSource(FakeHfaApi.source(streamId: 7));
@@ -149,18 +155,32 @@ void main() {
     );
 
     test(
-      'master gain is remembered while stopped and applied on start',
+      'the master gain is saved by the core and shown after a restart',
       () async {
         final fake = FakeHfaApi();
-        final c = containerFor(fake);
+        var c = containerFor(fake);
         c.listen(hubControllerProvider, (_, _) {});
-        final hub = c.read(hubControllerProvider.notifier);
+        var hub = c.read(hubControllerProvider.notifier);
+        await settle();
+        expect(c.read(hubControllerProvider).masterGain, 1);
+        // Saved while the hub is stopped too.
         await hub.setMasterGain(1.5);
-        expect(fake.calls, isNot(contains('hubSetMasterGain')));
-        await hub.start();
+        expect(fake.calls, contains('hubSetMasterGain'));
         expect(fake.masterGain, 1.5);
+        c.dispose();
+
+        // A new UI (app restart) shows the saved value before any start.
+        c = containerFor(fake);
+        c.listen(hubControllerProvider, (_, _) {});
+        await settle();
+        expect(c.read(hubControllerProvider).masterGain, 1.5);
+        hub = c.read(hubControllerProvider.notifier);
+        await hub.start();
+        expect(c.read(hubControllerProvider).masterGain, 1.5);
         await hub.setMasterGain(0.25);
         expect(fake.masterGain, 0.25);
+        await hub.stop();
+        expect(c.read(hubControllerProvider).masterGain, 0.25);
       },
     );
 
@@ -195,28 +215,55 @@ void main() {
       expect(native.calls, ['startHubService', 'stopHubService']);
     });
 
-    test(
-      'a failure after hubStart keeps core, service and UI agreeing',
-      () async {
-        final fake = _MasterGainFailingApi();
-        final native = RecordingNativeChannel();
-        final c = containerFor(fake, native: native);
-        // Errors are transient (the hub screen shows each in a snack bar).
-        final errors = <String>[];
-        c.listen(hubControllerProvider.select((h) => h.error), (_, error) {
-          if (error != null) errors.add(error);
-        });
-        final hub = c.read(hubControllerProvider.notifier);
-        await hub.setMasterGain(2);
-        await hub.start();
-        final state = c.read(hubControllerProvider);
-        expect(fake.hubRunning, isTrue);
-        expect(state.running, isTrue);
-        expect(errors, ['mixer busy']);
-        expect(state.masterGain, 1);
-        expect(native.calls, ['startHubService']);
-      },
-    );
+    test('a refused master gain goes back to the saved value', () async {
+      final fake = _MasterGainFailingApi();
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      // Errors are transient (the hub screen shows each in a snack bar).
+      final errors = <String>[];
+      c.listen(hubControllerProvider.select((h) => h.error), (_, error) {
+        if (error != null) errors.add(error);
+      });
+      final hub = c.read(hubControllerProvider.notifier);
+      await hub.setMasterGain(0.5);
+      await hub.start();
+      var state = c.read(hubControllerProvider);
+      expect(state.running, isTrue);
+      expect(state.masterGain, 0.5, reason: 'the core applies it on start');
+      await hub.setMasterGain(2);
+      state = c.read(hubControllerProvider);
+      expect(fake.hubRunning, isTrue);
+      expect(errors, ['mixer busy']);
+      expect(state.masterGain, 0.5);
+      expect(native.calls, ['startHubService']);
+    });
+
+    test('the header data follows the core status', () async {
+      final fake = FakeHfaApi()..advertiseError = 'no multicast';
+      final c = containerFor(
+        fake,
+        pollInterval: const Duration(milliseconds: 20),
+      );
+      c.listen(hubControllerProvider, (_, _) {});
+      final hub = c.read(hubControllerProvider.notifier);
+      await hub.start();
+      var state = c.read(hubControllerProvider);
+      expect(state.addresses, ['192.168.1.10:47810', '[fd00::10]:47810']);
+      expect(state.notDiscoverable, isTrue);
+      expect(state.advertiseError, 'no multicast');
+      // The poll picks up a new network.
+      fake
+        ..lanAddresses = ['10.0.0.5']
+        ..advertiseError = null;
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      state = c.read(hubControllerProvider);
+      expect(state.addresses, ['10.0.0.5:47810']);
+      expect(state.notDiscoverable, isFalse);
+      await hub.stop();
+      state = c.read(hubControllerProvider);
+      expect(state.addresses, isEmpty);
+      expect(state.notDiscoverable, isFalse);
+    });
 
     test('an Error event is surfaced', () async {
       final fake = FakeHfaApi();
@@ -954,6 +1001,326 @@ void main() {
     });
   });
 
+  group('SenderController (trust, broadcast state, memory)', () {
+    const hubKey = 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE';
+    final keyId = FakeHfaApi.fingerprintFor(hubKey);
+
+    /// What a scanned QR code leaves after its pairing: the key is kept, the
+    /// one-time token spent, and the target says "trusted".
+    HubTarget scannedThenPaired() => HubTarget.fromPairingUri(
+      PairingUriDto(
+        host: '10.0.0.9',
+        port: 47810,
+        hubId: hubKey,
+        hubDeviceId: keyId,
+        token: 'dG9rZW4',
+        name: 'Desk PC',
+      ),
+    ).asPaired();
+
+    test('iOS: a hub key without a pairing never starts a broadcast', () async {
+      final fake = FakeHfaApi(platform: 'ios');
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      final target = scannedThenPaired();
+      expect(target.hubKey, hubKey);
+      expect(target.pairingSecret, isNull);
+      expect(target.trusted, isTrue, reason: 'the stale flag to ignore');
+
+      Future<void> expectRefused(HubTarget target) async {
+        sender.selectTarget(target);
+        await sender.start();
+        final state = c.read(senderControllerProvider);
+        expect(state.error, contains('Pair with this hub first'));
+        expect(state.needsPin, isTrue);
+        expect(state.broadcastReady, isFalse);
+        expect(native.lastBroadcastConfig, isNull);
+        expect(fake.calls, isNot(contains('senderStart')));
+      }
+
+      // Not in the trust store (e.g. forgotten since the QR code).
+      await expectRefused(target);
+      // Only paired the other way (it sends to this device's hub).
+      fake.trusted.add(
+        FakeHfaApi.peer(deviceId: keyId, asHub: false, asSender: true),
+      );
+      await expectRefused(target);
+      // A key without a device id is looked up by its fingerprint too.
+      await expectRefused(
+        const HubTarget(
+          name: 'Desk PC',
+          origin: HubOrigin.pairingLink,
+          host: '10.0.0.9',
+          hubKey: hubKey,
+          trusted: true,
+        ),
+      );
+      // A key that is not the device id's identifies nothing.
+      fake.trusted
+        ..clear()
+        ..add(FakeHfaApi.peer(deviceId: 'other-id'));
+      await expectRefused(
+        const HubTarget(
+          name: 'Desk PC',
+          origin: HubOrigin.pairingLink,
+          host: '10.0.0.9',
+          deviceId: 'other-id',
+          hubKey: hubKey,
+          trusted: true,
+        ),
+      );
+
+      // Paired as a hub: the key's device is found, no PIN needed.
+      fake.trusted
+        ..clear()
+        ..add(FakeHfaApi.peer(deviceId: keyId));
+      sender.selectTarget(target);
+      await sender.start();
+      final state = c.read(senderControllerProvider);
+      expect(state.error, isNull);
+      expect(state.broadcastReady, isTrue);
+      expect(native.lastBroadcastConfig?.hubKey, hubKey);
+      expect(fake.calls, isNot(contains('senderStart')));
+    });
+
+    test('desktop: a pinned hub key alone does not stream', () async {
+      final fake = FakeHfaApi();
+      final c = containerFor(fake);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(scannedThenPaired());
+      sender.selectSource(const SourceChoice(SourceKind.tone));
+      await sender.start();
+      await settle();
+      final state = c.read(senderControllerProvider);
+      expect(state.status.state, 'failed');
+      expect(state.needsPin, isTrue);
+      expect(fake.trusted, isEmpty);
+    });
+
+    test(
+      'iOS: the broadcast state is read at start, on resume and from events',
+      () async {
+        final fake = FakeHfaApi(platform: 'ios');
+        final native = RecordingNativeChannel()
+          ..broadcastStatusAnswer = const BroadcastStatus(
+            state: BroadcastState.streaming,
+            hubName: 'Desk PC',
+          );
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        await settle();
+        await settle();
+        var state = c.read(senderControllerProvider);
+        expect(native.broadcastStatusQueries, 1);
+        expect(state.broadcast.state, BroadcastState.streaming);
+        expect(state.broadcasting, isTrue);
+
+        // Stopped from Control Center while the app was in the background.
+        native.broadcastStatusAnswer = const BroadcastStatus(
+          state: BroadcastState.stopped,
+        );
+        final binding = TestWidgetsFlutterBinding.instance;
+        binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+        binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+        await settle();
+        await settle();
+        state = c.read(senderControllerProvider);
+        expect(native.broadcastStatusQueries, 2);
+        expect(state.broadcast.state, BroadcastState.stopped);
+        expect(state.broadcasting, isFalse);
+
+        native.emit(
+          const NativeEvent(
+            NativeEventType.broadcastStatus,
+            broadcast: BroadcastStatus(
+              state: BroadcastState.reconnecting,
+              hubName: 'Desk PC',
+            ),
+          ),
+        );
+        await settle();
+        state = c.read(senderControllerProvider);
+        expect(state.broadcast.state, BroadcastState.reconnecting);
+        expect(state.broadcasting, isTrue);
+
+        native.emit(
+          const NativeEvent(
+            NativeEventType.broadcastStatus,
+            message: 'The hub refused the connection.',
+            broadcast: BroadcastStatus(
+              state: BroadcastState.failed,
+              message: 'The hub refused the connection.',
+            ),
+          ),
+        );
+        await settle();
+        state = c.read(senderControllerProvider);
+        expect(state.broadcasting, isFalse);
+        expect(state.error, 'The hub refused the connection.');
+      },
+    );
+
+    test('other platforms never ask for a broadcast state', () async {
+      final native = RecordingNativeChannel();
+      final c = containerFor(FakeHfaApi(platform: 'android'), native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      await settle();
+      expect(native.broadcastStatusQueries, 0);
+      expect(c.read(senderControllerProvider).broadcast, BroadcastStatus.idle);
+    });
+
+    test('macOS: a sender holds the App Nap opt-out while it runs', () async {
+      final fake = FakeHfaApi(platform: 'macos', trusted: [trustedPeer]);
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.discovered(trustedHub));
+      sender.selectSource(const SourceChoice(SourceKind.tone));
+      await sender.start();
+      await settle();
+      expect(native.calls, ['beginStreaming']);
+      await sender.stop();
+      expect(native.calls, ['beginStreaming', 'endStreaming']);
+
+      // A sender that ends by itself releases it too.
+      await sender.start();
+      await settle();
+      fake.emitSenderStatus(
+        const SenderStatusDto(
+          state: 'failed',
+          error: 'the hub went away',
+          bitrate: 0,
+          lossPct: 0,
+          rttMs: 0,
+          levelDb: -120,
+          hubGain: 1,
+          hubMuted: false,
+          hubPriority: false,
+        ),
+      );
+      await settle();
+      expect(native.calls, [
+        'beginStreaming',
+        'endStreaming',
+        'beginStreaming',
+        'endStreaming',
+      ]);
+    });
+
+    test('other desktops do not ask for it', () async {
+      final fake = FakeHfaApi(trusted: [trustedPeer]);
+      final native = RecordingNativeChannel();
+      final c = containerFor(fake, native: native);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.discovered(trustedHub));
+      sender.selectSource(const SourceChoice(SourceKind.tone));
+      await sender.start();
+      await sender.stop();
+      expect(native.calls, isNot(contains('beginStreaming')));
+    });
+
+    test(
+      'the last hub and source are remembered and preselected next time',
+      () async {
+        final dir = await Directory.systemTemp.createTemp('hfa_last_');
+        addTearDown(() => dir.delete(recursive: true));
+        final fake = FakeHfaApi(
+          trusted: [trustedPeer],
+          captureApps: [const CaptureAppDto(pid: 7, name: 'Firefox')],
+        );
+        Future<ProviderContainer> launch() async {
+          final c = containerFor(fake, dataDir: dir.path);
+          c.listen(senderControllerProvider, (_, _) {});
+          c.listen(appPrefsProvider, (_, _) {});
+          await c.read(appPrefsProvider.notifier).flush();
+          // Trust store and app list are asked asynchronously.
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+          return c;
+        }
+
+        var c = await launch();
+        expect(c.read(senderControllerProvider).target, isNull);
+        final sender = c.read(senderControllerProvider.notifier);
+        sender.selectTarget(HubTarget.discovered(trustedHub));
+        sender.selectSource(
+          const SourceChoice(
+            SourceKind.app,
+            app: CaptureAppDto(pid: 7, name: 'Firefox'),
+          ),
+        );
+        await sender.start();
+        await settle();
+        final prefs = c.read(appPrefsProvider);
+        expect(prefs.lastHub?.deviceId, trustedHub.deviceId);
+        expect(prefs.lastHub?.name, 'Desk PC');
+        expect(
+          prefs.lastSource,
+          const LastSource(SourceKind.app, appName: 'Firefox'),
+        );
+        await sender.stop();
+        await c.read(appPrefsProvider.notifier).flush();
+        c.dispose();
+
+        // Next launch: Firefox runs with another pid.
+        fake.captureApps
+          ..clear()
+          ..add(const CaptureAppDto(pid: 99, name: 'Firefox'));
+        c = await launch();
+        var state = c.read(senderControllerProvider);
+        expect(state.target?.deviceId, trustedHub.deviceId);
+        expect(state.target?.trusted, isTrue);
+        expect(state.target?.needsPin, isFalse);
+        expect(
+          state.source,
+          const SourceChoice(
+            SourceKind.app,
+            app: CaptureAppDto(pid: 99, name: 'Firefox'),
+          ),
+        );
+        c.dispose();
+
+        // Forgotten since: the remembered hub asks for a PIN.
+        fake.trusted.clear();
+        c = await launch();
+        state = c.read(senderControllerProvider);
+        expect(state.target?.deviceId, trustedHub.deviceId);
+        expect(state.target?.trusted, isFalse);
+        expect(state.target?.needsPin, isTrue);
+        c.dispose();
+      },
+    );
+
+    test('a choice made before the prefs loaded is not overwritten', () async {
+      final fake = FakeHfaApi(trusted: [trustedPeer]);
+      final c = containerFor(fake);
+      c.listen(senderControllerProvider, (_, _) {});
+      final sender = c.read(senderControllerProvider.notifier);
+      sender.selectTarget(HubTarget.discovered(strangerHub));
+      c
+          .read(appPrefsProvider.notifier)
+          .rememberSend(
+            HubTarget.discovered(trustedHub),
+            const SourceChoice(SourceKind.tone),
+          );
+      await settle();
+      expect(
+        c.read(senderControllerProvider).target?.deviceId,
+        strangerHub.deviceId,
+      );
+      // "Send to …" takes the remembered one on request.
+      expect(await sender.useRemembered(), isTrue);
+      final state = c.read(senderControllerProvider);
+      expect(state.target?.deviceId, trustedHub.deviceId);
+      expect(state.target?.trusted, isTrue);
+      expect(state.source, const SourceChoice(SourceKind.tone));
+    });
+  });
+
   group('DiscoveryController', () {
     test('tracks found/lost hubs and holds the multicast lock', () async {
       final fake = FakeHfaApi(discoverableHubs: [trustedHub]);
@@ -1118,7 +1485,13 @@ void main() {
       () async {
         final fake = FakeHfaApi(
           trusted: [
-            const TrustedPeerDto(deviceId: 'a', name: 'A', pairedAtUnix: 1),
+            const TrustedPeerDto(
+              deviceId: 'a',
+              name: 'A',
+              pairedAtUnix: 1,
+              pairedAsHub: true,
+              pairedAsSender: true,
+            ),
           ],
         );
         final c = containerFor(fake);
@@ -1152,8 +1525,20 @@ void main() {
     test('forget removes the peer and reloads the list', () async {
       final fake = FakeHfaApi(
         trusted: [
-          const TrustedPeerDto(deviceId: 'a', name: 'A', pairedAtUnix: 1),
-          const TrustedPeerDto(deviceId: 'b', name: 'B', pairedAtUnix: 2),
+          const TrustedPeerDto(
+            deviceId: 'a',
+            name: 'A',
+            pairedAtUnix: 1,
+            pairedAsHub: true,
+            pairedAsSender: true,
+          ),
+          const TrustedPeerDto(
+            deviceId: 'b',
+            name: 'B',
+            pairedAtUnix: 2,
+            pairedAsHub: true,
+            pairedAsSender: true,
+          ),
         ],
       );
       final c = containerFor(fake);
@@ -1172,10 +1557,11 @@ class _FailingHubApi extends FakeHfaApi {
   }
 }
 
+/// Refuses master gains above 1 while the hub runs.
 class _MasterGainFailingApi extends FakeHfaApi {
   @override
   Future<void> hubSetMasterGain(double gain) async {
-    if (hubRunning) throw const HfaApiException('mixer busy');
+    if (hubRunning && gain > 1) throw const HfaApiException('mixer busy');
     return super.hubSetMasterGain(gain);
   }
 }

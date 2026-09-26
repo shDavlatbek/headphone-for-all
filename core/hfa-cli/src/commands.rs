@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use hfa_core::{DiscoveryEvent, HubInfo, TrustStore};
+use hfa_core::{DiscoveryEvent, HubInfo, PeerRoles, TrustStore, TrustedPeer};
 
 use crate::cli::{DiscoverArgs, TrustCommand};
 use crate::display::{format_unix_time, Table};
@@ -232,6 +232,33 @@ pub async fn devices() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `ROLES` cell of `hfa trust list`: how a peer was paired. `hub` = this device paired
+/// with it as a sender and may stream to it; `sender` = it paired with this device's hub and
+/// may stream into it (entries from before roles existed have both).
+fn roles_label(roles: PeerRoles) -> String {
+    match (roles.hub, roles.sender) {
+        (true, true) => "hub, sender",
+        (true, false) => "hub",
+        (false, true) => "sender",
+        (false, false) => "-",
+    }
+    .to_owned()
+}
+
+/// The `hfa trust list` table (header plus one row per peer).
+fn trust_table(peers: Vec<TrustedPeer>) -> String {
+    let mut table = Table::new(["DEVICE ID", "NAME", "ROLES", "PAIRED AT (UTC)"]);
+    for peer in peers {
+        table.row([
+            peer.device_id,
+            peer.name,
+            roles_label(peer.roles),
+            format_unix_time(peer.paired_at),
+        ]);
+    }
+    table.render()
+}
+
 /// `hfa trust list|remove <id>`. `remove` refuses while a hub or sender runs with the same
 /// data dir (see [`DataDirLock`]).
 pub async fn trust(data_dir: PathBuf, command: TrustCommand) -> anyhow::Result<()> {
@@ -261,11 +288,7 @@ pub async fn trust(data_dir: PathBuf, command: TrustCommand) -> anyhow::Result<(
                 println!("No trusted devices in {}.", data_dir.display());
                 return Ok(());
             }
-            let mut table = Table::new(["DEVICE ID", "NAME", "PAIRED AT (UTC)"]);
-            for peer in peers {
-                table.row([peer.device_id, peer.name, format_unix_time(peer.paired_at)]);
-            }
-            print!("{}", table.render());
+            print!("{}", trust_table(peers));
         }
         TrustCommand::Remove { device_id } => {
             let id = device_id.trim().to_owned();
@@ -287,4 +310,56 @@ pub async fn trust(data_dir: PathBuf, command: TrustCommand) -> anyhow::Result<(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hfa_core::PeerRole;
+
+    fn peer(key: u8, name: &str, roles: PeerRoles) -> TrustedPeer {
+        TrustedPeer {
+            device_id: hfa_proto::fingerprint(&[key; 32]),
+            name: name.to_owned(),
+            public_key: [key; 32],
+            paired_at: 1_767_225_600,
+            roles,
+        }
+    }
+
+    #[test]
+    fn trust_list_shows_the_roles() {
+        let text = trust_table(vec![
+            peer(1, "Desk PC", PeerRoles::only(PeerRole::Hub)),
+            peer(2, "Phone", PeerRoles::only(PeerRole::Sender)),
+            peer(3, "Old laptop", PeerRoles::BOTH),
+        ]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(lines[0].starts_with("DEVICE ID"), "{text}");
+        let roles_at = lines[0].find("ROLES").expect("ROLES column");
+        let paired_at = lines[0].find("PAIRED AT (UTC)").expect("date column");
+        let cell = |line: &str| line[roles_at..paired_at].trim().to_owned();
+        assert_eq!(cell(lines[1]), "hub");
+        assert_eq!(cell(lines[2]), "sender");
+        assert_eq!(cell(lines[3]), "hub, sender");
+        assert!(
+            lines[1].contains("Desk PC") && lines[1].contains("2026-01-01"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn roles_label_covers_every_combination() {
+        assert_eq!(roles_label(PeerRoles::BOTH), "hub, sender");
+        assert_eq!(roles_label(PeerRoles::only(PeerRole::Hub)), "hub");
+        assert_eq!(roles_label(PeerRoles::only(PeerRole::Sender)), "sender");
+        assert_eq!(
+            roles_label(PeerRoles {
+                hub: false,
+                sender: false
+            }),
+            "-"
+        );
+    }
 }

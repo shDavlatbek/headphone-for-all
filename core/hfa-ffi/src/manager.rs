@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use hfa_core::config::SETTINGS_FILE;
 use hfa_core::{
-    Advertiser, HubConfig, HubEngine, HubEvent, HubHandle, Identity, SenderConfig, SenderEngine,
-    SenderEvent, SenderHandle, SenderState, Settings, TrustStore,
+    Advertiser, HubConfig, HubEngine, HubEvent, HubHandle, Identity, PeerRole, SenderConfig,
+    SenderEngine, SenderEvent, SenderHandle, SenderState, Settings, TrustStore,
 };
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
@@ -379,23 +379,33 @@ impl EngineManager {
 
     /// See `api::hub::hub_status`.
     pub(crate) fn hub_status(&self) -> HubStatusDto {
-        let st = self.state.lock();
-        let device_name = st
-            .app
-            .as_ref()
-            .map(|a| a.settings.device_name.clone())
-            .unwrap_or_default();
-        match &st.hub {
-            Some(slot) => HubStatusDto {
-                running: true,
-                port: slot.handle.local_port(),
-                device_name,
-                source_count: u32::try_from(slot.handle.sources().len()).unwrap_or(u32::MAX),
-                advertised: slot.advertiser.is_some(),
-                advertise_error: slot.advertise_error.clone(),
-            },
-            None => convert::stopped_hub_status(device_name),
+        let mut status = {
+            let st = self.state.lock();
+            let (device_name, master_gain) = st
+                .app
+                .as_ref()
+                .map(|a| (a.settings.device_name.clone(), a.settings.master_gain))
+                .unwrap_or_else(|| (String::new(), 1.0));
+            match &st.hub {
+                Some(slot) => HubStatusDto {
+                    running: true,
+                    port: slot.handle.local_port(),
+                    device_name,
+                    source_count: u32::try_from(slot.handle.sources().len()).unwrap_or(u32::MAX),
+                    advertised: slot.advertiser.is_some(),
+                    advertise_error: slot.advertise_error.clone(),
+                    master_gain,
+                    addresses: Vec::new(),
+                },
+                None => convert::stopped_hub_status(device_name, master_gain),
+            }
+        };
+        if status.running {
+            // Listed outside the state lock (a system call); addresses change with the network.
+            status.addresses =
+                convert::hub_addresses(&hfa_core::pairing::lan_addresses(), status.port);
         }
+        status
     }
 
     /// See `api::hub::hub_sources`.
@@ -436,13 +446,30 @@ impl EngineManager {
         self.with_hub(|h| Ok(h.set_priority(stream_id, priority)?))
     }
 
-    /// See `api::hub::hub_set_master_gain`.
+    /// See `api::hub::hub_set_master_gain`: saved in the settings (so every later hub start
+    /// applies it) and applied to a running hub. The file is written outside the state lock;
+    /// the lifecycle lock orders it with `update_settings` and hub starts.
     pub(crate) fn hub_set_master_gain(&self, gain: f32) -> Result<()> {
         check_gain(gain)?;
-        self.with_hub(|h| {
-            h.set_master_gain(gain);
-            Ok(())
-        })
+        let _ops = self.lifecycle.lock();
+        let mut settings = {
+            let st = self.state.lock();
+            st.app
+                .as_ref()
+                .ok_or(FfiError::NotInitialized)?
+                .settings
+                .clone()
+        };
+        settings.master_gain = gain;
+        settings.save()?;
+        let mut st = self.state.lock();
+        if let Some(app) = st.app.as_mut() {
+            app.settings.master_gain = gain;
+        }
+        if let Some(slot) = &st.hub {
+            slot.handle.set_master_gain(gain);
+        }
+        Ok(())
     }
 
     /// See `api::hub::hub_start_pairing`.
@@ -491,8 +518,13 @@ impl EngineManager {
                 // Loaded per event (a small file; events are rare) so that a hub paired
                 // while discovery runs shows as trusted.
                 let trust = data_dir.as_deref().and_then(|d| TrustStore::load(d).ok());
+                // "Trusted" means no PIN is needed: this device paired with it as a hub
+                // (a peer that only paired with this device's hub still needs one).
                 let dto = convert::discovery_event_dto(&event, |id| {
-                    trust.as_ref().is_some_and(|t| t.get(id).is_some())
+                    trust
+                        .as_ref()
+                        .and_then(|t| t.get(id))
+                        .is_some_and(|p| p.roles.contains(PeerRole::Hub))
                 });
                 if !sink.deliver(dto) {
                     break;
@@ -856,7 +888,10 @@ mod tests {
     #[test]
     fn stopped_engines_report_idle_and_controls_fail() {
         let m = EngineManager::new().expect("manager");
-        assert_eq!(m.hub_status(), convert::stopped_hub_status(String::new()));
+        assert_eq!(
+            m.hub_status(),
+            convert::stopped_hub_status(String::new(), 1.0)
+        );
         assert!(m.hub_sources().is_empty());
         assert!(matches!(
             m.hub_set_gain(1, 1.0),
@@ -870,9 +905,10 @@ mod tests {
             m.hub_set_priority(1, true),
             Err(FfiError::HubNotRunning)
         ));
+        // The master gain is saved in the settings, so it only needs an initialized app.
         assert!(matches!(
             m.hub_set_master_gain(1.0),
-            Err(FfiError::HubNotRunning)
+            Err(FfiError::NotInitialized)
         ));
         assert!(matches!(
             m.hub_start_pairing(),

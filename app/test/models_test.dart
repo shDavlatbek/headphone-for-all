@@ -135,7 +135,13 @@ void main() {
 
     test('paired peers are found by id (empty host)', () {
       final t = HubTarget.paired(
-        const TrustedPeerDto(deviceId: 'ef01', name: 'Old', pairedAtUnix: 0),
+        const TrustedPeerDto(
+          deviceId: 'ef01',
+          name: 'Old',
+          pairedAtUnix: 0,
+          pairedAsHub: true,
+          pairedAsSender: true,
+        ),
       );
       expect(t.host, isEmpty);
       expect(t.needsPin, isFalse);
@@ -244,6 +250,8 @@ void main() {
       deviceId: 'hub1',
       name: 'Desk',
       pairedAtUnix: 1,
+      pairedAsHub: true,
+      pairedAsSender: true,
     );
     final selected = HubTarget.discovered(hub).withPin('123456');
 

@@ -5,10 +5,12 @@
 //! `api_e2e.rs` covers a sender that pairs with and streams to a hub.
 
 use hfa_core::{TrustStore, TrustedPeer};
-use hfa_ffi::api::app::{forget_peer, get_settings, init_app, trusted_peers, update_settings};
+use hfa_ffi::api::app::{
+    fingerprint_of_key, forget_peer, get_settings, init_app, trusted_peers, update_settings,
+};
 use hfa_ffi::api::hub::{
-    hub_cancel_pairing, hub_pairing_status, hub_sources, hub_start, hub_start_pairing, hub_status,
-    hub_stop,
+    hub_cancel_pairing, hub_pairing_status, hub_set_master_gain, hub_sources, hub_start,
+    hub_start_pairing, hub_status, hub_stop,
 };
 use hfa_ffi::api::sender::{
     sender_start, sender_status, sender_stop, CaptureSourceDto, SenderStartDto,
@@ -53,7 +55,16 @@ fn api_lifecycle_with_real_engines() {
             })
             .expect("add peer");
     }
-    assert_eq!(trusted_peers().expect("peers").len(), 2);
+    let peers = trusted_peers().expect("peers");
+    assert_eq!(peers.len(), 2);
+    assert!(peers.iter().all(|p| p.paired_as_hub && p.paired_as_sender));
+    // A key's device id, as the app compares it with the trusted peers.
+    assert_eq!(
+        fingerprint_of_key("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".into()).expect("key"),
+        hfa_proto::fingerprint(&[7u8; 32])
+    );
+    assert!(fingerprint_of_key("not a key".into()).is_err());
+    assert!(fingerprint_of_key("AAAA".into()).is_err(), "too short");
     forget_peer(hfa_proto::fingerprint(&[7u8; 32])).expect("forget");
     let peers = trusted_peers().expect("peers");
     assert_eq!(peers.len(), 1);
@@ -64,8 +75,27 @@ fn api_lifecycle_with_real_engines() {
         .peers()
         .is_empty());
 
+    // The master gain is saved while the hub is stopped and applied by its start.
+    assert!((hub_status().master_gain - 1.0).abs() < f32::EPSILON);
+    hub_set_master_gain(0.5).expect("master gain while stopped");
+    assert!((hub_status().master_gain - 0.5).abs() < f32::EPSILON);
+    assert!(hub_set_master_gain(4.5).is_err());
+    assert!(hub_status().addresses.is_empty(), "stopped: no addresses");
+
     let status = hub_start().expect("hub starts");
     assert!(status.running);
+    assert!((status.master_gain - 0.5).abs() < f32::EPSILON);
+    let port_suffix = format!(":{}", status.port);
+    assert!(
+        status.addresses.iter().all(|a| a.ends_with(&port_suffix)),
+        "{:?}",
+        status.addresses
+    );
+    // IPv4 first, IPv6 in brackets.
+    let first_v6 = status.addresses.iter().position(|a| a.starts_with('['));
+    if let Some(i) = first_v6 {
+        assert!(status.addresses[i..].iter().all(|a| a.starts_with('[')));
+    }
     assert_ne!(status.port, 0);
     assert_eq!(hub_start().expect("idempotent").port, status.port);
     assert_eq!(hub_status(), status);
@@ -98,8 +128,14 @@ fn api_lifecycle_with_real_engines() {
         label: String::new(),
     };
     assert!(sender_start(own).is_err());
+    hub_set_master_gain(0.75).expect("master gain while running");
+    assert!((hub_status().master_gain - 0.75).abs() < f32::EPSILON);
     hub_stop().expect("hub stops");
     assert!(!hub_status().running);
+    // Saved in settings.json, so it survives an app restart.
+    let saved = hfa_core::Settings::load_or_default(dir.path()).expect("settings");
+    assert!((saved.master_gain - 0.75).abs() < f32::EPSILON);
+    assert!((hub_status().master_gain - 0.75).abs() < f32::EPSILON);
     assert!(!hub_status().advertised);
     assert_eq!(hub_pairing_status().expect("pairing status"), None);
 
@@ -109,6 +145,10 @@ fn api_lifecycle_with_real_engines() {
     settings.bitrate = 96_000;
     update_settings(settings).expect("update");
     assert_eq!(get_settings().expect("settings").bitrate, 96_000);
+    // Saving the settings screen keeps the master gain.
+    assert!((hub_status().master_gain - 0.75).abs() < f32::EPSILON);
+    let saved = hfa_core::Settings::load_or_default(dir.path()).expect("settings");
+    assert!((saved.master_gain - 0.75).abs() < f32::EPSILON);
 
     // A sender towards a closed port keeps trying (it never reaches `streaming`).
     let closed = SenderStartDto {

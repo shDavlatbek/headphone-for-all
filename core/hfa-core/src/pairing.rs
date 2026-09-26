@@ -296,68 +296,130 @@ impl fmt::Debug for PairingAttempt<'_> {
 /// (RFC 1918) addresses and physical-looking interfaces over virtual ones (Docker, VM,
 /// VPN bridges). `None` if there is none.
 pub fn lan_ipv4() -> Option<Ipv4Addr> {
-    let interfaces = match if_addrs::get_if_addrs() {
-        Ok(list) => list,
-        Err(e) => {
-            tracing::debug!(error = %e, "cannot list network interfaces");
-            return None;
-        }
-    };
-    interfaces
-        .iter()
-        .filter_map(|i| match i.ip() {
-            IpAddr::V4(ip)
-                if !ip.is_loopback()
-                    && !ip.is_link_local()
-                    && !ip.is_unspecified()
-                    && !ip.is_multicast()
-                    && !i.is_p2p()
-                    && !matches!(
-                        i.oper_status,
-                        if_addrs::IfOperStatus::Down
-                            | if_addrs::IfOperStatus::NotPresent
-                            | if_addrs::IfOperStatus::LowerLayerDown
-                    ) =>
-            {
-                Some((lan_score(&i.name, ip), ip))
-            }
-            _ => None,
+    lan_candidates()
+        .into_iter()
+        .filter_map(|(name, ip)| match ip {
+            IpAddr::V4(v4) => Some((lan_score(&name, v4), v4)),
+            IpAddr::V6(_) => None,
         })
         .max_by_key(|(score, ip)| (*score, std::cmp::Reverse(u32::from(*ip))))
         .map(|(_, ip)| ip)
 }
 
+/// Every address other LAN devices may use to reach this device, best first: the IPv4
+/// addresses (ranked like [`lan_ipv4`], so its answer comes first), then IPv6 addresses
+/// that are not link-local (global and unique-local; a link-local address needs a zone
+/// that another device cannot know). Addresses of virtual-looking interfaces (Docker, VM,
+/// VPN) are left out when a physical-looking interface has one. Empty if there is none.
+///
+/// For display (the hub screen lists them for typing into a sender); blocking (lists the
+/// interfaces).
+pub fn lan_addresses() -> Vec<IpAddr> {
+    rank_lan_addresses(lan_candidates())
+}
+
+/// Orders `(interface name, address)` candidates for [`lan_addresses`].
+fn rank_lan_addresses(candidates: Vec<(String, IpAddr)>) -> Vec<IpAddr> {
+    let any_physical = candidates.iter().any(|(name, _)| !looks_virtual(name));
+    let mut ranked: Vec<(u8, IpAddr)> = candidates
+        .into_iter()
+        .filter(|(name, _)| !any_physical || !looks_virtual(name))
+        .map(|(name, ip)| match ip {
+            // IPv4 before IPv6; within IPv4 the `lan_ipv4` order.
+            IpAddr::V4(v4) => (4 + lan_score(&name, v4), ip),
+            IpAddr::V6(_) => (0, ip),
+        })
+        .collect();
+    ranked.sort_by(|(sa, a), (sb, b)| sb.cmp(sa).then_with(|| a.cmp(b)));
+    let mut out: Vec<IpAddr> = Vec::with_capacity(ranked.len());
+    for (_, ip) in ranked {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// Up, non-point-to-point interfaces' usable unicast addresses with the interface name:
+/// IPv4 without loopback / link-local / unspecified / multicast, IPv6 without loopback /
+/// link-local (`fe80::/10`) / unspecified / multicast.
+fn lan_candidates() -> Vec<(String, IpAddr)> {
+    let interfaces = match if_addrs::get_if_addrs() {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::debug!(error = %e, "cannot list network interfaces");
+            return Vec::new();
+        }
+    };
+    interfaces
+        .into_iter()
+        .filter(|i| {
+            !i.is_p2p()
+                && !matches!(
+                    i.oper_status,
+                    if_addrs::IfOperStatus::Down
+                        | if_addrs::IfOperStatus::NotPresent
+                        | if_addrs::IfOperStatus::LowerLayerDown
+                )
+        })
+        .filter_map(|i| {
+            let ip = i.ip();
+            let usable = match ip {
+                IpAddr::V4(v4) => {
+                    !v4.is_loopback()
+                        && !v4.is_link_local()
+                        && !v4.is_unspecified()
+                        && !v4.is_multicast()
+                }
+                IpAddr::V6(v6) => {
+                    !v6.is_loopback()
+                        && !v6.is_unspecified()
+                        && !v6.is_multicast()
+                        && (v6.segments()[0] & 0xffc0) != 0xfe80
+                }
+            };
+            usable.then_some((i.name, ip))
+        })
+        .collect()
+}
+
+/// Name prefixes of virtual network interfaces.
+const VIRTUAL_PREFIXES: [&str; 14] = [
+    "docker",
+    "br-",
+    "veth",
+    "virbr",
+    "vmnet",
+    "vboxnet",
+    "tun",
+    "tap",
+    "wg",
+    "utun",
+    "zt",
+    "tailscale",
+    "podman",
+    "cni",
+];
+
 /// Ranks a candidate address: private ranges first, then interfaces that do not look virtual.
 fn lan_score(if_name: &str, ip: Ipv4Addr) -> u8 {
-    const VIRTUAL_PREFIXES: [&str; 14] = [
-        "docker",
-        "br-",
-        "veth",
-        "virbr",
-        "vmnet",
-        "vboxnet",
-        "tun",
-        "tap",
-        "wg",
-        "utun",
-        "zt",
-        "tailscale",
-        "podman",
-        "cni",
-    ];
-    let name = if_name.to_ascii_lowercase();
-    let looks_virtual = VIRTUAL_PREFIXES.iter().any(|p| name.starts_with(p))
-        || name.contains("virtual")
-        || name.contains("vethernet")
-        || name.contains("vpn");
     let mut score = 0;
     if ip.is_private() {
         score += 2;
     }
-    if !looks_virtual {
+    if !looks_virtual(if_name) {
         score += 1;
     }
     score
+}
+
+/// Whether an interface name looks like a virtual one (container bridges, VMs, VPNs).
+fn looks_virtual(if_name: &str) -> bool {
+    let name = if_name.to_ascii_lowercase();
+    VIRTUAL_PREFIXES.iter().any(|p| name.starts_with(p))
+        || name.contains("virtual")
+        || name.contains("vethernet")
+        || name.contains("vpn")
 }
 
 fn close_if_expired(state: &mut State, now: u64) {
@@ -630,5 +692,52 @@ mod tests {
             method_for_secret("AAECAwQFBgcICQoLDA0ODw"),
             PairMethod::Token
         );
+    }
+
+    #[test]
+    fn lan_addresses_rank_ipv4_first_and_skip_virtual_interfaces() {
+        let ip = |s: &str| s.parse::<IpAddr>().expect("ip");
+        let candidates = vec![
+            ("docker0".to_owned(), ip("172.17.0.1")),
+            ("wlan0".to_owned(), ip("2001:db8::5")),
+            ("eth0".to_owned(), ip("203.0.113.9")),
+            ("wlan0".to_owned(), ip("192.168.1.20")),
+            ("eth1".to_owned(), ip("10.0.0.7")),
+            ("eth1".to_owned(), ip("10.0.0.7")),
+            ("wlan0".to_owned(), ip("fd00::20")),
+        ];
+        assert_eq!(
+            rank_lan_addresses(candidates),
+            vec![
+                ip("10.0.0.7"),
+                ip("192.168.1.20"),
+                ip("203.0.113.9"),
+                ip("2001:db8::5"),
+                ip("fd00::20"),
+            ]
+        );
+        // Only virtual interfaces: they are all there is, so they are shown.
+        assert_eq!(
+            rank_lan_addresses(vec![("tailscale0".to_owned(), ip("100.64.0.3"))]),
+            vec![ip("100.64.0.3")]
+        );
+        assert!(rank_lan_addresses(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn lan_addresses_start_with_the_pairing_address() {
+        let all = lan_addresses();
+        if let Some(best) = lan_ipv4() {
+            // The best IPv4 may sit on a virtual interface only when there is no other.
+            if all.first().is_some_and(IpAddr::is_ipv4) {
+                assert!(all.contains(&IpAddr::V4(best)), "{all:?} / {best}");
+            }
+        }
+        for addr in &all {
+            assert!(!addr.is_loopback(), "{addr}");
+            if let IpAddr::V6(v6) = addr {
+                assert_ne!(v6.segments()[0] & 0xffc0, 0xfe80, "{addr}");
+            }
+        }
     }
 }

@@ -42,6 +42,13 @@ String formatUnixDate(int unixSeconds) {
   return '${d.year}-${two(d.month)}-${two(d.day)}';
 }
 
+/// Local wall-clock time of [time] as `HH:mm`.
+String formatClock(DateTime time) {
+  final local = time.toLocal();
+  String two(int v) => v.toString().padLeft(2, '0');
+  return '${two(local.hour)}:${two(local.minute)}';
+}
+
 /// Display name of a core platform string.
 String platformName(String platform) => switch (platform) {
   'windows' => 'Windows',

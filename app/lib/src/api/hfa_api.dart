@@ -74,6 +74,11 @@ abstract class HfaApi {
   /// Parses an `hfa://pair?...` URI (from a QR code or a pasted link).
   Future<PairingUriDto> parsePairingUri(String uri);
 
+  /// The device id (fingerprint) of a base64url static key, e.g. a hub key
+  /// from a pairing link, to find its device in [trustedPeers]. Throws for
+  /// text that is not a key.
+  Future<String> fingerprintOfKey(String keyB64);
+
   /// Starts the hub (idempotent).
   Future<HubStatusDto> hubStart();
 
@@ -95,7 +100,8 @@ abstract class HfaApi {
   /// Marks a stream as priority (it ducks the others).
   Future<void> hubSetPriority(int streamId, bool priority);
 
-  /// Sets the master linear gain (0..=4).
+  /// Sets and saves the master linear gain (0..=4); also while the hub is
+  /// stopped (every hub start applies the saved value).
   Future<void> hubSetMasterGain(double gain);
 
   /// Opens a pairing window (PIN + QR URI).

@@ -2144,6 +2144,103 @@ writes `app/assets/licenses/rust.txt` (entries separated by a line of 80 `-`; ea
 empty line, text), including libopus' `COPYING`; `main()` registers it with `LicenseRegistry`
 (`lib/src/licenses.dart`). Regenerate it after changing `core/Cargo.lock`.
 
+### 8.13 Refinements made by `feat/app-polish` (the code in `app/lib`, `core/hfa-ffi` and `core/hfa-core` is authoritative; overrides §6.5, §8.7, §8.9.1 and §8.12 where they differ)
+
+**Master gain persisted by the core** (replaces "the master gain is not persisted by the core" in §6.5 and the
+§8.7 "remembered while stopped and applied after `hubStart`"). `Settings.master_gain: f32` (serde default 1.0,
+validated finite and in `0.0..=MAX_GAIN` (4.0); older `settings.json` files load with 1.0). `HubEngine::start`
+sends it to the mixer as its first command, so a hub (app or `hfa hub`) plays at the saved volume from its first
+frame. `hub_set_master_gain(gain)` validates, **saves** `settings.json` (under the manager's lifecycle lock, the
+file written outside the state lock) and applies it to a running hub; it is **allowed while the hub is stopped**
+(no `HubNotRunning` any more; `NotInitialized` before `init_app`). `update_settings` keeps the saved gain (not a
+`SettingsDto` field). `HubStatusDto.master_gain` reports the saved value, also while stopped. Dart:
+`HubController` shows `HubStatusDto.masterGain` from its first status read (before any start), calls the core on
+every release of the slider (also while stopped), and on a refusal moves the slider back to the core's saved value.
+The "set it again after `hubStart`" step is gone.
+
+**Hub addresses.** `HubStatusDto.addresses: Vec<String>`: while running, `ip:port` per LAN address from
+`hfa_core::pairing::lan_addresses()` (up, non-point-to-point interfaces; IPv4 first in `lan_ipv4` order, so the
+pairing URI's address comes first; then IPv6 that is not link-local, as `[addr]:port`; addresses of virtual-looking
+interfaces (Docker, VM, VPN) are left out when a physical one has an address); empty while stopped. Listed on every
+`hub_status` call (outside the manager's state lock). `HubController` refreshes the status with every source poll,
+so addresses and `advertised` follow network changes. The hub header lists them (keys `hub-address-<i>`) with a copy
+button each (`copy-hub-address-<i>`).
+
+**Not discoverable.** While the hub runs with `advertised == false`, the header shows "Not discoverable — senders
+must add this hub by address" (key `not-discoverable`) and "Reason: <advertise_error>" when there is one.
+
+**Trust roles in the UI and CLI.** `TrustedPeerDto` gains `paired_as_hub` / `paired_as_sender` (from
+`TrustedPeer.roles`, §6.4). Settings → Trusted devices shows a "hub" and/or "sender" chip per peer
+(`peer-<id>-hub` / `peer-<id>-sender`); `hfa trust list` prints `DEVICE ID  NAME  ROLES  PAIRED AT (UTC)` with
+ROLES `hub`, `sender` or `hub, sender`. "Trusted" on the sender side now always means *trusted as a hub*:
+`HubInfoDto.trusted` (discovery) is true only for a peer with the hub role; `HubTarget.paired` is trusted only with
+`paired_as_hub`; the hub picker's "Paired" list shows only such peers; `currentHubTarget` counts only them, and a
+paired target that is no longer in the (loaded) trust store loses its trust. `HubTarget.needsPin` also covers a
+`paired` (remembered) target that is not trusted.
+
+**Identification before a broadcast (security fix of §8.12's iOS flow).** A hub key is not proof of a pairing.
+Without a PIN/token, `SenderController` prepares the iOS broadcast only when the trust store (`trusted_peers`, asked
+at that moment) holds the target's device id — or, for a key, `fingerprint_of_key(key)`; a key whose fingerprint is
+not the given device id identifies nothing — **with `paired_as_hub`**. Otherwise it fails with "Pair with this hub
+first: enter the PIN shown on it." and writes no broadcast config. New FFI function
+**`fingerprint_of_key(key_b64: String) -> Result<String>`** (base64url, padded or not, 32 bytes →
+`hfa_proto::fingerprint`). `FakeHfaApi.senderStart` models the core: only a peer with the hub role streams without
+a secret.
+
+**Last hub and source** (`app_prefs.json`, same file as §8.12's startup preference). `AppPrefs.lastHub` = `{name,
+deviceId?, host, port, hubKey?}` (never a PIN or token), `lastSource` = `{kind, appName?}`; written when a sender
+started here reaches `streaming` and when an iOS broadcast config was written. Loading: fields that do not fit are
+dropped (an entry without id and host is dropped). `SenderController` preselects them once the prefs load, unless
+the user chose a hub or source or started something first; the hub's trust comes from the trust store (`paired`
+origin with an id, else `manual`), a single app is found again by name in `list_capture_apps`. The home screen shows
+**"Send to <hub> · <source>"** (key `send-to-last-hub`) while no sender is live: it selects them
+(`SenderController.useRemembered`, which awaits the trust store), starts like the Start button (PIN dialog when the
+hub is not trusted as a hub) unless the source is the iOS broadcast or an app that does not run now, and opens the
+sender screen.
+
+**Sender status chips.** While live, the sender card shows `hub_muted` → "Muted on the hub" (`hub-muted-chip`),
+otherwise a `hub_gain` that rounds to another percentage than 100 → "Volume x% on the hub" (`hub-volume-chip`), and
+`hub_priority` → "Priority" (`hub-priority-chip`).
+
+**iOS broadcast state (consumer side of the channel contract shared with `feat/ios-native`).** Method
+**`getBroadcastStatus`** → a map, and EventChannel event **`{type: "broadcastStatus", state, message?, hubName?,
+updatedAtMs?}`**, `state` ∈ `idle|connecting|streaming|reconnecting|failed|stopped`. `BroadcastStatus.fromMap`
+also accepts the older answer `{broadcasting, state?, message?, timestamp?}` of §8.9.1: its `started` / `finished`
+states, `broadcasting: true` without a known state → `streaming`, `finished` → `stopped`, `broadcasting: false`
+with a running state → `stopped`, `timestamp` in seconds (or milliseconds when > 1e11); anything unknown → `idle`.
+`broadcastStarted` / `broadcastFinished` keep working. On iOS the sender controller asks `getBroadcastStatus` when
+it is built and on every app resume (`AppLifecycleListener.onResume`); a `failed` state shows its message as the
+error. The sender card (broadcast source) titles the state ("Broadcast connecting…", "Broadcasting", "Broadcast
+reconnecting…", "Broadcast failed", "Broadcast stopped") and shows a line (key `broadcast-status`) with the hub,
+the message and the update time. Other platforms are never asked; a `MissingPluginException` (not implemented)
+from this or any other optional method (`_invokeOptional`) is a `null` answer that does **not** mark the channel as
+unavailable.
+
+**In-app help.** `url_launcher` (6.3) opens links in the browser (`LaunchMode.externalApplication`; where that
+fails the link is copied and a snack bar says so; `linkOpenerProvider` is overridden in tests). About: "Help & user
+guide" (key `help-guide`) → `https://github.com/shDavlatbek/headphone-for-all/blob/main/docs/USER_GUIDE.md`; the
+other links open too (a copy button copies). Android source "This device's audio": **"Which apps work?"**
+(`android-apps-link`) → `docs/ANDROID_APPS.md` on GitHub. iOS source "Screen broadcast": a note (key
+`ios-recording-note`) that iOS shows the red recording indicator while broadcasting, that only audio is sent, and
+that tapping the indicator stops it. The plugin registrants under `app/{linux,macos,windows}/flutter` are
+regenerated by `flutter pub get`.
+
+**Start at sign-in (§8.10 `--autostart` completed).** Linux runner: `--autostart` makes the first frame leave the
+window hidden (like the Windows runner), and an autostart launch that finds the app already running
+(`g_application_get_is_remote`) exits without activating it. Settings shows **"Start at sign-in, hidden in the
+tray"** (key `start-at-sign-in`) on Linux: `XdgSignInLauncher` writes / deletes
+`$XDG_CONFIG_HOME/autostart/io.github.shdavlatbek.hfa.desktop` (`Exec=<executable or $APPIMAGE> --autostart`,
+quoted per the Desktop Entry spec; reading it back honours `Hidden=true` / `X-GNOME-Autostart-enabled=false`); in a
+Flatpak (`/.flatpak-info`) `FlatpakSignInLauncher` calls `org.freedesktop.portal.Background.RequestBackground`
+(`autostart`, `commandline: [headphone_for_all, --autostart]`) and the switch shows the choice recorded in
+`AppPrefs.startAtSignIn`. Windows and macOS show a hint instead (`sign-in-hint`): the installer's sign-in task, and
+System Settings → Login Items (the app registers no login item; a login-item launch shows the window).
+
+**macOS App Nap for senders** (the §8.9.1 follow-up). New channel methods **`beginStreaming` / `endStreaming`**
+(macOS: a second `ProcessInfo` activity token, `.userInitiated` + `.latencyCritical`, idempotent, independent of the
+hub's). `SenderController` calls `beginStreaming` before a Rust-capture `senderStart` on macOS only, and
+`endStreaming` on stop, on a failed start and when the sender ends by itself.
+
 ## 9. Work packages and file ownership
 
 | WP / branch | Owns |

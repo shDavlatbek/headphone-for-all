@@ -4,6 +4,11 @@ import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/bootstrap.dart';
 import 'package:headphone_for_all/src/state/navigation.dart';
 
+import 'package:headphone_for_all/src/models/hub_target.dart';
+import 'package:headphone_for_all/src/models/source_choice.dart';
+import 'package:headphone_for_all/src/state/app_prefs.dart';
+import 'package:headphone_for_all/src/state/sender_controller.dart';
+
 import 'helpers.dart';
 
 void main() {
@@ -95,7 +100,13 @@ void main() {
           ),
         ],
         trusted: const [
-          TrustedPeerDto(deviceId: 'p1', name: 'Tablet', pairedAtUnix: 0),
+          TrustedPeerDto(
+            deviceId: 'p1',
+            name: 'Tablet',
+            pairedAtUnix: 0,
+            pairedAsHub: true,
+            pairedAsSender: true,
+          ),
         ],
       )..addSource(FakeHfaApi.source(streamId: 1, label: 'A long app label'));
       final container = await pumpApp(tester, fake, size: size);
@@ -123,5 +134,59 @@ void main() {
     expect(find.text('libhfa_ffi.so not found'), findsOneWidget);
     await tester.tap(find.text('Try again'));
     expect(retried, 1);
+  });
+
+  testWidgets('home offers to send to the last hub again', (tester) async {
+    final fake = FakeHfaApi(trusted: [FakeHfaApi.peer(deviceId: 'hub-1')]);
+    final container = await pumpApp(tester, fake);
+    expect(find.byKey(const Key('send-to-last-hub')), findsNothing);
+    container
+        .read(appPrefsProvider.notifier)
+        .rememberSend(
+          const HubTarget(
+            name: 'Desk PC',
+            origin: HubOrigin.discovered,
+            host: '192.168.1.20',
+            port: 47810,
+            deviceId: 'hub-1',
+            trusted: true,
+          ),
+          const SourceChoice(SourceKind.tone),
+        );
+    await tester.pumpAndSettle();
+    expect(find.text('Send to Desk PC · Test tone (440 Hz)'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('send-to-last-hub')));
+    await tester.pumpAndSettle();
+    // Paired: no PIN asked; it streams and the sender screen shows it.
+    expect(fake.lastSenderStart?.hubDeviceId, 'hub-1');
+    expect(fake.lastSenderStart?.pairingSecret, isNull);
+    expect(container.read(sectionProvider), AppSection.sender);
+    expect(container.read(senderControllerProvider).isLive, isTrue);
+    await unmount(tester);
+  });
+
+  testWidgets('a remembered hub that was forgotten asks for a PIN', (
+    tester,
+  ) async {
+    final fake = FakeHfaApi();
+    final container = await pumpApp(tester, fake);
+    container
+        .read(appPrefsProvider.notifier)
+        .rememberSend(
+          const HubTarget(
+            name: 'Desk PC',
+            origin: HubOrigin.paired,
+            deviceId: 'hub-1',
+            hubKey: 'AQID',
+            trusted: true,
+          ),
+          const SourceChoice(SourceKind.tone),
+        );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('send-to-last-hub')));
+    await tester.pumpAndSettle();
+    expect(find.byType(AlertDialog), findsOneWidget, reason: 'PIN dialog');
+    expect(fake.calls, isNot(contains('senderStart')));
+    await unmount(tester);
   });
 }

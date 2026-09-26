@@ -48,7 +48,9 @@ class HubTarget {
 
   /// A paired device that is not currently discovered: the core looks it up
   /// over mDNS by id (no [address]), or it is dialled at its last known
-  /// [address] (iOS, which cannot browse mDNS).
+  /// [address] (iOS, which cannot browse mDNS). It is [trusted] only if this
+  /// device paired with it as a sender ([TrustedPeerDto.pairedAsHub]); a peer
+  /// that only paired with this device's hub still needs a PIN.
   factory HubTarget.paired(TrustedPeerDto peer, {HubAddress? address}) =>
       HubTarget(
         name: peer.name,
@@ -56,7 +58,7 @@ class HubTarget {
         host: address?.host ?? '',
         port: address?.port ?? 0,
         deviceId: peer.deviceId,
-        trusted: true,
+        trusted: peer.pairedAsHub,
       );
 
   /// A hub from a scanned QR code or pasted link: key and one-time token
@@ -103,7 +105,9 @@ class HubTarget {
   /// PIN or one-time token to pair with.
   final String? pairingSecret;
 
-  /// This device already trusts the hub (or holds its key from a QR code).
+  /// This device already trusts the hub as a hub (from the trust store), or
+  /// holds a one-time token for it from a QR code. A hub key alone is not
+  /// trust: see `SenderController` for how a start decides.
   final bool trusted;
 
   /// Hub platform, when known.
@@ -119,11 +123,14 @@ class HubTarget {
     return port == 0 ? h : '$h:$port';
   }
 
-  /// Starting needs a PIN first: the hub is known not to trust us and no
-  /// secret is at hand. (A manual target may be paired already, so the core
-  /// decides; it fails with "pairing required" if not.)
+  /// Starting needs a PIN first: the hub is known not to be paired (a
+  /// discovered hub, or a paired / remembered one that is not in the trust
+  /// store as a hub) and no secret is at hand. (A manual target may be paired
+  /// already, so the core decides; it fails with "pairing required" if not.)
   bool get needsPin =>
-      origin == HubOrigin.discovered && !trusted && pairingSecret == null;
+      (origin == HubOrigin.discovered || origin == HubOrigin.paired) &&
+      !trusted &&
+      pairingSecret == null;
 
   /// A copy with [pin] as the pairing secret.
   HubTarget withPin(String? pin) => HubTarget(
@@ -218,12 +225,15 @@ class HubAddress {
 /// looked up again by device id in [discovered] (visible hubs by id) and
 /// [peers], so a new address, port or trust state is used; [addresses] are
 /// the last known addresses of paired hubs that are not discovered (iOS).
-/// A typed-in or scanned target, or one no longer known, is returned as is.
-/// A PIN or token the user entered is kept.
+/// A peer counts as trusted only when this device paired with it as a hub
+/// ([TrustedPeerDto.pairedAsHub]); [peers] is `null` while the trust store
+/// is still loading (trust is then left as it is). A typed-in or
+/// scanned target is returned as is; one no longer known keeps its fields but
+/// loses its trust. A PIN or token the user entered is kept.
 HubTarget currentHubTarget(
   HubTarget target, {
   required Map<String, HubInfoDto> discovered,
-  required List<TrustedPeerDto> peers,
+  required List<TrustedPeerDto>? peers,
   Map<String, HubAddress> addresses = const {},
 }) {
   final id = target.deviceId;
@@ -233,12 +243,27 @@ HubTarget currentHubTarget(
     return target;
   }
   final hub = discovered[id];
-  final peer = peers.where((p) => p.deviceId == id).firstOrNull;
+  final peer = peers?.where((p) => p.deviceId == id).firstOrNull;
+  final pairedAsHub = peer?.pairedAsHub ?? false;
   final HubTarget fresh;
   if (hub != null) {
-    fresh = HubTarget.discovered(hub, trusted: hub.trusted || peer != null);
+    fresh = HubTarget.discovered(hub, trusted: hub.trusted || pairedAsHub);
   } else if (peer != null) {
     fresh = HubTarget.paired(peer, address: addresses[id]);
+  } else if (peers != null &&
+      target.trusted &&
+      target.origin == HubOrigin.paired) {
+    // Forgotten since it was selected: it needs a PIN again.
+    return HubTarget(
+      name: target.name,
+      origin: target.origin,
+      host: target.host,
+      port: target.port,
+      deviceId: id,
+      hubKey: target.hubKey,
+      pairingSecret: target.pairingSecret,
+      platform: target.platform,
+    );
   } else {
     return target;
   }

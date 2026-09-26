@@ -7,6 +7,9 @@ import 'package:headphone_for_all/src/state/hub_controller.dart';
 import 'package:headphone_for_all/src/state/sender_controller.dart';
 import 'package:headphone_for_all/src/state/navigation.dart';
 
+import 'package:flutter/services.dart';
+import 'package:headphone_for_all/src/util/links.dart';
+
 import 'helpers.dart';
 
 void main() {
@@ -86,6 +89,8 @@ void main() {
           deviceId: 'hub-1',
           name: 'Desk',
           pairedAtUnix: 1700000000,
+          pairedAsHub: true,
+          pairedAsSender: true,
         ),
       ],
     );
@@ -196,11 +201,15 @@ void main() {
           deviceId: 'aaaa-1111',
           name: 'Phone',
           pairedAtUnix: 1767225600,
+          pairedAsHub: true,
+          pairedAsSender: true,
         ),
         const TrustedPeerDto(
           deviceId: 'bbbb-2222',
           name: 'Tablet',
           pairedAtUnix: 1767225600,
+          pairedAsHub: true,
+          pairedAsSender: true,
         ),
       ],
     );
@@ -231,6 +240,124 @@ void main() {
     await tester.tap(find.byKey(const Key('licences')));
     await tester.pumpAndSettle();
     expect(find.byType(LicensePage), findsOneWidget);
+    await unmount(tester);
+  });
+
+  testWidgets('trusted devices show how they were paired', (tester) async {
+    final fake = FakeHfaApi(
+      trusted: [
+        FakeHfaApi.peer(deviceId: 'hub-1', name: 'Desk PC'),
+        FakeHfaApi.peer(
+          deviceId: 'phone-1',
+          name: 'Phone',
+          asHub: false,
+          asSender: true,
+        ),
+        FakeHfaApi.peer(deviceId: 'old-1', name: 'Old laptop', asSender: true),
+      ],
+    );
+    await pumpApp(tester, fake, section: AppSection.settings);
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('peer-old-1')),
+      300,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.byKey(const Key('peer-hub-1-hub')), findsOneWidget);
+    expect(find.byKey(const Key('peer-hub-1-sender')), findsNothing);
+    expect(find.byKey(const Key('peer-phone-1-hub')), findsNothing);
+    expect(find.byKey(const Key('peer-phone-1-sender')), findsOneWidget);
+    expect(find.byKey(const Key('peer-old-1-hub')), findsOneWidget);
+    expect(find.byKey(const Key('peer-old-1-sender')), findsOneWidget);
+    await unmount(tester);
+  });
+
+  testWidgets('Linux switches starting at sign-in', (tester) async {
+    final signIn = MemorySignInLauncher();
+    await pumpApp(
+      tester,
+      FakeHfaApi(),
+      section: AppSection.settings,
+      signIn: signIn,
+    );
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('start-at-sign-in')),
+      300,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.byKey(const Key('sign-in-hint')), findsNothing);
+    await tester.tap(find.byKey(const Key('start-at-sign-in')));
+    await tester.pumpAndSettle();
+    expect(signIn.enabled, isTrue);
+    expect(
+      tester
+          .widget<SwitchListTile>(find.byKey(const Key('start-at-sign-in')))
+          .value,
+      isTrue,
+    );
+    await tester.tap(find.byKey(const Key('start-at-sign-in')));
+    await tester.pumpAndSettle();
+    expect(signIn.enabled, isFalse);
+    await unmount(tester);
+  });
+
+  testWidgets('Windows says where starting at sign-in is switched', (
+    tester,
+  ) async {
+    await pumpApp(
+      tester,
+      FakeHfaApi(platform: 'windows'),
+      section: AppSection.settings,
+    );
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('sign-in-hint')),
+      300,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.byKey(const Key('start-at-sign-in')), findsNothing);
+    expect(find.textContaining('installer'), findsOneWidget);
+    await unmount(tester);
+  });
+
+  testWidgets('about opens the user guide; without a browser it copies', (
+    tester,
+  ) async {
+    final links = RecordingLinkOpener();
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map)['text'] as String?;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    await pumpApp(
+      tester,
+      FakeHfaApi(),
+      section: AppSection.about,
+      links: links,
+    );
+    await tester.tap(find.byKey(const Key('help-guide')));
+    await tester.pumpAndSettle();
+    expect(links.opened, [
+      Uri.parse(
+        'https://github.com/shDavlatbek/headphone-for-all/blob/main/docs/USER_GUIDE.md',
+      ),
+    ]);
+    expect(copied, isNull);
+
+    links.opens = false;
+    await tester.tap(find.byKey(const Key('help-guide')));
+    await tester.pumpAndSettle();
+    expect(copied, userGuideUrl);
+    expect(find.textContaining('Link copied'), findsOneWidget);
     await unmount(tester);
   });
 }

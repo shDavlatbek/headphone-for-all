@@ -26,6 +26,10 @@ enum NativeEventType {
   /// iOS: the broadcast extension finished.
   broadcastFinished,
 
+  /// iOS: the broadcast's state changed (`{type: "broadcastStatus", state,
+  /// message, hubName, updatedAtMs}`, see [BroadcastStatus]).
+  broadcastStatus,
+
   /// An event type this app version does not know.
   unknown,
 }
@@ -34,9 +38,10 @@ enum NativeEventType {
 @immutable
 class NativeEvent {
   /// Creates an event.
-  const NativeEvent(this.type, {this.message});
+  const NativeEvent(this.type, {this.message, this.broadcast});
 
-  /// Parses the `{type, message?}` map sent by native code.
+  /// Parses the `{type, message?}` map sent by native code (a
+  /// `broadcastStatus` event also carries [broadcast]).
   factory NativeEvent.fromMap(Object? raw) {
     if (raw is! Map) return const NativeEvent(NativeEventType.unknown);
     final type = switch (raw['type']) {
@@ -44,10 +49,17 @@ class NativeEvent {
       'captureError' => NativeEventType.captureError,
       'broadcastStarted' => NativeEventType.broadcastStarted,
       'broadcastFinished' => NativeEventType.broadcastFinished,
+      'broadcastStatus' => NativeEventType.broadcastStatus,
       _ => NativeEventType.unknown,
     };
     final message = raw['message'];
-    return NativeEvent(type, message: message is String ? message : null);
+    return NativeEvent(
+      type,
+      message: message is String ? message : null,
+      broadcast: type == NativeEventType.broadcastStatus
+          ? BroadcastStatus.fromMap(raw)
+          : null,
+    );
   }
 
   /// What happened.
@@ -56,15 +68,134 @@ class NativeEvent {
   /// Optional human-readable detail.
   final String? message;
 
+  /// The broadcast's state, for [NativeEventType.broadcastStatus].
+  final BroadcastStatus? broadcast;
+
   @override
   bool operator ==(Object other) =>
-      other is NativeEvent && other.type == type && other.message == message;
+      other is NativeEvent &&
+      other.type == type &&
+      other.message == message &&
+      other.broadcast == broadcast;
 
   @override
-  int get hashCode => Object.hash(type, message);
+  int get hashCode => Object.hash(type, message, broadcast);
 
   @override
-  String toString() => 'NativeEvent($type, $message)';
+  String toString() => 'NativeEvent($type, $message, $broadcast)';
+}
+
+/// State of the iOS broadcast extension (docs/CONTRACTS.md §8.9).
+enum BroadcastState {
+  /// No broadcast runs (none started, or its status is unknown).
+  idle,
+
+  /// The extension started and connects to the hub.
+  connecting,
+
+  /// Audio streams to the hub.
+  streaming,
+
+  /// The connection was lost; the extension reconnects.
+  reconnecting,
+
+  /// The broadcast ended with an error ([BroadcastStatus.message]).
+  failed,
+
+  /// The broadcast was stopped.
+  stopped;
+
+  /// Whether the extension runs in this state.
+  bool get isRunning =>
+      this == connecting || this == streaming || this == reconnecting;
+}
+
+/// What the broadcast extension reports: the answer of `getBroadcastStatus`
+/// and the payload of a `broadcastStatus` event.
+@immutable
+class BroadcastStatus {
+  /// Creates a status.
+  const BroadcastStatus({
+    required this.state,
+    this.message,
+    this.hubName,
+    this.updatedAt,
+  });
+
+  /// Parses the contract map `{state, message?, hubName?, updatedAtMs?}`.
+  ///
+  /// Also accepts the older shape `{broadcasting, state?, message?,
+  /// timestamp?}` (the extension's `broadcast_status.json` states `started` /
+  /// `finished`, a Unix `timestamp` in seconds or milliseconds): without a
+  /// known state, `broadcasting: true` means [BroadcastState.streaming] and
+  /// `finished` means [BroadcastState.stopped]. Anything unknown is
+  /// [BroadcastState.idle].
+  factory BroadcastStatus.fromMap(Map<Object?, Object?> raw) {
+    final broadcasting = raw['broadcasting'] == true;
+    final state = switch (raw['state']) {
+      'idle' => BroadcastState.idle,
+      'connecting' => BroadcastState.connecting,
+      'streaming' => BroadcastState.streaming,
+      'reconnecting' => BroadcastState.reconnecting,
+      'failed' => BroadcastState.failed,
+      'stopped' || 'finished' => BroadcastState.stopped,
+      _ when broadcasting => BroadcastState.streaming,
+      _ => BroadcastState.idle,
+    };
+    final message = raw['message'];
+    final hubName = raw['hubName'];
+    return BroadcastStatus(
+      // A legacy answer may say "not broadcasting" with a stale running state.
+      state: raw.containsKey('broadcasting') && !broadcasting && state.isRunning
+          ? BroadcastState.stopped
+          : state,
+      message: message is String && message.trim().isNotEmpty
+          ? message.trim()
+          : null,
+      hubName: hubName is String && hubName.isNotEmpty ? hubName : null,
+      updatedAt:
+          _time(raw['updatedAtMs'], milliseconds: true) ??
+          _time(raw['timestamp'], milliseconds: false),
+    );
+  }
+
+  /// Nothing is known about a broadcast.
+  static const idle = BroadcastStatus(state: BroadcastState.idle);
+
+  /// The state.
+  final BroadcastState state;
+
+  /// Why it failed or stopped, or a hint.
+  final String? message;
+
+  /// The hub the extension streams to, once known.
+  final String? hubName;
+
+  /// When the extension last updated it.
+  final DateTime? updatedAt;
+
+  /// A number of milliseconds, or of seconds unless [milliseconds] (a value
+  /// larger than any date in seconds is taken as milliseconds).
+  static DateTime? _time(Object? raw, {required bool milliseconds}) {
+    if (raw is! num || !raw.isFinite || raw <= 0) return null;
+    final ms = milliseconds || raw > 1e11 ? raw : raw * 1000;
+    return DateTime.fromMillisecondsSinceEpoch(ms.round());
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is BroadcastStatus &&
+      other.state == state &&
+      other.message == message &&
+      other.hubName == hubName &&
+      other.updatedAt == updatedAt;
+
+  @override
+  int get hashCode => Object.hash(state, message, hubName, updatedAt);
+
+  @override
+  String toString() =>
+      'BroadcastStatus($state, $message, $hubName, $updatedAt)';
 }
 
 /// Result of [NativeChannel.captureSupport].
@@ -174,6 +305,18 @@ class NativeChannel {
     }
   }
 
+  /// Invokes [method], which only some platforms implement; returns `null`
+  /// where it is missing. Unlike [_invoke] this says nothing about whether
+  /// the channel exists (Android and iOS answer unknown methods with
+  /// "not implemented", which arrives as a [MissingPluginException] too).
+  Future<T?> _invokeOptional<T>(String method, [Object? arguments]) async {
+    try {
+      return await _methods.invokeMethod<T>(method, arguments);
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
   /// Whether the native side implements the channel (probed once with
   /// `getDataDir`, or known from an earlier call).
   Future<bool> isAvailable() async {
@@ -249,6 +392,23 @@ class NativeChannel {
   /// iOS: writes `broadcast_config.json` for the broadcast extension.
   Future<void> writeBroadcastConfig(BroadcastConfig config) =>
       _invoke<void>('writeBroadcastConfig', config.toMap());
+
+  /// iOS: the broadcast extension's state (`getBroadcastStatus`), or `null`
+  /// where the platform does not implement it (every other platform).
+  Future<BroadcastStatus?> getBroadcastStatus() async {
+    final raw = await _invokeOptional<Map<Object?, Object?>>(
+      'getBroadcastStatus',
+    );
+    return raw == null ? null : BroadcastStatus.fromMap(raw);
+  }
+
+  /// macOS: holds an activity assertion while this device sends, so App Nap
+  /// does not throttle a sender whose window is hidden (docs/CONTRACTS.md
+  /// §8.9). A no-op elsewhere.
+  Future<void> beginStreaming() => _invokeOptional<void>('beginStreaming');
+
+  /// Ends what [beginStreaming] began (idempotent).
+  Future<void> endStreaming() => _invokeOptional<void>('endStreaming');
 
   /// Whether native capture is supported, or `null` where the platform has no
   /// native capture (desktop: Rust captures directly).

@@ -36,6 +36,8 @@ class _MockRustLibApi implements RustLibApi {
     deviceName: 'Mock',
     sourceCount: 0,
     advertised: true,
+    masterGain: 1,
+    addresses: ['192.168.1.2:1'],
   );
 
   @override
@@ -48,6 +50,7 @@ class _MockRustLibApi implements RustLibApi {
       'crateApiAppGetSettings' => Future.value(settings),
       'crateApiAppListOutputDevices' => Future.value(<String>['out']),
       'crateApiAppTrustedPeers' => Future.value(<TrustedPeerDto>[]),
+      'crateApiAppFingerprintOfKey' => Future.value('ab12-cd34-ef56-7890'),
       'crateApiAppParsePairingUri' => Future.value(
         const PairingUriDto(
           host: 'h',
@@ -118,6 +121,11 @@ void main() {
     (name, args) = await single(() => api.parsePairingUri('hfa://pair'));
     expect(name, 'crateApiAppParsePairingUri');
     expect(args, {#uri: 'hfa://pair'});
+
+    mock.calls.clear();
+    expect(await api.fingerprintOfKey('AQID'), 'ab12-cd34-ef56-7890');
+    expect(mock.calls.single.$1, 'crateApiAppFingerprintOfKey');
+    expect(mock.calls.single.$2, {#keyB64: 'AQID'});
 
     for (final (call, expected) in <(Future<Object?> Function(), String)>[
       (api.getSettings, 'crateApiAppGetSettings'),

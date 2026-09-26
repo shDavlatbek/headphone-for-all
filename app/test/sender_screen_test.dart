@@ -3,6 +3,9 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:headphone_for_all/src/api/hfa_api.dart';
 import 'package:headphone_for_all/src/state/navigation.dart';
 
+import 'package:headphone_for_all/src/platform/native_channel.dart';
+import 'package:headphone_for_all/src/util/links.dart';
+
 import 'helpers.dart';
 
 const deskHub = HubInfoDto(
@@ -32,11 +35,15 @@ FakeHfaApi senderFake({String platform = 'linux'}) {
         deviceId: deskHub.deviceId,
         name: deskHub.name,
         pairedAtUnix: 1767225600,
+        pairedAsHub: true,
+        pairedAsSender: true,
       ),
       const TrustedPeerDto(
         deviceId: 'old0-0000-0000-0003',
         name: 'Old laptop',
         pairedAtUnix: 1735689600,
+        pairedAsHub: true,
+        pairedAsSender: true,
       ),
     ],
     captureApps: const [
@@ -391,6 +398,102 @@ void main() {
       find.textContaining('scan its QR code (Pair a device) or add it by'),
       findsOneWidget,
     );
+    await unmount(tester);
+  });
+
+  testWidgets('a live sender shows what the hub does with its stream', (
+    tester,
+  ) async {
+    final fake = senderFake();
+    await pumpApp(tester, fake, section: AppSection.sender);
+    SenderStatusDto live({
+      double gain = 1,
+      bool muted = false,
+      bool prio = false,
+    }) => SenderStatusDto(
+      state: 'streaming',
+      hubName: 'Desk PC',
+      bitrate: 128000,
+      lossPct: 0,
+      rttMs: 3,
+      levelDb: -20,
+      hubGain: gain,
+      hubMuted: muted,
+      hubPriority: prio,
+    );
+    fake.emitSenderStatus(live());
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('hub-muted-chip')), findsNothing);
+    expect(find.byKey(const Key('hub-volume-chip')), findsNothing);
+    expect(find.byKey(const Key('hub-priority-chip')), findsNothing);
+
+    fake.emitSenderStatus(live(gain: 0.4, prio: true));
+    await tester.pumpAndSettle();
+    expect(find.text('Volume 40% on the hub'), findsOneWidget);
+    expect(find.text('Priority'), findsOneWidget);
+
+    fake.emitSenderStatus(live(gain: 0.4, muted: true));
+    await tester.pumpAndSettle();
+    expect(find.text('Muted on the hub'), findsOneWidget);
+    expect(find.byKey(const Key('hub-volume-chip')), findsNothing);
+    expect(find.byKey(const Key('hub-priority-chip')), findsNothing);
+
+    // Not shown once the sender stopped.
+    fake.emitSenderStatus(idleSenderStatus);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('hub-muted-chip')), findsNothing);
+    await unmount(tester);
+  });
+
+  testWidgets('iOS shows the broadcast state and explains the red indicator', (
+    tester,
+  ) async {
+    final fake = FakeHfaApi(platform: 'ios');
+    final native = RecordingNativeChannel()
+      ..broadcastStatusAnswer = const BroadcastStatus(
+        state: BroadcastState.reconnecting,
+        hubName: 'Desk PC',
+        message: 'The network changed.',
+      );
+    await pumpApp(tester, fake, native: native, section: AppSection.sender);
+    expect(find.byKey(const Key('ios-recording-note')), findsOneWidget);
+    expect(find.textContaining('red recording indicator'), findsOneWidget);
+    expect(find.text('Broadcast reconnecting…'), findsOneWidget);
+    expect(
+      find.text(
+        'Connection to Desk PC lost, reconnecting. The network changed.',
+      ),
+      findsOneWidget,
+    );
+
+    native.emit(
+      const NativeEvent(
+        NativeEventType.broadcastStatus,
+        broadcast: BroadcastStatus(
+          state: BroadcastState.streaming,
+          hubName: 'Desk PC',
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Broadcasting'), findsOneWidget);
+    expect(find.text('Sending to Desk PC.'), findsOneWidget);
+    await unmount(tester);
+  });
+
+  testWidgets('Android links to the list of apps that can be captured', (
+    tester,
+  ) async {
+    final links = RecordingLinkOpener();
+    await pumpApp(
+      tester,
+      FakeHfaApi(platform: 'android'),
+      section: AppSection.sender,
+      links: links,
+    );
+    await tester.tap(find.byKey(const Key('android-apps-link')));
+    await tester.pumpAndSettle();
+    expect(links.opened, [Uri.parse(androidAppsUrl)]);
     await unmount(tester);
   });
 }

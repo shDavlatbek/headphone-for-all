@@ -60,6 +60,11 @@ pub struct SettingsDto {
 }
 
 /// A paired device.
+///
+/// Pairing grants trust in one direction (CONTRACTS §6.4 refinements): this device streams
+/// only to peers it paired with as a sender (`paired_as_hub`), and its hub accepts only
+/// peers that paired with it (`paired_as_sender`). Entries from before roles existed have
+/// both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedPeerDto {
     /// Device id (fingerprint).
@@ -68,6 +73,10 @@ pub struct TrustedPeerDto {
     pub name: String,
     /// Unix time (seconds) of pairing.
     pub paired_at_unix: i64,
+    /// Trusted as a hub: this device paired with it and may stream to it without a PIN.
+    pub paired_as_hub: bool,
+    /// Trusted as a sender: it paired with this device's hub and may stream into it.
+    pub paired_as_sender: bool,
 }
 
 /// A parsed `hfa://pair?...` URI (from a QR code).
@@ -134,6 +143,14 @@ pub fn trusted_peers() -> anyhow::Result<Vec<TrustedPeerDto>> {
 /// hub disconnects that sender, and a sender streaming to that hub stops (pairing required).
 pub fn forget_peer(device_id: String) -> anyhow::Result<()> {
     Ok(manager()?.forget_peer(&device_id)?)
+}
+
+/// The device id (fingerprint, `ab12-cd34-ef56-7890`) of a static key given as base64url
+/// (padded or not, e.g. `PairingUriDto.hub_id`), to look the key's device up in
+/// `trusted_peers`. Fails for text that is not a 32-byte base64url key.
+pub fn fingerprint_of_key(key_b64: String) -> anyhow::Result<String> {
+    let key = crate::hub_target::decode_key(&key_b64)?;
+    Ok(hfa_proto::fingerprint(&key))
 }
 
 /// Parses a pairing URI scanned from a QR code.

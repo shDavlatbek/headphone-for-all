@@ -36,6 +36,25 @@ The home screen asks what this device does:
 You can switch roles at any time. On desktop the window can be closed while the hub or a sender runs:
 the app keeps running in the tray / menu bar; use **Quit** in the tray menu to stop it.
 
+**Next time** the Sender section preselects the hub and source you last sent with, and the home screen
+offers **Send to <hub>** to start again with one tap (if that hub was forgotten since, it asks for a
+PIN first). The hub's **master volume** is remembered too, also across restarts.
+
+**What the screens tell you:**
+
+- **Hub header:** the addresses senders can type into "Add by address" (IPv4 first, IPv6 in
+  brackets), each with a copy button. **"Not discoverable — senders must add this hub by address"**
+  means the hub could not announce itself on the network (the reason is shown below it): senders do
+  not list it, so add it by address or with the QR code.
+- **Sender card:** while sending, chips show what the hub does with your stream: **Muted on the hub**,
+  **Volume 40 % on the hub**, **Priority** (it ducks the other sources). These are set on the hub.
+- **Settings → Trusted devices:** each paired device carries a **hub** chip (this device sends to it
+  without a PIN) and/or a **sender** chip (it sends to this device's hub without a PIN). Pairing works
+  in one direction: a phone that paired with your PC's hub is not a hub your PC can send to. The CLI
+  shows the same in the ROLES column of `hfa trust list`.
+- **About → Help & user guide** opens this guide in the browser (if no browser opens, the link is
+  copied).
+
 ## 3. Pair a device
 
 Pairing happens once per sender–hub pair; after that they reconnect by themselves.
@@ -64,7 +83,8 @@ one on the hub.
   joined Wi-Fi is usually **Public**: set it to Private (Settings → Network & internet → the network →
   Network profile type) so the rule applies.
 - **"Start in the notification area when I sign in"** (installer option) starts the app hidden in the
-  tray at sign-in. It does not switch the hub on: open the app from the tray and start the hub.
+  tray at sign-in (run the installer again to change it). Switch on **Settings → Start the hub when the
+  app opens** as well, and the PC is a hub as soon as you sign in.
 - **Sender:** the captured audio still plays on the PC's own speakers; turn them down or mute the
   output device's speakers if they echo.
 - Capturing one app, or everything except this app, needs Windows 10 2004 or newer.
@@ -75,7 +95,11 @@ one on the hub.
   a sender starts. If you denied it, allow it in System Settings → Privacy & Security → Screen &
   System Audio Recording (the "System Audio Recording Only" list), then restart the sender. For the
   `hfa` command-line tool, the permission is asked for the terminal app you run it from.
-- While sending, macOS mutes the Mac's own output, so there is no echo.
+- While sending, macOS mutes the Mac's own output, so there is no echo. The app keeps App Nap away
+  while it sends or runs the hub, so a hidden window does not cause dropouts.
+- **Start at sign-in:** add Headphone for All in System Settings → General → Login Items (the app does
+  not register itself). With **Settings → Start the hub when the app opens** the Mac is a hub right
+  after you sign in.
 
 ### Linux
 
@@ -83,6 +107,11 @@ one on the hub.
   captures the monitor of the default output.
 - **Tray icon:** GNOME shows it only with the "AppIndicator and KStatusNotifierItem Support" extension;
   KDE, Xfce, Cinnamon and others show it directly.
+- **Start at sign-in:** Settings → **Start at sign-in, hidden in the tray** writes an autostart entry
+  (`~/.config/autostart/io.github.shdavlatbek.hfa.desktop`, starting the app with `--autostart`; for an
+  AppImage it points at the `.AppImage` file, so keep it where it is). The Flatpak asks the desktop
+  through its background portal instead (the desktop may ask you to allow it). Combine it with **Start
+  the hub when the app opens**.
 - **Firewall:** if you use `ufw` or `firewalld`, allow TCP and UDP port 47810 (and mDNS, UDP 5353) on
   the hub, e.g. `sudo ufw allow 47810` and `sudo ufw allow 5353/udp`.
 - In the Flatpak, "everything except this app" and single-app capture are limited by the sandbox;
@@ -94,7 +123,8 @@ one on the hub.
   then shows a persistent notification and a casting indicator while it captures; **Stop** in the
   notification ends it.
 - Apps can opt out of being captured, and calls are never captured: those stay silent. See
-  [ANDROID_APPS.md](ANDROID_APPS.md) for known apps and workarounds.
+  [ANDROID_APPS.md](ANDROID_APPS.md) for known apps and workarounds (the **Which apps work?** link
+  under the source opens it).
 - The phone keeps playing its own audio out loud; lower its volume or plug in wired earphones.
 - As a hub, allow notifications so the hub's notification (which keeps it running) is visible.
 
@@ -103,7 +133,9 @@ one on the hub.
 - iOS has no system-audio capture for apps; sending uses a **screen broadcast**. Start it with the
   button in the Sender section (or Control Center → long-press Screen Recording → Headphone for All →
   Start Broadcast). The status bar or Dynamic Island shows the **red recording indicator** while the
-  broadcast runs: that is normal and cannot be hidden. Only audio is sent, never the screen.
+  broadcast runs: that is normal and cannot be hidden. Only audio is sent, never the screen. The
+  Sender section explains this next to the source and shows the broadcast's state (connecting,
+  sending, reconnecting, failed with the reason, ended), also after the app was in the background.
 - **DRM-protected audio** (Apple Music, Netflix, many streaming apps) is silent in a broadcast; this is
   an iOS rule.
 - iOS does not list hubs on the network yet: pair with **Scan QR**, the pairing link, or the hub's
