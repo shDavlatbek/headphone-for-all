@@ -122,6 +122,13 @@ class HubController extends Notifier<HubState> {
   /// move the slider back.
   int _gainChanges = 0;
 
+  /// The master slider is being dragged ([previewMasterGain] was called and
+  /// [setMasterGain] has not run yet): a status read must not move it back.
+  bool _dragging = false;
+
+  /// The master gain in [state] is the user's, not the core's.
+  bool get _holdGain => _gainChanges > 0 || _dragging;
+
   HfaApi get _api => ref.read(hfaApiProvider);
 
   @override
@@ -144,7 +151,7 @@ class HubController extends Notifier<HubState> {
     try {
       final status = await _api.hubStatus();
       if (!ref.mounted) return;
-      if (_gainChanges == 0) {
+      if (!_holdGain) {
         state = state.copyWith(masterGain: status.masterGain);
       }
       if (!status.running || state.running || state.busy) return;
@@ -159,19 +166,21 @@ class HubController extends Notifier<HubState> {
   /// [state] with [status] applied, keeping a master gain that is being set.
   HubState _applyStatus(HubStatusDto status) {
     final next = state.withStatus(status);
-    return _gainChanges == 0
-        ? next
-        : next.copyWith(masterGain: state.masterGain);
+    return _holdGain ? next.copyWith(masterGain: state.masterGain) : next;
   }
 
   /// Reloads the running hub's status (addresses change with the network).
+  ///
+  /// The master gain is left alone: a running hub's gain only changes
+  /// through this controller, and a poll during a slider drag must not
+  /// snap the thumb back to the saved value.
   Future<void> refreshStatus() async {
     try {
       final status = await _api.hubStatus();
       if (!ref.mounted || !state.running || state.busy || !status.running) {
         return;
       }
-      state = _applyStatus(status);
+      state = state.withStatus(status).copyWith(masterGain: state.masterGain);
     } catch (e) {
       debugPrint('hub status: ${describeError(e)}');
     }
@@ -274,6 +283,7 @@ class HubController extends Notifier<HubState> {
 
   /// Shows [gain] on the master slider while it is dragged (no core call).
   void previewMasterGain(double gain) {
+    _dragging = true;
     state = state.copyWith(masterGain: gain);
   }
 
@@ -281,6 +291,8 @@ class HubController extends Notifier<HubState> {
   /// stopped) and every hub start applies it; if the core refuses, the
   /// slider goes back to the saved value.
   Future<void> setMasterGain(double gain) async {
+    // The drag ends here; the change in flight holds the value from now on.
+    _dragging = false;
     _gainChanges++;
     state = state.copyWith(masterGain: gain);
     try {

@@ -50,16 +50,21 @@ class HubTarget {
   /// over mDNS by id (no [address]), or it is dialled at its last known
   /// [address] (iOS, which cannot browse mDNS). It is [trusted] only if this
   /// device paired with it as a sender ([TrustedPeerDto.pairedAsHub]); a peer
-  /// that only paired with this device's hub still needs a PIN.
-  factory HubTarget.paired(TrustedPeerDto peer, {HubAddress? address}) =>
-      HubTarget(
-        name: peer.name,
-        origin: HubOrigin.paired,
-        host: address?.host ?? '',
-        port: address?.port ?? 0,
-        deviceId: peer.deviceId,
-        trusted: peer.pairedAsHub,
-      );
+  /// that only paired with this device's hub still needs a PIN. [hubKey] is
+  /// the hub's public key when it is known (e.g. a remembered hub).
+  factory HubTarget.paired(
+    TrustedPeerDto peer, {
+    HubAddress? address,
+    String? hubKey,
+  }) => HubTarget(
+    name: peer.name,
+    origin: HubOrigin.paired,
+    host: address?.host ?? '',
+    port: address?.port ?? 0,
+    deviceId: peer.deviceId,
+    hubKey: hubKey,
+    trusted: peer.pairedAsHub,
+  );
 
   /// A hub from a scanned QR code or pasted link: key and one-time token
   /// included, so no PIN is needed.
@@ -224,8 +229,9 @@ class HubAddress {
 /// The selected [target] as it is known now: a discovered or paired hub is
 /// looked up again by device id in [discovered] (visible hubs by id) and
 /// [peers], so a new address, port or trust state is used; [addresses] are
-/// the last known addresses of paired hubs that are not discovered (iOS).
-/// A peer counts as trusted only when this device paired with it as a hub
+/// the last known addresses of paired hubs that are not discovered (iOS);
+/// without one, a paired target keeps its own address (a remembered hub
+/// that is not announced is still dialled directly). A peer counts as trusted only when this device paired with it as a hub
 /// ([TrustedPeerDto.pairedAsHub]); [peers] is `null` while the trust store
 /// is still loading (trust is then left as it is). A typed-in or
 /// scanned target is returned as is; one no longer known keeps its fields but
@@ -249,7 +255,19 @@ HubTarget currentHubTarget(
   if (hub != null) {
     fresh = HubTarget.discovered(hub, trusted: hub.trusted || pairedAsHub);
   } else if (peer != null) {
-    fresh = HubTarget.paired(peer, address: addresses[id]);
+    // A paired target that carries an address (a remembered hub, or one
+    // dialled at its last address before) keeps it when no newer one is
+    // known: a hub that is not announced (added by address) is then still
+    // reached. A target that was only discovered is looked up by id instead,
+    // since its announced address may be stale.
+    final own = target.origin == HubOrigin.paired && target.host.isNotEmpty
+        ? HubAddress(target.host, target.port)
+        : null;
+    fresh = HubTarget.paired(
+      peer,
+      address: addresses[id] ?? own,
+      hubKey: target.origin == HubOrigin.paired ? target.hubKey : null,
+    );
   } else if (peers != null &&
       target.trusted &&
       target.origin == HubOrigin.paired) {
@@ -274,3 +292,43 @@ HubTarget currentHubTarget(
 
 /// Whether [text] is a 6-digit pairing PIN.
 bool isValidPin(String text) => RegExp(r'^\d{6}$').hasMatch(text.trim());
+
+/// Splits a typed hub address into host and port.
+///
+/// Accepts what the hub screen shows and copies (`192.168.1.20:47810`,
+/// `[fd00::20]:47810`) as well as a bare host name or IPv4 address, a
+/// bracketed IPv6 address without a port (`[fd00::20]`) and a bare IPv6
+/// address (more than one `:` and no brackets: no port). The port is `null`
+/// when none is given. Returns `null` when [text] is not an address (empty,
+/// an empty host, unbalanced brackets, or a port outside 1–65535).
+({String host, int? port})? splitHostPort(String text) {
+  final t = text.trim();
+  if (t.isEmpty) return null;
+  int? parsePort(String p) {
+    if (!RegExp(r'^\d{1,5}$').hasMatch(p)) return null;
+    final port = int.parse(p);
+    return port >= 1 && port <= 65535 ? port : null;
+  }
+
+  if (t.startsWith('[')) {
+    final close = t.indexOf(']');
+    if (close < 0) return null;
+    final host = t.substring(1, close).trim();
+    final rest = t.substring(close + 1);
+    if (host.isEmpty || host.contains('[') || host.contains(']')) return null;
+    if (rest.isEmpty) return (host: host, port: null);
+    if (!rest.startsWith(':')) return null;
+    final port = parsePort(rest.substring(1));
+    return port == null ? null : (host: host, port: port);
+  }
+  if (t.contains('[') || t.contains(']') || t.contains(RegExp(r'\s'))) {
+    return null;
+  }
+  final colons = ':'.allMatches(t).length;
+  if (colons == 0) return (host: t, port: null);
+  if (colons > 1) return (host: t, port: null); // a bare IPv6 address
+  final i = t.indexOf(':');
+  final host = t.substring(0, i);
+  final port = parsePort(t.substring(i + 1));
+  return host.isEmpty || port == null ? null : (host: host, port: port);
+}

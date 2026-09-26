@@ -52,6 +52,13 @@ String linuxLaunchCommand(Map<String, String> env, String resolvedExecutable) {
 /// Quotes [arg] for a desktop entry's `Exec` key (Desktop Entry
 /// Specification, "The Exec key"): arguments with reserved characters are
 /// double-quoted with `"`, `` ` ``, `$` and `\` escaped; `%` is doubled.
+///
+/// The key's value is a string, and the spec applies the string escape rule
+/// before the quoting rule: every backslash of the quoted form is written
+/// twice (a literal `\` in a quoted argument becomes four backslashes, a
+/// literal `$` becomes `\\$`), and a tab, newline or carriage return is
+/// written as `\t`, `\n` or `\r`. Without that pass a key-file parser
+/// (GLib) rejects `\"` and `\$` as invalid escapes and ignores the entry.
 String desktopExecQuote(String arg) {
   final percent = arg.replaceAll('%', '%%');
   if (!RegExp(r'''[\s"'\\><~|&;$*?#()`]''').hasMatch(percent)) return percent;
@@ -59,8 +66,19 @@ String desktopExecQuote(String arg) {
     RegExp(r'["`$\\]'),
     (m) => '\\${m[0]}',
   );
-  return '"$escaped"';
+  return _desktopStringEscape('"$escaped"');
 }
+
+/// The Desktop Entry string escape (`\\`, `\t`, `\n`, `\r`) of [value].
+String _desktopStringEscape(String value) => value.replaceAllMapped(
+  RegExp('[\\\\\t\n\r]'),
+  (m) => switch (m[0]) {
+    '\t' => r'\t',
+    '\n' => r'\n',
+    '\r' => r'\r',
+    _ => r'\\',
+  },
+);
 
 /// The XDG autostart entry that starts [command] hidden in the tray.
 String autostartDesktopEntry(String command) =>

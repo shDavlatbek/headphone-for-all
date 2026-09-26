@@ -308,14 +308,23 @@ class SenderController extends Notifier<SenderState> {
       debugPrint('broadcast status: ${describeError(e)}');
     }
     if (status == null || !ref.mounted) return;
-    _applyBroadcast(status);
+    _applyBroadcast(status, event: false);
   }
 
-  void _applyBroadcast(BroadcastStatus status) {
+  /// Shows [status]. A `failed` status becomes the sender error only when it
+  /// is news: a `broadcastStatus` [event], or a polled status newer than the
+  /// one already known. The extension keeps its last state until the next
+  /// broadcast, so every start and resume reads the same old failure again;
+  /// the broadcast-status line shows it (with its time), and a cleared error
+  /// must not come back.
+  void _applyBroadcast(BroadcastStatus status, {required bool event}) {
+    final known = state.broadcast.updatedAt;
+    final at = status.updatedAt;
+    final isNew = event || (known != null && at != null && at.isAfter(known));
     state = state.copyWith(
       broadcast: status,
       broadcasting: status.state.isRunning,
-      error: status.state == BroadcastState.failed
+      error: status.state == BroadcastState.failed && isNew
           ? (status.message ?? 'The broadcast failed.')
           : state.error,
     );
@@ -473,7 +482,7 @@ class SenderController extends Notifier<SenderState> {
         );
       case NativeEventType.broadcastStatus:
         final status = event.broadcast;
-        if (status != null) _applyBroadcast(status);
+        if (status != null) _applyBroadcast(status, event: true);
       case NativeEventType.unknown:
         break;
     }

@@ -30,15 +30,19 @@ class LastHub {
     this.host = '',
     this.port = 0,
     this.hubKey,
+    this.direct = false,
   });
 
   /// The hub [target] as it is remembered (the one-time secret is dropped).
+  /// A hub that was not found on the LAN (typed in, from a pairing link, or
+  /// dialled at a known address) is [direct].
   factory LastHub.of(HubTarget target) => LastHub(
     name: target.name,
     deviceId: target.deviceId,
     host: target.host,
     port: target.port,
     hubKey: target.hubKey,
+    direct: target.origin != HubOrigin.discovered && target.host.isNotEmpty,
   );
 
   /// Parses the JSON written by [toJson]; `null` when it does not fit.
@@ -49,6 +53,7 @@ class LastHub {
     final host = json['host'];
     final port = json['port'];
     final hubKey = json['hubKey'];
+    final direct = json['direct'];
     if (name is! String || name.trim().isEmpty) return null;
     if (deviceId != null && (deviceId is! String || deviceId.isEmpty)) {
       return null;
@@ -64,6 +69,7 @@ class LastHub {
       host: host,
       port: port,
       hubKey: hubKey is String && hubKey.isNotEmpty ? hubKey : null,
+      direct: direct == true,
     );
   }
 
@@ -82,6 +88,12 @@ class LastHub {
   /// Hub static key (base64url), from a pairing link.
   final String? hubKey;
 
+  /// The hub was reached at [host] directly, not found on the LAN: it may
+  /// not be announced at all (added by address), so it is dialled at [host]
+  /// again. A hub that was found on the LAN is looked up by its id instead,
+  /// since its address may have changed.
+  final bool direct;
+
   /// The file's JSON.
   Map<String, Object?> toJson() => {
     'name': name,
@@ -89,16 +101,18 @@ class LastHub {
     'host': host,
     'port': port,
     'hubKey': hubKey,
+    'direct': direct,
   };
 
   /// The target to select. [trusted] must come from the trust store (this
   /// device paired with the hub as a sender): a remembered hub the user
-  /// forgot since then asks for a PIN.
+  /// forgot since then asks for a PIN. A hub with an id that is not
+  /// [direct] gets no host: it is found by id (see [currentHubTarget]).
   HubTarget toTarget({required bool trusted}) => HubTarget(
     name: name,
     origin: deviceId == null ? HubOrigin.manual : HubOrigin.paired,
-    host: host,
-    port: port,
+    host: deviceId == null || direct ? host : '',
+    port: deviceId == null || direct ? port : 0,
     deviceId: deviceId,
     hubKey: hubKey,
     trusted: trusted,
@@ -111,10 +125,11 @@ class LastHub {
       other.deviceId == deviceId &&
       other.host == host &&
       other.port == port &&
-      other.hubKey == hubKey;
+      other.hubKey == hubKey &&
+      other.direct == direct;
 
   @override
-  int get hashCode => Object.hash(name, deviceId, host, port, hubKey);
+  int get hashCode => Object.hash(name, deviceId, host, port, hubKey, direct);
 }
 
 /// The source this device last sent: its kind and, for one app, the app's

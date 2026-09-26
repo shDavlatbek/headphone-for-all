@@ -201,6 +201,53 @@ void main() {
     await unmount(tester);
   });
 
+  testWidgets('an address copied from the hub header is accepted', (
+    tester,
+  ) async {
+    final fake = senderFake();
+    await pumpApp(tester, fake, section: AppSection.sender);
+    // The forms the hub header shows (HubStatusDto.addresses).
+    for (final (text, host, port, shown) in [
+      ('192.168.1.20:47810', '192.168.1.20', 47810, '192.168.1.20:47810'),
+      ('[fd00::20]:47811', 'fd00::20', 47811, '[fd00::20]:47811'),
+    ]) {
+      await tester.tap(find.byKey(const Key('add-by-address')));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const Key('host-field')), text);
+      await tester.tap(find.text('Add'));
+      await tester.pumpAndSettle();
+      expect(find.text(shown), findsWidgets);
+      await tester.tap(find.byKey(const Key('sender-start')));
+      await tester.pumpAndSettle();
+      expect(fake.lastSenderStart?.hubHost, host);
+      expect(fake.lastSenderStart?.hubPort, port);
+    }
+
+    // A Port field value wins; a malformed address is refused in the form.
+    await tester.tap(find.byKey(const Key('add-by-address')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('host-field')), '10.0.0.9:1');
+    await tester.enterText(find.byKey(const Key('port-field')), '47999');
+    await tester.tap(find.text('Add'));
+    await tester.pumpAndSettle();
+    expect(find.text('10.0.0.9:47999'), findsWidgets);
+    await tester.tap(find.byKey(const Key('add-by-address')));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const Key('host-field')),
+      '10.0.0.9:99999',
+    );
+    await tester.tap(find.text('Add'));
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Enter a host, an IP address or host:port'),
+      findsOneWidget,
+    );
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    await unmount(tester);
+  });
+
   testWidgets('desktop sources follow the capabilities; one app is picked', (
     tester,
   ) async {

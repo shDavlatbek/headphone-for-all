@@ -38,12 +38,14 @@ the app keeps running in the tray / menu bar; use **Quit** in the tray menu to s
 
 **Next time** the Sender section preselects the hub and source you last sent with, and the home screen
 offers **Send to <hub>** to start again with one tap (if that hub was forgotten since, it asks for a
-PIN first). The hub's **master volume** is remembered too, also across restarts.
+PIN first). A remembered hub that was added by address is dialled at that address again, so it works
+even when the hub is not discoverable. The hub's **master volume** is remembered too, also across restarts.
 
 **What the screens tell you:**
 
 - **Hub header:** the addresses senders can type into "Add by address" (IPv4 first, IPv6 in
-  brackets), each with a copy button. **"Not discoverable — senders must add this hub by address"**
+  brackets), each with a copy button; paste a copied `ip:port` or `[ipv6]:port` into the Host field
+  as it is. **"Not discoverable — senders must add this hub by address"**
   means the hub could not announce itself on the network (the reason is shown below it): senders do
   not list it, so add it by address or with the QR code.
 - **Sender card:** while sending, chips show what the hub does with your stream: **Muted on the hub**,
@@ -65,7 +67,8 @@ Pairing happens once per sender–hub pair; after that they reconnect by themsel
    - pick the hub from the list of discovered hubs and enter the PIN, or
    - **Scan QR** (mobile), or
    - **Pairing link**: paste the `hfa://pair?…` link (copy it on the hub), or
-   - **Add by address**: type the hub's IP address (port 47810 by default), then the PIN.
+   - **Add by address**: type the hub's IP address (port 47810 by default), or paste an address
+     copied from the hub header (`192.168.1.20:47810`, `[fd00::20]:47810`), then the PIN.
 3. Both sides show "Paired". The sender connects and the hub lists it with a volume slider, mute and a
    level meter.
 

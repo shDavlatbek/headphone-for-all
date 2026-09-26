@@ -184,6 +184,30 @@ void main() {
       },
     );
 
+    test('a status poll keeps a master gain that is being dragged', () async {
+      final fake = FakeHfaApi();
+      final c = containerFor(
+        fake,
+        pollInterval: const Duration(milliseconds: 20),
+      );
+      c.listen(hubControllerProvider, (_, _) {});
+      final hub = c.read(hubControllerProvider.notifier);
+      await hub.start();
+      expect(c.read(hubControllerProvider).masterGain, 1);
+
+      // The thumb is held still at 0.3 while several polls return 1.0.
+      hub.previewMasterGain(0.3);
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(fake.masterGain, 1, reason: 'a preview does not call the core');
+      expect(c.read(hubControllerProvider).masterGain, 0.3);
+
+      // Releasing it saves the value, and later polls keep showing it.
+      await hub.setMasterGain(0.3);
+      expect(fake.masterGain, 0.3);
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      expect(c.read(hubControllerProvider).masterGain, 0.3);
+    });
+
     test('stop clears sources and stops the hub service', () async {
       final fake = FakeHfaApi()..addSource(FakeHfaApi.source(streamId: 3));
       final native = RecordingNativeChannel();
@@ -1160,6 +1184,60 @@ void main() {
         state = c.read(senderControllerProvider);
         expect(state.broadcasting, isFalse);
         expect(state.error, 'The hub refused the connection.');
+      },
+    );
+
+    test(
+      'iOS: an old failure read again on resume is not a new error',
+      () async {
+        final fake = FakeHfaApi(platform: 'ios');
+        final old = DateTime.fromMillisecondsSinceEpoch(1767225600000);
+        final native = RecordingNativeChannel()
+          ..broadcastStatusAnswer = BroadcastStatus(
+            state: BroadcastState.failed,
+            message: 'The hub refused the connection.',
+            updatedAt: old,
+          );
+        final c = containerFor(fake, native: native);
+        c.listen(senderControllerProvider, (_, _) {});
+        final binding = TestWidgetsFlutterBinding.instance;
+        Future<void> resume() async {
+          binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+          binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+          await settle();
+          await settle();
+        }
+
+        await settle();
+        await settle();
+        // App start: the days-old failure is shown in the status line only.
+        var state = c.read(senderControllerProvider);
+        expect(state.broadcast.state, BroadcastState.failed);
+        expect(state.broadcast.updatedAt, old);
+        expect(state.error, isNull);
+
+        // Resuming twice with the same answer brings no error either.
+        await resume();
+        await resume();
+        state = c.read(senderControllerProvider);
+        expect(native.broadcastStatusQueries, 3);
+        expect(state.error, isNull);
+
+        // A failure newer than the known one (it happened in the background)
+        // is reported once...
+        native.broadcastStatusAnswer = BroadcastStatus(
+          state: BroadcastState.failed,
+          message: 'Lost the hub.',
+          updatedAt: old.add(const Duration(minutes: 5)),
+        );
+        await resume();
+        expect(c.read(senderControllerProvider).error, 'Lost the hub.');
+        // ...and does not come back once cleared.
+        c.read(senderControllerProvider.notifier).clearError();
+        await resume();
+        state = c.read(senderControllerProvider);
+        expect(state.error, isNull);
+        expect(state.broadcast.message, 'Lost the hub.');
       },
     );
 

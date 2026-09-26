@@ -114,14 +114,14 @@ class _AddHubDialogState extends State<_AddHubDialog> {
 
   void _submit() {
     if (!(_form.currentState?.validate() ?? false)) return;
-    var host = _host.text.trim();
-    if (host.startsWith('[') && host.endsWith(']')) {
-      host = host.substring(1, host.length - 1);
-    }
+    // `host:port` and `[v6]:port` (as the hub screen copies them) are split;
+    // a value in the Port field wins over a port in the host text.
+    final address = splitHostPort(_host.text);
+    if (address == null) return;
     Navigator.of(context).pop(
       HubTarget.manual(
-        host: host,
-        port: int.tryParse(_port.text.trim()) ?? 0,
+        host: address.host,
+        port: int.tryParse(_port.text.trim()) ?? address.port ?? 0,
         pin: _pin.text,
       ),
     );
@@ -143,11 +143,16 @@ class _AddHubDialogState extends State<_AddHubDialog> {
                 autofocus: true,
                 decoration: const InputDecoration(
                   labelText: 'Host or IP address',
-                  hintText: '192.168.1.20',
+                  hintText: '192.168.1.20 or 192.168.1.20:47810',
                 ),
-                validator: (v) => (v == null || v.trim().isEmpty)
-                    ? 'Enter the hub address'
-                    : null,
+                validator: (v) {
+                  if (v == null || v.trim().isEmpty) {
+                    return 'Enter the hub address';
+                  }
+                  return splitHostPort(v) == null
+                      ? 'Enter a host, an IP address or host:port'
+                      : null;
+                },
               ),
               TextFormField(
                 key: const Key('port-field'),

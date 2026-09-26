@@ -159,9 +159,40 @@ void main() {
     await tester.pumpAndSettle();
     // Paired: no PIN asked; it streams and the sender screen shows it.
     expect(fake.lastSenderStart?.hubDeviceId, 'hub-1');
+    // Found on the LAN before: looked up by id, not at its old address.
+    expect(fake.lastSenderStart?.hubHost, isEmpty);
     expect(fake.lastSenderStart?.pairingSecret, isNull);
     expect(container.read(sectionProvider), AppSection.sender);
     expect(container.read(senderControllerProvider).isLive, isTrue);
+    await unmount(tester);
+  });
+
+  testWidgets('a remembered hub added by address is dialled there again', (
+    tester,
+  ) async {
+    // Paired, but not announced (so not discovered): only its address works.
+    final fake = FakeHfaApi(trusted: [FakeHfaApi.peer(deviceId: 'hub-9')]);
+    final container = await pumpApp(tester, fake);
+    container
+        .read(appPrefsProvider.notifier)
+        .rememberSend(
+          const HubTarget(
+            name: 'Attic PC',
+            origin: HubOrigin.paired,
+            host: '192.168.1.44',
+            port: 47811,
+            deviceId: 'hub-9',
+            trusted: true,
+          ),
+          const SourceChoice(SourceKind.tone),
+        );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('send-to-last-hub')));
+    await tester.pumpAndSettle();
+    expect(fake.lastSenderStart?.hubDeviceId, 'hub-9');
+    expect(fake.lastSenderStart?.hubHost, '192.168.1.44');
+    expect(fake.lastSenderStart?.hubPort, 47811);
+    expect(fake.lastSenderStart?.pairingSecret, isNull);
     await unmount(tester);
   });
 

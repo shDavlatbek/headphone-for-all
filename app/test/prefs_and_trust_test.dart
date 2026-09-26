@@ -38,6 +38,7 @@ void main() {
           host: '192.168.1.20',
           port: 47810,
           hubKey: 'AQID',
+          direct: true,
         ),
         lastSource: LastSource(SourceKind.app, appName: 'Firefox'),
       );
@@ -94,8 +95,10 @@ void main() {
         ),
       );
       expect(hub.toJson().values, isNot(contains('one-time token')));
+      expect(hub.direct, isTrue, reason: 'reached at its address');
       final untrusted = hub.toTarget(trusted: false);
       expect(untrusted.origin, HubOrigin.paired);
+      expect(untrusted.address, '10.0.0.9:47810');
       expect(untrusted.hubKey, 'key');
       expect(untrusted.needsPin, isTrue);
       expect(hub.toTarget(trusted: true).needsPin, isFalse);
@@ -103,6 +106,37 @@ void main() {
       final manual = const LastHub(name: '10.0.0.9', host: '10.0.0.9');
       expect(manual.toTarget(trusted: false).origin, HubOrigin.manual);
       expect(manual.toTarget(trusted: false).needsPin, isFalse);
+    });
+
+    test('a hub found on the LAN is remembered by id, not by address', () {
+      const hub = HubInfoDto(
+        deviceId: 'hub1',
+        name: 'Desk',
+        addrs: ['192.168.1.20'],
+        port: 47810,
+        platform: 'windows',
+        trusted: true,
+      );
+      final found = LastHub.of(HubTarget.discovered(hub));
+      expect(found.direct, isFalse);
+      expect(found.host, '192.168.1.20', reason: 'kept for reference');
+      final target = found.toTarget(trusted: true);
+      expect(target.origin, HubOrigin.paired);
+      expect((target.host, target.port), ('', 0), reason: 'found by id');
+      expect(LastHub.fromJson(found.toJson()), found);
+      // A hub added by address and paired (it may not be announced).
+      final typed = LastHub.of(
+        const HubTarget(
+          name: 'Desk',
+          origin: HubOrigin.paired,
+          host: '192.168.1.44',
+          port: 47811,
+          deviceId: 'hub1',
+          trusted: true,
+        ),
+      );
+      expect(typed.direct, isTrue);
+      expect(typed.toTarget(trusted: true).address, '192.168.1.44:47811');
     });
 
     test('a remembered app is found again by name', () {
@@ -251,7 +285,16 @@ void main() {
 
     test('Exec arguments are quoted per the Desktop Entry spec', () {
       expect(desktopExecQuote('/usr/bin/hfa'), '/usr/bin/hfa');
-      expect(desktopExecQuote(r'/a b/$x"`\y'), r'"/a b/\$x\"\`\\y"');
+      // The quoting rule, then the string escape rule (every `\` doubled):
+      // `\\$` for `$`, `\\"` for `"`, four backslashes for `\`.
+      expect(desktopExecQuote(r'/a b/$x"`\y'), r'"/a b/\\$x\\"\\`\\\\y"');
+      expect(
+        desktopExecQuote(r'/home/me/My $Apps/hfa'),
+        r'"/home/me/My \\$Apps/hfa"',
+      );
+      expect(desktopExecQuote(r'C:\hfa'), r'"C:\\\\hfa"');
+      expect(desktopExecQuote('/a\tb/hfa'), r'"/a\tb/hfa"');
+      expect(desktopExecQuote('/a b/hfa'), '"/a b/hfa"');
       expect(desktopExecQuote('/50%/hfa'), '/50%%/hfa');
     });
 

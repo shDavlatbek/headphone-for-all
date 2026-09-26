@@ -292,12 +292,83 @@ void main() {
     expect(fresh.origin, HubOrigin.paired);
     expect(fresh.address, '192.168.1.20:47810');
 
+    // Not announced and no book address (desktop, Android): a discovered
+    // target is looked up by id, since its announced address may be stale...
+    fresh = currentHubTarget(
+      HubTarget.discovered(hub),
+      discovered: const {},
+      peers: const [peer],
+    );
+    expect(fresh.host, isEmpty);
+    // ...but a remembered paired hub (added by address, not advertised)
+    // keeps its own address and key, so "Send to" still reaches it.
+    const remembered = HubTarget(
+      name: 'Desk',
+      origin: HubOrigin.paired,
+      host: '192.168.1.44',
+      port: 47810,
+      deviceId: 'hub1',
+      hubKey: 'a2V5',
+      trusted: true,
+    );
+    fresh = currentHubTarget(
+      remembered,
+      discovered: const {},
+      peers: const [peer],
+    );
+    expect(fresh.origin, HubOrigin.paired);
+    expect((fresh.host, fresh.port), ('192.168.1.44', 47810));
+    expect(fresh.hubKey, 'a2V5');
+    expect(fresh.trusted, isTrue);
+    expect(
+      fresh.toRequest(const CaptureSourceDto.system()).hubHost,
+      '192.168.1.44',
+    );
+    // A newer book address wins over the remembered one.
+    fresh = currentHubTarget(
+      remembered,
+      discovered: const {},
+      peers: const [peer],
+      addresses: const {'hub1': HubAddress('192.168.1.45', 47811)},
+    );
+    expect(fresh.address, '192.168.1.45:47811');
+
     // Typed-in and scanned targets are what the user entered.
     final manual = HubTarget.manual(host: '10.0.0.2');
     expect(
       currentHubTarget(manual, discovered: {'hub1': hub}, peers: const [peer]),
       same(manual),
     );
+  });
+
+  test('a typed hub address is split into host and port', () {
+    ({String host, int? port}) hp(String host, [int? port]) =>
+        (host: host, port: port);
+    expect(splitHostPort('192.168.1.20:47810'), hp('192.168.1.20', 47810));
+    expect(splitHostPort(' [fd00::20]:47810 '), hp('fd00::20', 47810));
+    expect(splitHostPort('[fd00::20]'), hp('fd00::20'));
+    expect(splitHostPort('fd00::20'), hp('fd00::20'));
+    expect(splitHostPort('fe80::1%eth0'), hp('fe80::1%eth0'));
+    expect(splitHostPort('desk-pc.local'), hp('desk-pc.local'));
+    expect(splitHostPort('desk-pc.local:5000'), hp('desk-pc.local', 5000));
+    expect(splitHostPort('10.0.0.9'), hp('10.0.0.9'));
+    for (final bad in [
+      '',
+      '  ',
+      ':47810',
+      '10.0.0.9:',
+      '10.0.0.9:0',
+      '10.0.0.9:65536',
+      '10.0.0.9:port',
+      '[fd00::20',
+      '[]:1',
+      '[fd00::20]47810',
+      '[fd00::20]:',
+      'fd00::20]:1',
+      'desk pc',
+    ]) {
+      expect(splitHostPort(bad), isNull, reason: bad);
+    }
   });
 
   test('the hub address is read from a pairing URI', () {
