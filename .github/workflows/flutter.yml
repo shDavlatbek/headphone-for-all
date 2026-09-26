@@ -192,8 +192,9 @@ jobs:
         if: steps.script.outputs.present == 'true'
         run: |
           apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }} ${{ env.LINUX_FLUTTER_DEPS }}
-          # The baseline this AppImage promises (packaging/README.md).
-          ldd --version | head -n 1
+          # The baseline this AppImage promises (packaging/README.md). `sed -n 1p`, not `head`:
+          # this shell runs with pipefail, and ldd dies of SIGPIPE when head exits first.
+          ldd --version | sed -n 1p
           pkg-config --modversion libpipewire-0.3
       - uses: dtolnay/rust-toolchain@stable
         if: steps.script.outputs.present == 'true'
