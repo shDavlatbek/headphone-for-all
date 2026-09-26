@@ -1440,7 +1440,10 @@ Implemented with jni 0.22 (`EnvUnowned::with_env` + `Outcome`); works for a Kotl
   unsupported `android-x86`); and the Android build environment sets **`ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT`** to
   the NDK Gradle chose (`android.ndkVersion`) and **`ANDROID_PLATFORM=android-<minSdk>`**, which opusic-sys' CMake
   build of libopus needs (without it CMake fails with "Neither the NDK or a standalone toolchain was found"), so
-  IDE / `flutter run` builds need no manual export. Pods: iOS 13.0, macOS 10.15.
+  IDE / `flutter run` builds need no manual export. On Windows the Cargo target directory is
+  `<app>\build\windows\x64\cargokit` instead of `…\plugins\<plugin>\cargokit_build` (`cargokit.cmake`): libopus'
+  CMake build nests ~160 characters below it, and MSVC's compiler fails past `MAX_PATH` (C1041 on the CMake compiler
+  check). Pods: iOS 13.0, macOS 10.15.
 - **Apple system frameworks.** A Rust staticlib does not carry its dependencies' `#[link(kind = "framework")]`
   directives, and the pods `-force_load` `libhfa_ffi.a`, so the podspecs link them: macOS `CoreAudio`,
   `AudioToolbox`, `CoreFoundation`, `Foundation`; iOS the same plus `AVFAudio`; both `libobjc` (from objc2-* crates
@@ -1924,6 +1927,9 @@ snapshot is `fix/core-sec`'s shared store.
   from those PNGs (found via `/proc/self/exe`) and falls back to the themed icon named after the application
   id. Data directory: `$XDG_DATA_HOME/io.github.shdavlatbek.hfa/hfa` (`path_provider_linux` uses the
   application id).
+- **GLib 2.72 (Ubuntu 22.04, the AppImage's build base).** `app/linux/CMakeLists.txt` compiles the plugins with
+  `G_APPLICATION_DEFAULT_FLAGS=G_APPLICATION_FLAGS_NONE` when `pkg-config glib-2.0` is older than 2.74: tray_manager's
+  `cnativeapi` uses that GLib 2.74 name. The runner itself checks `GLIB_CHECK_VERSION(2, 74, 0)`.
 
 **Icon.** One source, `packaging/icon/hfa.svg` (ids `tile` and `glyph` are used to derive variants), rendered
 by `packaging/icon/generate.py` into `app/windows/runner/resources/app_icon.ico` (16–256 px),

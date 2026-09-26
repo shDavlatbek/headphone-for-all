@@ -3154,19 +3154,26 @@ mod tests {
         );
     }
 
+    /// `true` for the two ways a client without a usable PipeWire fails: the context cannot be
+    /// created (libpipewire without its client configuration, e.g. a CI runner that has only
+    /// the development package), or the daemon's socket is not there.
+    fn is_clear_no_pipewire_error(err: &CaptureError) -> bool {
+        matches!(err, CaptureError::Backend(m)
+            if m.contains("PipeWire")
+                && (m.contains("cannot connect") || m.contains("create context")))
+    }
+
     #[test]
     fn a_missing_daemon_is_a_clear_error() {
         let remote = "hfa-test-no-such-pipewire-socket";
         let err = Connection::open(Some(remote)).err().expect("must fail");
-        assert!(
-            matches!(&err, CaptureError::Backend(m) if m.contains("cannot connect")),
-            "{err}"
-        );
+        assert!(is_clear_no_pipewire_error(&err), "{err}");
         let err = PipeWireCapture::open(Mode::Monitor, "test".into(), Some(remote.into()))
             .err()
             .expect("must fail");
-        assert!(matches!(err, CaptureError::Backend(_)), "{err}");
-        assert!(list_apps_on(Some(remote)).is_err());
+        assert!(is_clear_no_pipewire_error(&err), "{err}");
+        let err = list_apps_on(Some(remote)).expect_err("must fail");
+        assert!(is_clear_no_pipewire_error(&err), "{err}");
     }
 
     #[test]

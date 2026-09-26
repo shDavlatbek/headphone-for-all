@@ -25,7 +25,19 @@ function(apply_cargokit target manifest_dir lib_name any_symbol_name)
         set(CARGOKIT_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
         set(OUTPUT_LIB "${CMAKE_CURRENT_BINARY_DIR}/${CARGOKIT_LIB_FULL_NAME}")
     endif()
-    set(CARGOKIT_TEMP_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargokit_build")
+    if (WIN32)
+        # headphone-for-all: keep Cargo's target directory short on Windows. MSVC's cl.exe is
+        # not long-path aware, and libopus (opusic-sys, CMake) builds about 160 characters below
+        # the target directory (<triple>\release\build\opusic-sys-<hash>\out\build\CMakeFiles\
+        # CMakeScratch\TryCompile-xxxxxx\CMakeFiles\cmTC_xxxxx.dir\cmTC_xxxxx.pdb). Under
+        # <app>\build\windows\x64\plugins\<plugin>\cargokit_build that crossed MAX_PATH (260)
+        # and CMake's compiler check failed with "C1041: cannot open program database".
+        # <app>\build\windows\x64\cargokit saves 41 characters (and is still removed by
+        # `flutter clean`).
+        set(CARGOKIT_TEMP_DIR "${CMAKE_BINARY_DIR}/cargokit")
+    else()
+        set(CARGOKIT_TEMP_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargokit_build")
+    endif()
 
     if (FLUTTER_TARGET_PLATFORM)
         set(CARGOKIT_TARGET_PLATFORM "${FLUTTER_TARGET_PLATFORM}")

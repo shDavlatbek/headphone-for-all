@@ -102,7 +102,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::pacer::assert_real_time;
+    use crate::pacer::{assert_not_ahead_of_real_time, assert_paced_in_real_time};
     use crate::ring::pcm_ring_with_channels;
     use crate::CaptureError;
 
@@ -115,13 +115,19 @@ mod tests {
         let overruns = sink.stats();
         let t0 = Instant::now();
         tone.start(sink).expect("start");
-        std::thread::sleep(Duration::from_secs(1));
+        // 10 ms blocks of 480 frames, produced in real time: measured while the thread runs
+        // (not from before `start`), so a slow thread start on a loaded machine does not count.
+        assert_paced_in_real_time(
+            || source.available() / 2,
+            48_000,
+            480,
+            Duration::from_secs(1),
+            0.05,
+        );
         tone.stop();
         let elapsed = t0.elapsed();
         let frames = source.available() / 2;
-        // ~1 s must give 48000 ± 5 % frames; measured against the real elapsed time so an
-        // oversleeping test thread on a loaded machine does not make the test flaky.
-        assert_real_time(frames, 48_000, elapsed, 480, 0.05);
+        assert_not_ahead_of_real_time(frames, 48_000, elapsed);
         assert_eq!(frames % 480, 0, "whole 10 ms blocks");
         assert_eq!(overruns.count(), 0);
 

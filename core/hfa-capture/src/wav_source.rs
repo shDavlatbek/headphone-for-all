@@ -265,7 +265,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::pacer::assert_real_time;
+    use crate::pacer::{assert_not_ahead_of_real_time, assert_paced_in_real_time};
     use crate::ring::pcm_ring_with_channels;
 
     fn write_wav(path: &Path, spec: hound::WavSpec, samples: &[f32]) {
@@ -300,17 +300,26 @@ mod tests {
         assert_eq!(src.format(), AudioFormat::new(8000, 2));
         assert_eq!(src.frames(), 200);
         assert!(src.describe().contains("in.wav"));
-        let (sink, mut ring) = pcm_ring_with_channels(16_000, 2);
+        // Room for 4 s: the measurement below runs for about 1 s.
+        let (sink, mut ring) = pcm_ring_with_channels(64_000, 2);
+        let overruns = sink.stats();
         let t0 = Instant::now();
         src.start(sink).expect("start");
-        std::thread::sleep(Duration::from_millis(500));
+        // 10 ms (80-frame) blocks, produced in real time while the thread runs.
+        assert_paced_in_real_time(
+            || ring.available() / 2,
+            8000,
+            80,
+            Duration::from_secs(1),
+            0.05,
+        );
         src.stop();
         let elapsed = t0.elapsed();
 
         let got = ring.available();
-        // ~500 ms at 8 kHz stereo = ~4000 frames, in whole 10 ms (80-frame) blocks.
-        assert_eq!(got % 160, 0);
-        assert_real_time(got / 2, 8000, elapsed, 80, 0.05);
+        assert_eq!(overruns.count(), 0);
+        assert_eq!(got % 160, 0, "whole 10 ms blocks");
+        assert_not_ahead_of_real_time(got / 2, 8000, elapsed);
         let mut buf = vec![0.0; got];
         ring.pull(&mut buf);
         for (i, v) in buf.iter().enumerate() {
