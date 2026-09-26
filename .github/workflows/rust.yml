@@ -1,0 +1,210 @@
+# Rust core (core/): format, lints and tests on the three desktop OSes, cross-checks of the
+# mobile FFI crate (Android through cargo-ndk, iOS on macOS), the end-to-end CLI selftest and the
+# live PipeWire tests of the Linux capture backend. Build commands: docs/BUILDING.md.
+name: Rust
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per workflow and ref; a newer push cancels the older run (except on main, where every
+# commit keeps its result).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # The Rust release every job lints and tests with. Pinned (not `stable`) so a new Rust release
+  # cannot turn CI red through new clippy lints under -D warnings; bumped on purpose together with
+  # the dev containers (docs/BUILDING.md "Rust toolchain", CONTRACTS.md section 12). Keep it equal to
+  # RUST_TOOLCHAIN in flutter.yml.
+  RUST_TOOLCHAIN: "1.94.1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # Every cargo command runs against the workspace in core/.
+  MANIFEST: core/Cargo.toml
+  # Build dependencies of hfa-capture's PipeWire backend (pipewire-sys runs bindgen) and cpal's ALSA.
+  LINUX_DEPS: libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev clang pkg-config cmake
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --manifest-path "$MANIFEST" --all -- --check
+
+  test:
+    name: clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-latest runs the WASAPI backend's unit tests, macos-latest (Apple Silicon) the
+        # Core Audio process-tap backend's.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_DEPS }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --manifest-path "$MANIFEST" --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        shell: bash
+        # --no-fail-fast: a failing crate must not hide the results of the others.
+        run: cargo test --manifest-path "$MANIFEST" --workspace --locked --no-fail-fast
+
+  android:
+    name: Android (hfa-ffi, arm64-v8a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # opusic-sys builds libopus with CMake and the NDK's toolchain file, which needs the API level.
+      ANDROID_PLATFORM: android-29
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-linux-android
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+      - name: Select the newest NDK of the runner image
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          test -d "$ndk" || { echo "::error::no Android NDK on this runner"; exit 1; }
+          echo "Using NDK $ndk"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+      # Lints (a superset of `cargo check`) the JNI code in src/android.rs with the NDK clang.
+      # (cargo-ndk resolves the workspace from the current directory, hence core/.)
+      - name: cargo ndk clippy
+        working-directory: core
+        run: cargo ndk -t arm64-v8a -P 29 clippy -p hfa-ffi --all-targets --locked -- -D warnings
+
+  ios:
+    name: iOS (hfa-ffi, aarch64-apple-ios)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-apple-ios
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      # Default features: bundled libopus (CMake, iOS SDK) and the flutter_rust_bridge API, exactly
+      # what the app links; the C ABI of the broadcast extension is part of the same crate.
+      - name: cargo check
+        run: cargo check --manifest-path "$MANIFEST" -p hfa-ffi --target aarch64-apple-ios --locked
+      - name: cargo clippy
+        run: cargo clippy --manifest-path "$MANIFEST" -p hfa-ffi --target aarch64-apple-ios --locked -- -D warnings
+
+  # The end-to-end check of the real-time path (paced tone senders, encoder, UDP, jitter buffer,
+  # mixer, paced WAV output) on every desktop OS: each schedules those threads differently.
+  selftest:
+    name: CLI selftest (loss 5 %, jitter 20 ms, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_DEPS }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+          key: selftest
+      # In-process hub (WAV/null output) + tone sender over localhost; non-zero exit on failure.
+      - name: hfa selftest
+        shell: bash
+        run: cargo run --manifest-path "$MANIFEST" --release --locked -p hfa-cli -- selftest --seconds 8 --loss 5 --jitter 20
+
+  pipewire-live:
+    name: PipeWire live capture tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      XDG_RUNTIME_DIR: /tmp/pw-run
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install PipeWire and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_DEPS }} \
+            pipewire pipewire-bin wireplumber dbus-daemon dbus-user-session
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: Build the tests
+        run: cargo test --manifest-path "$MANIFEST" -p hfa-capture --locked --no-run
+      # The recipe of the `live` test module in core/hfa-capture/src/linux.rs: a headless PipeWire
+      # + WirePlumber session with a null sink named hfa-test-sink as the default sink.
+      - name: Start PipeWire with a null sink
+        run: |
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          nohup dbus-run-session -- sh -c 'pipewire & sleep 1; wireplumber & sleep 100000' \
+            > "$RUNNER_TEMP/pipewire.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            pw-cli info 0 > /dev/null 2>&1 && break
+            sleep 1
+          done
+          pw-cli info 0 > /dev/null
+          pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=hfa-test-sink
+            media.class=Audio/Sink object.linger=true audio.position=[FL FR] }'
+          for _ in $(seq 1 30); do
+            pw-metadata 0 default.audio.sink 2>/dev/null | grep -q hfa-test-sink && break
+            sleep 1
+          done
+          pw-metadata 0 default.audio.sink
+      - name: Live tests
+        run: cargo test --manifest-path "$MANIFEST" -p hfa-capture --locked -- --ignored --test-threads=1 live_
+      - name: PipeWire log
+        if: failure()
+        run: cat "$RUNNER_TEMP/pipewire.log" || true

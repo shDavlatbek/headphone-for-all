@@ -33,24 +33,24 @@ SENDER                                                   HUB
 |---|---|
 | Core engine | **Rust** workspace (shared by all platforms, compiled as `cdylib`/`staticlib`) |
 | Audio I/O (playback, simple capture) | `cpal` (WASAPI, CoreAudio, ALSA/JACK, AAudio) |
-| Codec | libopus through `opus` / `audiopus` |
+| Codec | libopus through `opusic-sys` (libopus built from bundled source and linked statically by default) |
 | Resampling / drift | `rubato` (variable ratio) |
 | Real-time buffers | `rtrb` (lock-free SPSC) |
-| Networking | `tokio` + UDP (media); TCP or QUIC (`quinn`) for control |
+| Networking | `tokio` + UDP (media); TCP with Noise for control |
 | Serialization (control) | Protobuf (`prost`), so versions can evolve |
-| Discovery | `mdns-sd` (desktop, Android); native `NWBrowser` on iOS |
-| Security | `snow` (Noise XX / IK), `spake2` (PIN pairing), ChaCha20-Poly1305 for media |
+| Discovery | `mdns-sd` (desktop, Android); on iOS a native Bonjour backend (`NWBrowser` + dns_sd resolve, `DNSServiceRegister`; `app/ios/Runner/HfaBonjourDiscovery.swift`) plugs into `hfa-core`'s platform-backend hook through `hfa-ffi`'s C ABI `include/hfa_discovery.h` |
+| Security | `snow` (Noise XX), `spake2` (PIN/QR-token pairing), ChaCha20-Poly1305 for media |
 | UI | **Flutter** (desktop + mobile) through **`flutter_rust_bridge` v2** |
 
 ### Platform capture backends
 
 | OS | Where it lives | Implementation |
 |---|---|---|
-| Windows | Rust (`hfa-capture`) | `cpal` loopback for the whole system; `windows` crate for process loopback (exclude our own PID) |
+| Windows | Rust (`hfa-capture`) | `windows` crate for every mode (not cpal): WASAPI loopback of the default render endpoint for the whole system; process loopback (`ActivateAudioInterfaceAsync`, include or exclude a process tree, e.g. our own PID) |
 | macOS | Rust (`hfa-capture`) | `objc2-core-audio`: `AudioHardwareCreateProcessTap` → aggregate device → IOProc |
 | Linux | Rust (`hfa-capture`) | `pipewire` crate: capture stream linked to the default sink monitor |
 | Android | Kotlin (`app/android`) | Foreground service + MediaProjection + `AudioRecord` with `AudioPlaybackCaptureConfiguration`; pushes PCM to Rust through JNI (`hfa-ffi`) |
-| iOS | Swift (`app/ios/BroadcastExtension`) | ReplayKit `RPBroadcastSampleHandler` receives `.audioApp` buffers and calls the Rust **sender-only** static lib directly (no Flutter in the extension). It shares the paired-hub config with the app through an App Group. |
+| iOS | Swift (`app/ios/HfaBroadcast`) | ReplayKit `RPBroadcastSampleHandler` receives `.audioApp` buffers and calls the Rust **sender-only** static lib directly (no Flutter in the extension). It shares the paired-hub config with the app through an App Group. |
 
 **Rule: audio never goes through Dart.** Flutter only drives UI and settings. PCM flows
 native ↔ Rust through a C ABI, and every backend implements one trait:
@@ -81,10 +81,25 @@ Bandwidth: about 140 kbit/s per stereo stream at 128 kbps Opus, which is trivial
 
 ### Control channel (per sender ↔ hub, encrypted with Noise)
 
-`Hello{device_name, platform, app_version}` → `PairRequest{pake_msg | qr_token}` → `PairAccept{hub_pubkey}` →
-`StreamStart{stream_id, codec, rate, channels, frame_ms, label}` / `StreamStop` →
-`SetVolume{stream_id, gain}` / `Mute` / `SetPriority` (hub → sender, for the sender UI) →
-`Ping/Pong` (RTT) → `Stats{loss, jitter, buffer_ms, latency_ms}` → `Bye`.
+TCP, then a `Noise_XX_25519_ChaChaPoly_BLAKE2s` handshake (prologue `hfa-v0 control`; the sender
+is the initiator). The sender learns the hub's static key in message 2 and aborts right there if it
+expected another key or device id (pairing URI, trusted hub, hub looked up by id), before it
+reveals anything. Then:
+
+1. `Hello{device_id, device_name, platform, app_version, role, pairing_required}` both ways. Each side
+   checks that `device_id` is the fingerprint of the peer's authenticated key. `pairing_required`
+   tells whether a pairing phase follows (the sender does not trust the hub as a hub, or the hub
+   does not trust the sender as a sender).
+2. Pairing, if needed: `PairStart{method}` → `PairSpake` both ways → `PairConfirm` both ways →
+   `PairResult`. SPAKE2 with the PIN or the QR token as the password (never sent in clear), bound
+   to the Noise handshake hash, with HMAC key confirmation. The hub allows 5 guesses per pairing
+   window and one attempt at a time; a successful pairing consumes the one-time secret.
+3. Session: `StreamStart{stream_id, rate, channels, frame_ms, bitrate, label, media_key}` →
+   `StreamAccepted{udp_port}` / `StreamRejected` / `StreamStop`; `SetVolume` / `SetMute` /
+   `SetPriority` (hub → sender, for the sender UI); `Ping/Pong` (RTT); `Stats`; `Bye`.
+
+The wire contract is the module documentation of `core/hfa-core/src/control.rs` and
+`docs/CONTRACTS.md` §6.2.
 
 ## 4. Hub engine
 
@@ -131,7 +146,7 @@ headphone-for-all/
 ├── app/                          # Flutter app (one UI for 5 OSes)
 │   ├── lib/                      # Dart UI: device list, sources mixer, pairing (QR/PIN), settings
 │   ├── android/                  # + Kotlin CaptureService (MediaProjection)
-│   ├── ios/                      # + BroadcastExtension/ (Swift + Rust sender staticlib)
+│   ├── ios/                      # + HfaBroadcast/ (Swift + Rust sender staticlib)
 │   ├── macos/ windows/ linux/
 ├── docs/
 └── .github/workflows/            # CI: cargo test/clippy, flutter analyze, per-OS builds
@@ -139,7 +154,8 @@ headphone-for-all/
 
 ## 7. UI (Flutter)
 
-- **Home:** "Be a hub" / "Send to a hub" toggle, and a list of discovered hubs.
+- **Home:** two role cards, "Headphone is connected here" (hub) and "Send this device's audio" (sender), with
+  their current state. Discovered hubs are listed on the sender screen (and in settings), not on Home.
 - **Hub screen:** connected sources with a live level meter, volume slider, mute, priority star, stats
   (latency, loss). Plus a "Pair new device" button that shows a QR code and PIN.
 - **Sender screen:** the target hub, a capture on/off button, per-app selection where the OS supports it (Windows, macOS),
@@ -150,6 +166,14 @@ headphone-for-all/
 
 - **Pairing required.** Unknown devices can't inject audio into your headphone.
 - All media and control traffic is encrypted; keys are pinned after the first pairing.
+- **Trust is directional.** A pairing records the peer's role: the sender trusts the hub *as a hub*,
+  the hub trusts the sender *as a sender*. A hub you once sent audio to cannot stream into your own
+  hub without pairing with it (entries saved before roles existed stay trusted both ways).
+- **Forgetting a device takes effect at once.** All parts of one process share one trust store per
+  data directory; a hub disconnects a sender as soon as it is removed, and every write re-reads
+  `trusted.json` under a file lock, so a removed device never comes back with a later pairing.
+- mDNS answers are only hints: a hub found by name or id is authenticated by its key in the
+  handshake, and a device at a discovered address that has another key is skipped and retried.
 - LAN-only by default. Internet mode (relay/WebRTC) would be explicit and opt-in later.
 - Always-visible "capturing" indicator on senders (the OS already forces this on Android and iOS).
 - No audio is ever stored or sent anywhere except the paired hub.
@@ -158,7 +182,8 @@ headphone-for-all/
 
 - Unit tests: packet (de)serialization, jitter buffer reorder/loss, drift controller convergence (simulated
   clocks at ±200 ppm), limiter.
-- Loopback integration test: `hfa-cli send --tone 440` → `hfa-cli hub --out wav` on localhost, with simulated
-  loss and jitter (`tc netem` on Linux). Check the output frequency and continuity.
+- Loopback integration test: `hfa selftest` runs an in-process hub (WAV/null output) and tone senders over
+  localhost through a simulated lossy, jittery network (`--loss`, `--jitter`), then checks the output for
+  missing tones, glitches and latency (CI: 5 % loss, 20 ms jitter).
 - Latency measurement: a click track on the sender, and a mic or loopback on the hub, to measure glass-to-glass latency.
 - Device matrix for manual QA: the Windows/macOS/Linux/Android/iOS × hub/sender combinations listed in the roadmap.

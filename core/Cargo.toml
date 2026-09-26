@@ -1,0 +1,147 @@
+[workspace]
+members = ["hfa-proto", "hfa-audio", "hfa-capture", "hfa-core", "hfa-ffi", "hfa-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+# rubato 5 (the newest resampler release) needs Rust 1.87.
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shDavlatbek/headphone-for-all"
+
+# Every third-party version lives here. Crates use `dep = { workspace = true }`.
+# Crate choices are recorded in docs/CONTRACTS.md ("Dependency choices").
+[workspace.dependencies]
+# --- internal crates ---
+# Crates that (transitively) link libopus are declared without default features; every
+# member re-enables them through its own default `bundled-opus` feature. This lets
+# `--no-default-features` skip the libopus C build (e.g. `cargo check` for Apple targets
+# on a Linux host without the macOS SDK). See docs/CONTRACTS.md "Cargo features".
+hfa-proto = { path = "hfa-proto", version = "1.0.0" }
+hfa-audio = { path = "hfa-audio", version = "1.0.0", default-features = false }
+hfa-capture = { path = "hfa-capture", version = "1.0.0", default-features = false }
+hfa-core = { path = "hfa-core", version = "1.0.0", default-features = false }
+
+# --- errors, logging, utilities ---
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+# `log` facade: hfa-ffi routes tracing events to logcat / os_log on mobile through it.
+log = "0.4.34"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+rand = "0.10.3"
+parking_lot = "0.12.5"
+# Dual-stack (IPv6 + IPv4) hub sockets (`IPV6_V6ONLY` off); already in the tree through tokio.
+socket2 = "0.6.5"
+once_cell = "1.21.4"
+directories = "6.0.0"
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2.189"
+# QR code of the pairing URI in `hfa hub --pair` (text renderer only; no `image`).
+qrcode = { version = "0.14.1", default-features = false }
+# Advisory lock of the data dir while `hfa hub` / `hfa send` run (std's `File::lock` needs
+# Rust 1.89, above the MSRV).
+fs4 = "1.1.0"
+
+# --- wire format + crypto (hfa-proto) ---
+prost = "0.14.4"
+# Only the pure-Rust primitives of Noise_XX_25519_ChaChaPoly_BLAKE2s. snow's `std` feature
+# (on by default) force-enables its optional `ring` dependency (C/asm build on every target).
+snow = { version = "0.10.0", default-features = false, features = [
+    "default-resolver",
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-getrandom",
+] }
+spake2 = "0.4.0"
+chacha20poly1305 = "0.11.0"
+sha2 = "0.11.0"
+hmac = "0.13.0"
+hkdf = "0.13.0"
+subtle = "2.6.1"
+zeroize = { version = "1.9.0", features = ["derive"] }
+base64 = "0.23.1"
+percent-encoding = "2.3.2"
+
+# --- audio (hfa-audio, hfa-capture) ---
+rtrb = "0.4.0"
+rubato = "5.0.0"
+# libopus bindings. The `bundled` feature (enabled through each member's default
+# `bundled-opus` feature) builds libopus statically from source with CMake, so no system
+# libopus is needed on Windows/macOS/Android/iOS. Without it, the system libopus is linked.
+opusic-sys = { version = "0.7.5", default-features = false }
+hound = "3.5.1"
+cpal = "0.18.2"
+
+# --- networking (hfa-core) ---
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+mdns-sd = "0.21.4"
+if-addrs = "0.15.0"
+
+# --- OS specific ---
+# Windows: WASAPI loopback, process loopback (ActivateAudioInterfaceAsync), sessions, COM.
+windows = { version = "0.62.2", features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
+# Must stay on the same minor as `windows` (0.62) for `#[implement]` / interface macros.
+windows-core = "0.62.2"
+# Linux: PipeWire (same major as cpal's optional pipewire backend).
+pipewire = "0.10.1"
+# macOS: Core Audio process taps. The objc2 0.6 / framework 0.3 family is mutually compatible.
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-core-audio = "0.3.2"
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = "0.3.2"
+block2 = "0.6.2"
+# Android: JNI exports in hfa-ffi (same major as cpal's Android backend).
+jni = "0.22.4"
+# Android: the process-global JavaVM + Context that cpal's AAudio backend reads (hfa-ffi sets it
+# from `NativeBridge.init`). Same version as cpal's.
+ndk-context = "0.1.1"
+# Flutter <-> Rust bindings (hfa-ffi). Must equal the installed flutter_rust_bridge_codegen
+# version exactly (the generated code checks it at run time).
+flutter_rust_bridge = "=2.13.0"
+
+# --- dev ---
+proptest = "1.11.0"
+tempfile = "3.27.0"
+
+# The sinc resampler is ~30x slower unoptimized; keep debug builds and tests (e.g. the
+# hfa-audio drift simulation) usable. Only this dependency is affected.
+[profile.dev.package.rubato]
+opt-level = 3
+
+# The DSP crate runs per sample on the hub's mixer thread (mixer, limiter, meters, the latency
+# cut's splice search) and instantiates rubato's generic resampler code: unoptimized, the mixer
+# thread of a debug `hfa selftest` needed ~2.4x the CPU, which on a loaded CI runner delays
+# the real-time threads. Debug assertions and overflow checks stay on (they come from the
+# profile, not the opt-level). libopus needs nothing here: opusic-sys builds it as CMake
+# "Release" whatever the profile.
+[profile.dev.package.hfa-audio]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"

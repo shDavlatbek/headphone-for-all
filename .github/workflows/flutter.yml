@@ -1,0 +1,540 @@
+# Flutter app (app/): analysis and widget tests, a drift check of the flutter_rust_bridge bindings,
+# and release builds for every platform (cargokit compiles core/hfa-ffi inside each build).
+# The integration test runs the real Rust library in the Linux job. Build commands: docs/BUILDING.md.
+# release.yml calls this workflow with `release: true` for a tagged release: the Android job then
+# also builds the App Bundle, and the Android, Windows and macOS jobs sign with the keys in the
+# repository secrets when they are set (docs/BUILDING.md, "Releasing").
+name: Flutter
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE-*"]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        description: Release build (App Bundle, signing with the repository secrets when set).
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  FLUTTER_VERSION: 3.47.5
+  # Must equal the flutter_rust_bridge versions in core/Cargo.toml and app/pubspec.yaml.
+  FRB_VERSION: 2.13.0
+  # The pinned Rust release of the codegen drift check (cargo-expand and rustfmt shape the
+  # generated code). Keep it equal to RUST_TOOLCHAIN in rust.yml. The build jobs install `stable`
+  # instead: cargokit always builds hfa-ffi with rustup's stable channel (it only knows
+  # stable/beta/nightly).
+  RUST_TOOLCHAIN: "1.94.1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Rust build dependencies on Linux (hfa-capture: PipeWire via bindgen, cpal: ALSA; libopus: CMake).
+  LINUX_RUST_DEPS: libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev clang pkg-config cmake
+  # Flutter Linux desktop toolchain and plugin dependencies (tray_manager's cnativeapi: X11 + Xi).
+  LINUX_FLUTTER_DEPS: ninja-build libgtk-3-dev libx11-dev libxi-dev liblzma-dev libstdc++-12-dev
+
+jobs:
+  analyze:
+    name: analyze + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter --version
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+  codegen:
+    name: flutter_rust_bridge drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }}
+      # The codegen formats frb_generated.rs by running rustfmt; without it the output stays
+      # unformatted and the check below reports stale bindings. The minimal profile of this action
+      # does not include rustfmt, so it is requested explicitly.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+          key: codegen
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      # Prebuilt binaries through cargo-binstall. The codegen expands hfa-ffi with cargo-expand.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: flutter_rust_bridge_codegen@${{ env.FRB_VERSION }},cargo-expand
+      - run: flutter_rust_bridge_codegen --version
+      - run: rustfmt --version
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+      - name: Regenerate the bindings
+        working-directory: app
+        run: flutter_rust_bridge_codegen generate
+      - name: The committed bindings must be up to date
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --short
+            git --no-pager diff --stat
+            git --no-pager diff | head -n 200
+            echo "::error::Generated bindings are stale: run 'flutter_rust_bridge_codegen generate' in app/ and commit the result."
+            exit 1
+          fi
+
+  linux:
+    name: Linux build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }} ${{ env.LINUX_FLUTTER_DEPS }} xvfb
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      # Loads the real Rust library through flutter_rust_bridge (debug build, virtual display).
+      - name: Integration test
+        run: xvfb-run -a flutter test integration_test -d linux
+      - name: Build (release)
+        run: flutter build linux --release
+      - name: Archive the bundle
+        run: tar -czf "$RUNNER_TEMP/headphone_for_all-linux-x64.tar.gz" -C build/linux/x64/release bundle
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-linux-x64
+          path: ${{ runner.temp }}/headphone_for_all-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # The AppImage does not bundle glibc, so it runs only on distributions at least as new as the
+  # build machine: it is built in an Ubuntu 24.04 container (glibc 2.39, libpipewire 1.0), the
+  # baseline that packaging/README.md specifies. Not older: the PipeWire bindings (pipewire-rs
+  # 0.10, libspa) do not compile against PipeWire 0.3.48 of Ubuntu 22.04. Older distributions are
+  # covered by the Flatpak, which brings its own runtime. A container and not the runner label,
+  # so the baseline stays fixed when ubuntu-latest moves on. The container runs as root and has
+  # none of the runner image's tools, so the first step installs what checkout, flutter-action
+  # (curl, jq, unzip, xz), rustup (curl) and the builds need. build-appimage.sh sets
+  # APPIMAGE_EXTRACT_AND_RUN=1, so FUSE is not needed. The job does nothing until packaging/linux
+  # (feat/desktop) is on the branch; `hashFiles` is not available in a job-level `if`, hence the
+  # check step.
+  linux-appimage:
+    name: Linux AppImage (Ubuntu 24.04 container)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    timeout-minutes: 60
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    defaults:
+      run:
+        shell: bash
+        working-directory: app
+    steps:
+      - name: Install the base tools of the container
+        working-directory: /
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git jq unzip xz-utils zip \
+            file build-essential
+          # The checkout (runner uid) and the Flutter SDK are owned by other users than root.
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@v7
+      - name: Is the packaging script present?
+        id: script
+        working-directory: .
+        run: |
+          if [ -f packaging/linux/build-appimage.sh ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::packaging/linux/build-appimage.sh is not on this branch; no AppImage."
+          fi
+      - name: Install Linux build dependencies
+        if: steps.script.outputs.present == 'true'
+        run: |
+          apt-get install -y --no-install-recommends ${{ env.LINUX_RUST_DEPS }} ${{ env.LINUX_FLUTTER_DEPS }}
+          # The baseline this AppImage promises (packaging/README.md). `sed -n 1p`, not `head`:
+          # this shell runs with pipefail, and ldd dies of SIGPIPE when head exits first.
+          ldd --version | sed -n 1p
+          pkg-config --modversion libpipewire-0.3
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.script.outputs.present == 'true'
+      - uses: subosito/flutter-action@v2
+        if: steps.script.outputs.present == 'true'
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - name: Build (release)
+        if: steps.script.outputs.present == 'true'
+        run: |
+          flutter pub get
+          flutter build linux --release
+      - name: AppImage
+        if: steps.script.outputs.present == 'true'
+        working-directory: .
+        run: bash packaging/linux/build-appimage.sh
+      - uses: actions/upload-artifact@v7
+        if: steps.script.outputs.present == 'true'
+        with:
+          name: headphone_for_all-linux-appimage
+          path: packaging/dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
+  # The Flatpak bundle packages the release bundle of the `linux` job (built on ubuntu-latest; the
+  # Flatpak runtime brings its own, newer glibc and libpipewire). flatpak-builder needs bubblewrap
+  # and a current flatpak, hence Flathub's builder image, which must run privileged.
+  linux-flatpak:
+    name: Linux Flatpak
+    needs: linux
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+      options: --privileged
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: headphone_for_all-linux-x64
+          path: ${{ runner.temp }}/linux-bundle
+      - name: Unpack the release bundle
+        run: |
+          mkdir -p app/build/linux/x64/release
+          tar -xzf "$RUNNER_TEMP/linux-bundle/headphone_for_all-linux-x64.tar.gz" -C app/build/linux/x64/release
+      - name: Flatpak bundle
+        run: bash packaging/linux/build-flatpak.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-linux-flatpak
+          path: packaging/dist/*.flatpak
+          if-no-files-found: error
+          retention-days: 14
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: app
+    env:
+      # Release signing (app/android/app/build.gradle.kts) only for release.yml; other runs sign
+      # with the debug key.
+      ANDROID_KEYSTORE_BASE64: ${{ inputs.release && secrets.ANDROID_KEYSTORE_BASE64 || '' }}
+      HFA_ANDROID_KEYSTORE_PASSWORD: ${{ inputs.release && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+      HFA_ANDROID_KEY_ALIAS: ${{ inputs.release && secrets.ANDROID_KEY_ALIAS || '' }}
+      HFA_ANDROID_KEY_PASSWORD: ${{ inputs.release && secrets.ANDROID_KEY_PASSWORD || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      # The NDK must be the app's android.ndkVersion (app/android/app/build.gradle.kts); cargokit
+      # builds hfa-ffi (and libopus through CMake) with the NDK Gradle selects.
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools platforms;android-36 build-tools;36.0.0 ndk;29.0.14206865
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      - name: Release signing key
+        if: env.ANDROID_KEYSTORE_BASE64 != ''
+        run: |
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "HFA_ANDROID_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+      - name: No release signing key
+        if: inputs.release && env.ANDROID_KEYSTORE_BASE64 == ''
+        run: echo "::warning::ANDROID_KEYSTORE_BASE64 is not set; the release APK and App Bundle are signed with the debug key."
+      # Release APK for arm64-v8a, armeabi-v7a and x86_64. Signed with the debug key unless this is a
+      # release run with the signing secrets: installable for testing, not for a store.
+      - name: Build APK (release)
+        run: flutter build apk --release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-android-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+      # The App Bundle for Google Play (release runs only).
+      - name: Build App Bundle (release)
+        if: inputs.release
+        run: flutter build appbundle --release
+      - uses: actions/upload-artifact@v7
+        if: inputs.release
+        with:
+          name: headphone_for_all-android-aab
+          path: app/build/app/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
+          retention-days: 14
+      # JVM unit tests and Android lint of the Kotlin platform code (feat/android) when present;
+      # -Ptarget-platform keeps cargokit's debug build of the Rust core to arm64 only.
+      - name: Android unit tests + lint
+        if: hashFiles('app/android/app/src/test/**') != ''
+        working-directory: app/android
+        run: ./gradlew --no-daemon -Ptarget-platform=android-arm64 :app:testDebugUnitTest :app:lintDebug
+
+  windows:
+    name: Windows build
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: app
+    env:
+      # Authenticode signing, release.yml only: a code-signing certificate as base64 PFX.
+      WINDOWS_CERTIFICATE_PFX_BASE64: ${{ inputs.release && secrets.WINDOWS_CERTIFICATE_PFX_BASE64 || '' }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ inputs.release && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
+      TIMESTAMP_URL: http://timestamp.digicert.com
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      - name: Build (release)
+        run: flutter build windows --release
+      # Signs the app and the Rust library before they are zipped and packed into the installer.
+      - name: Sign the executables
+        if: env.WINDOWS_CERTIFICATE_PFX_BASE64 != ''
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+          "SIGNING_PFX=$pfx" >> $env:GITHUB_ENV
+          & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd sha256 /tr $env:TIMESTAMP_URL /td sha256 `
+            build\windows\x64\runner\Release\headphone_for_all.exe build\windows\x64\runner\Release\hfa_ffi.dll
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+      - name: Zip the release folder
+        run: Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath "$env:RUNNER_TEMP\headphone_for_all-windows-x64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-windows-x64
+          path: ${{ runner.temp }}/headphone_for_all-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+      # Inno Setup installer (packaging/windows, feat/desktop) when it is present on this branch.
+      - name: Installer
+        id: installer
+        if: hashFiles('packaging/windows/build-installer.ps1') != ''
+        working-directory: .
+        run: ./packaging/windows/build-installer.ps1
+      - name: Sign the installer
+        if: steps.installer.outcome == 'success' && env.WINDOWS_CERTIFICATE_PFX_BASE64 != ''
+        working-directory: .
+        run: |
+          $setup = (Get-ChildItem packaging\dist\*.exe).FullName
+          & $env:SIGNTOOL sign /f $env:SIGNING_PFX /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd sha256 /tr $env:TIMESTAMP_URL /td sha256 $setup
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+      - uses: actions/upload-artifact@v7
+        if: steps.installer.outcome == 'success'
+        with:
+          name: headphone_for_all-windows-x64-setup
+          path: packaging/dist/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS build
+    runs-on: macos-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: app
+    env:
+      # Developer ID signing and notarization of the DMG, release.yml only (build-dmg.sh reads
+      # MACOS_SIGN_IDENTITY and the APPLE_API_* variables).
+      MACOS_CERTIFICATE_P12_BASE64: ${{ inputs.release && secrets.MACOS_CERTIFICATE_P12_BASE64 || '' }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ inputs.release && secrets.MACOS_CERTIFICATE_PASSWORD || '' }}
+      MACOS_SIGN_IDENTITY: ${{ inputs.release && secrets.MACOS_SIGN_IDENTITY || '' }}
+      APPLE_API_KEY_P8_BASE64: ${{ inputs.release && secrets.APPLE_API_KEY_P8_BASE64 || '' }}
+      APPLE_API_KEY_ID: ${{ inputs.release && secrets.APPLE_API_KEY_ID || '' }}
+      APPLE_API_ISSUER: ${{ inputs.release && secrets.APPLE_API_ISSUER || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      # Release builds are universal: cargokit builds hfa-ffi for both Mac architectures.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      - name: Build (release)
+        run: flutter build macos --release
+      - name: Zip the app
+        run: |
+          app="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$app" || { echo "::error::no .app in build/macos/Build/Products/Release"; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/headphone_for_all-macos.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: headphone_for_all-macos
+          path: ${{ runner.temp }}/headphone_for_all-macos.zip
+          if-no-files-found: error
+          retention-days: 14
+      # A temporary keychain with the Developer ID certificate (release runs with the secrets).
+      - name: Signing keychain
+        if: env.MACOS_CERTIFICATE_P12_BASE64 != '' && env.MACOS_SIGN_IDENTITY != ''
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/codesign.p12"
+          security import "$RUNNER_TEMP/codesign.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm -f "$RUNNER_TEMP/codesign.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain" > /dev/null
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          if [ -n "$APPLE_API_KEY_P8_BASE64" ]; then
+            printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+            echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+          fi
+      # Disk image (packaging/macos, feat/desktop) when it is present on this branch: unsigned, or
+      # signed (MACOS_SIGN_IDENTITY) and notarized (App Store Connect API key) in release runs.
+      - name: DMG
+        id: dmg
+        if: hashFiles('packaging/macos/build-dmg.sh') != ''
+        working-directory: .
+        run: |
+          args=()
+          if [ -n "$MACOS_SIGN_IDENTITY" ] && [ -n "$APPLE_API_KEY_ID" ]; then
+            args+=(--notarize)
+          fi
+          bash packaging/macos/build-dmg.sh ${args[@]+"${args[@]}"}
+      - uses: actions/upload-artifact@v7
+        if: steps.dmg.outcome == 'success'
+        with:
+          name: headphone_for_all-macos-dmg
+          path: packaging/dist/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    name: iOS build (no codesign)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      # Builds Runner and every embedded target, including the ReplayKit broadcast upload
+      # extension that links libhfa_ffi.a through the C ABI.
+      - name: Build (release, unsigned)
+        run: flutter build ios --release --no-codesign
+
+  apple-unit-tests:
+    name: XCTest (iOS simulator + macOS)
+    runs-on: macos-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim,aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - run: flutter pub get
+      # The Flutter builds generate the Xcode configuration and install the pods; xcodebuild then
+      # runs the Runner scheme's RunnerTests (on iOS also the broadcast extension's PCM converter).
+      - name: Build for the iOS simulator
+        run: flutter build ios --simulator --debug
+      - name: Unit tests of the simulator picker
+        working-directory: .
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s .github/scripts
+      # CoreSimulator lists the runtimes of every installed Xcode, and runner images often carry
+      # runtimes newer than the selected Xcode's SDK supports. The script picks an iPhone of the
+      # newest iOS runtime whose version is <= the active iphonesimulator SDK (compared as version
+      # tuples).
+      - name: iOS RunnerTests
+        run: |
+          sdk="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          echo "iphonesimulator SDK $sdk"
+          xcrun simctl list runtimes available --json > "$RUNNER_TEMP/runtimes.json"
+          xcrun simctl list devices available --json > "$RUNNER_TEMP/devices.json"
+          udid="$(python3 "$GITHUB_WORKSPACE/.github/scripts/pick_ios_simulator.py" "$sdk" \
+            "$RUNNER_TEMP/runtimes.json" "$RUNNER_TEMP/devices.json")"
+          test -n "$udid" || { echo "::error::no available iPhone simulator for iOS SDK $sdk"; exit 1; }
+          xcodebuild test -workspace ios/Runner.xcworkspace -scheme Runner \
+            -destination "id=$udid" -quiet CODE_SIGNING_ALLOWED=NO
+      - name: Build for macOS
+        run: flutter build macos --debug
+      - name: macOS RunnerTests
+        run: xcodebuild test -workspace macos/Runner.xcworkspace -scheme Runner -destination 'platform=macOS' -quiet

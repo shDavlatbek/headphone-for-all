@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Headphone for All
+GenericName=Multi-device Audio Mixer
+Comment=Hear every device in one headphone at the same time
+Exec=headphone_for_all
+Icon=io.github.shdavlatbek.hfa
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=headphone;headphones;bluetooth;audio;sound;stream;mix;mixer;lan;wifi;
+StartupNotify=true
+StartupWMClass=io.github.shdavlatbek.hfa
+SingleMainWindow=true

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!--
+    Headphone for All: application icon, the source of every raster icon.
+    A headphone that receives two incoming "waves" (the audio other devices
+    stream to the hub over the LAN). Drawn on a 256 x 256 grid; strokes are
+    at least 18 units wide and gaps at least 16 units, so the glyph stays
+    readable at 16 x 16 px (1 px = 16 units).
+
+    packaging/icon/generate.py renders the rasters from this file and derives
+    the platform variants from the element ids: "tile" (background) and
+    "glyph" (headphone + waves). Keep both ids when editing.
+
+    The comment sits inside <svg>: image loaders (gdk-pixbuf, so AppStream's
+    icon check in the Flatpak build) sniff the first bytes for the <svg> tag.
+
+    SPDX-License-Identifier: MIT OR Apache-2.0
+  -->
+  <title>Headphone for All</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5C6BC0"/>
+      <stop offset="1" stop-color="#303F9F"/>
+    </linearGradient>
+  </defs>
+  <rect id="tile" x="8" y="8" width="240" height="240" rx="56" ry="56" fill="url(#bg)"/>
+  <g id="glyph">
+    <!-- Incoming waves: arcs around the headband's centre (128, 160). -->
+    <g fill="none" stroke="#9FE8F0" stroke-width="18" stroke-linecap="round">
+      <path d="M 67.8 93.1 A 90 90 0 0 1 188.2 93.1"/>
+      <path d="M 48.3 65.0 A 124 124 0 0 1 207.7 65.0"/>
+    </g>
+    <!-- Headband -->
+    <path d="M 74 178 L 74 160 A 54 54 0 0 1 182 160 L 182 178" fill="none"
+          stroke="#FFFFFF" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- Ear cups -->
+    <rect x="52" y="150" width="44" height="72" rx="16" ry="16" fill="#FFFFFF"/>
+    <rect x="160" y="150" width="44" height="72" rx="16" ry="16" fill="#FFFFFF"/>
+  </g>
+</svg>

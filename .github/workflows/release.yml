@@ -1,0 +1,190 @@
+# Release: on a version tag (v1.2.3, v1.2.3-beta.1) builds every app package through flutter.yml
+# (with `release: true`: App Bundle, and signing where the repository secrets are set), the `hfa`
+# CLI for Linux, Windows and macOS, and publishes them with SHA256SUMS as a GitHub release.
+# workflow_dispatch builds the same set without publishing (the files stay run artifacts).
+# Secrets and the release checklist: docs/BUILDING.md, "Releasing".
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Not `${{ github.workflow }}-${{ github.ref }}`: flutter.yml, called below, uses that group, and
+# a called workflow sees the caller's `github.workflow` (same group = deadlock). Group names are
+# compared case-insensitively, so this one must differ in more than case.
+concurrency:
+  group: publish-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Keep equal to RUST_TOOLCHAIN in rust.yml.
+  RUST_TOOLCHAIN: "1.94.1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  MANIFEST: core/Cargo.toml
+
+jobs:
+  version:
+    name: Version check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      # The tag must name the version that app/pubspec.yaml (without +build) and the Rust workspace
+      # (core/Cargo.toml) carry, so the installers, the app's About screen and `hfa --version` agree.
+      - name: Versions
+        id: version
+        run: |
+          app="$(sed -n 's/^version:[[:space:]]*\([^+[:space:]]*\).*/\1/p' app/pubspec.yaml | head -n 1)"
+          core="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' core/Cargo.toml | head -n 1)"
+          echo "app/pubspec.yaml: $app, core/Cargo.toml: $core, ref: $GITHUB_REF_NAME"
+          test -n "$app" || { echo "::error::no version in app/pubspec.yaml"; exit 1; }
+          if [ "$app" != "$core" ]; then
+            echo "::error::app/pubspec.yaml ($app) and core/Cargo.toml ($core) disagree; bump both."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$app" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version v$app"
+            exit 1
+          fi
+          echo "version=$app" >> "$GITHUB_OUTPUT"
+
+  app:
+    name: App packages
+    needs: version
+    uses: ./.github/workflows/flutter.yml
+    with:
+      release: true
+    secrets: inherit
+
+  cli:
+    name: CLI (${{ matrix.name }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built in an Ubuntu 24.04 container like the AppImage: glibc 2.39 and libpipewire 1.0
+          # (linked dynamically) are the oldest baseline it runs on (the PipeWire bindings do not
+          # compile against the PipeWire 0.3.48 of Ubuntu 22.04).
+          - name: linux-x86_64
+            os: ubuntu-latest
+            container: ubuntu:24.04
+          - name: windows-x86_64
+            os: windows-latest
+            container: ""
+          # Universal binary (Apple Silicon + Intel) through lipo.
+          - name: macos-universal
+            os: macos-latest
+            container: ""
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Install build dependencies (container)
+        if: matrix.container != ''
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
+            libasound2-dev libpipewire-0.3-dev libspa-0.2-dev libclang-dev clang pkg-config cmake
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - name: Build
+        run: |
+          out="$RUNNER_TEMP/hfa-$VERSION-${{ matrix.name }}"
+          mkdir -p "$out"
+          if [ "$RUNNER_OS" = macOS ]; then
+            for target in aarch64-apple-darwin x86_64-apple-darwin; do
+              cargo build --manifest-path "$MANIFEST" --release --locked -p hfa-cli --target "$target"
+            done
+            lipo -create -output "$out/hfa" \
+              core/target/aarch64-apple-darwin/release/hfa core/target/x86_64-apple-darwin/release/hfa
+            lipo -info "$out/hfa"
+          else
+            cargo build --manifest-path "$MANIFEST" --release --locked -p hfa-cli
+            exe=""
+            if [ "$RUNNER_OS" = Windows ]; then exe=".exe"; fi
+            cp "core/target/release/hfa$exe" "$out/"
+          fi
+          cp LICENSE-MIT LICENSE-APACHE "$out/"
+          echo "OUT=$out" >> "$GITHUB_ENV"
+      - name: Smoke test
+        run: |
+          "$OUT/hfa" --version
+          "$OUT/hfa" --help > /dev/null
+      - name: Archive
+        run: |
+          cd "$(dirname "$OUT")"
+          name="$(basename "$OUT")"
+          mkdir -p "$RUNNER_TEMP/dist"
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip "$RUNNER_TEMP/dist/$name.zip" "$name" > /dev/null
+          else
+            tar -czf "$RUNNER_TEMP/dist/$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hfa-cli-${{ matrix.name }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish the GitHub release
+    needs: [version, app, cli]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      # Stable, versioned file names. Not published: the zipped macOS .app (the DMG carries the
+      # same app, signed in release runs, while the zip is made before signing).
+      - name: Collect the release files
+        run: |
+          set -euo pipefail
+          mkdir dist
+          a=artifacts
+          cp $a/headphone_for_all-windows-x64-setup/*.exe dist/
+          cp $a/headphone_for_all-windows-x64/headphone_for_all-windows-x64.zip \
+            "dist/Headphone_for_All-$VERSION-windows-x64-portable.zip"
+          cp $a/headphone_for_all-linux-appimage/*.AppImage dist/
+          cp $a/headphone_for_all-linux-flatpak/*.flatpak dist/
+          cp $a/headphone_for_all-linux-x64/headphone_for_all-linux-x64.tar.gz \
+            "dist/Headphone_for_All-$VERSION-linux-x64.tar.gz"
+          cp $a/headphone_for_all-macos-dmg/*.dmg dist/
+          cp $a/headphone_for_all-android-apk/app-release.apk "dist/Headphone_for_All-$VERSION-android.apk"
+          cp $a/headphone_for_all-android-aab/app-release.aab "dist/Headphone_for_All-$VERSION-android.aab"
+          cp $a/hfa-cli-*/* dist/
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          ls -l
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          name: Headphone for All ${{ env.VERSION }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

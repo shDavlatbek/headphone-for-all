@@ -6,16 +6,33 @@ and be heard **at the same time**.
 Order of work: build the risky core first (transport, drift, mixing) on the easiest OSes, then add
 platforms one at a time, and do the mobile hub last.
 
+## Status (September 2026)
+
+| Milestone | State | Still open |
+|---|---|---|
+| M0 Core engine + CLI | ✅ implemented | the 1-hour real-hardware exit test |
+| M1 Desktop MVP | ✅ implemented | exit test with three desktops; pairing-time measurement |
+| M2 Android sender | ✅ implemented | the compatibility list ([ANDROID_APPS.md](ANDROID_APPS.md)) has no tested entries yet |
+| M3 iOS sender | ✅ implemented | a real-device test of the native Bonjour discovery; UI copy about the red recording indicator; the 1-hour / memory exit test |
+| M4 Mobile hub | ✅ implemented | the 2-hour screen-off exit test; battery measurements |
+| M5 Polish and release | 🚧 in progress | see below |
+
+"Implemented" means the code, unit tests and CI builds exist; the exit criteria below still have to be
+checked on real devices. Details per milestone follow each section's list.
+
 ## M0: Core engine + CLI (Linux, Windows)
 
 - Rust workspace: `hfa-proto`, `hfa-core`, `hfa-cli`.
-- `hfa send --tone 440 --to <ip>` and `hfa hub`: one stream over UDP with Opus, a jitter buffer, and drift
+- `hfa send --source tone:440 --to <ip>` and `hfa hub`: one stream over UDP with Opus, a jitter buffer, and drift
   resampling, played through `cpal`.
 - System-audio capture: PipeWire monitor on Linux, WASAPI loopback on Windows.
 - Unit tests + a localhost integration test with simulated loss and jitter.
 
 **Exit criteria:** play music on a Linux or Windows laptop and hear it on another PC's headphone for 1 hour
 without glitches or drift build-up; latency without the Bluetooth hop is under 100 ms on home Wi-Fi.
+
+*Status:* implemented (`hfa-proto`, `hfa-audio`, `hfa-capture`, `hfa-core`, `hfa-cli`; PipeWire and WASAPI
+capture; `hfa selftest` with loss and jitter runs in CI). Exit test on real hardware: open.
 
 ## M1: Multi-source desktop MVP (Windows, macOS, Linux)
 
@@ -28,6 +45,9 @@ without glitches or drift build-up; latency without the Bluetooth hop is under 1
 **Exit criteria:** three desktops stream to one hub at once. Each can be adjusted on its own. The pairing
 flow takes under 30 s.
 
+*Status:* implemented (mixer with gain/mute/priority ducking/limiter, macOS process taps, mDNS, PIN/QR/link
+pairing, Noise, Flutter desktop app with tray, CI on all three desktop OSes). Exit test: open.
+
 ## M2: Android sender
 
 - Kotlin `CaptureService`: foreground service of type `mediaProjection` + `AudioPlaybackCapture` → JNI → Rust sender.
@@ -35,6 +55,9 @@ flow takes under 30 s.
 - A published compatibility list of popular apps (captured / blocked).
 
 **Exit criteria:** YouTube or a game on the phone and a video call on the laptop play together in a headphone on the PC hub.
+
+*Status:* implemented (capture service, `MulticastLock`, opt-out messaging). The compatibility list is
+started in [ANDROID_APPS.md](ANDROID_APPS.md) (rules + report template); app entries are untested.
 
 ## M3: iOS sender
 
@@ -45,6 +68,9 @@ flow takes under 30 s.
 **Exit criteria:** audio from the iPhone (for example YouTube in Safari, games, podcasts) is heard on the hub for 1 hour; the extension is
 not killed for using too much memory.
 
+*Status:* implemented (broadcast extension with the Rust sender, App Group, picker button, DRM note).
+Open: the red-indicator copy, iOS discovery (iOS pairs by QR code, link or address), the exit test.
+
 ## M4: Mobile hub ("any device is a hub")
 
 - Android hub: receive + mix + `AudioTrack`/AAudio output as `USAGE_MEDIA` without exclusive audio focus, in a
@@ -54,6 +80,9 @@ not killed for using too much memory.
 
 **Exit criteria:** headphone on the phone; the laptop's meeting audio plays over the phone's own music
 for 2 hours with the screen off.
+
+*Status:* implemented (Android `HubService`, iOS background audio with `.mixWithOthers`; DTX keep-alives).
+Open: the exit test and battery measurements.
 
 ## M5: Polish and release
 
@@ -66,6 +95,12 @@ for 2 hours with the screen off.
   - Linux: Flatpak / AppImage.
   - Android: Play Store.
   - iOS: App Store (broadcast-extension review).
+
+*Status:* in progress. Done: priority ducking; per-app capture on Windows and macOS; adaptive bitrate on
+reported loss, FEC and an adaptive jitter buffer; per-source stats in the UI; installers (Inno Setup,
+AppImage, Flatpak, DMG) and a tag-triggered release workflow that publishes them with the APK/AAB and
+the CLI, signing where keys are configured (docs/BUILDING.md, "Releasing"). Open: store releases (Play,
+App Store, Microsoft Store/MSIX, Flathub), the external security review, opt-in crash reporting.
 
 ## Future (after the MVP)
 

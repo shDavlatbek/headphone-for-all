@@ -1,0 +1,385 @@
+import 'package:flutter/services.dart';
+import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
+    show AnyhowException, PanicException;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:headphone_for_all/src/api/hfa_api.dart';
+import 'package:headphone_for_all/src/models/hub_target.dart';
+import 'package:headphone_for_all/src/models/source_choice.dart';
+import 'package:headphone_for_all/src/screens/pairing_sheet.dart';
+import 'package:headphone_for_all/src/util/format.dart';
+import 'package:headphone_for_all/src/widgets/level_meter.dart';
+
+AppInfo infoFor(String platform, {CapabilitiesDto? caps}) => AppInfo(
+  deviceId: 'id',
+  deviceName: 'n',
+  platform: platform,
+  version: '1',
+  capabilities: caps ?? FakeHfaApi.capabilitiesFor(platform),
+);
+
+void main() {
+  group('availableSources', () {
+    test('desktop with per-app capture offers everything', () {
+      expect(availableSources(infoFor('windows')), [
+        SourceKind.system,
+        SourceKind.systemExceptThisApp,
+        SourceKind.app,
+        SourceKind.tone,
+      ]);
+    });
+
+    test('Android offers native device audio and the tone', () {
+      expect(availableSources(infoFor('android')), [
+        SourceKind.deviceAudio,
+        SourceKind.tone,
+      ]);
+    });
+
+    test('iOS offers the broadcast and the tone', () {
+      expect(availableSources(infoFor('ios')), [
+        SourceKind.broadcast,
+        SourceKind.tone,
+      ]);
+    });
+
+    test('system mix without per-app hides "One app"', () {
+      const caps = CapabilitiesDto(
+        systemMix: true,
+        perApp: false,
+        mutesLocalOutput: false,
+        externalOnly: false,
+        notes: '',
+      );
+      expect(
+        availableSources(infoFor('linux', caps: caps)),
+        isNot(contains(SourceKind.app)),
+      );
+    });
+
+    test('no capture at all leaves the tone', () {
+      const caps = CapabilitiesDto(
+        systemMix: false,
+        perApp: false,
+        mutesLocalOutput: false,
+        externalOnly: false,
+        notes: '',
+      );
+      expect(availableSources(infoFor('unknown', caps: caps)), [
+        SourceKind.tone,
+      ]);
+    });
+  });
+
+  group('SourceChoice', () {
+    test('maps to the core capture sources', () {
+      expect(
+        const SourceChoice(SourceKind.system).toDto(),
+        const CaptureSourceDto.system(),
+      );
+      expect(
+        const SourceChoice(SourceKind.systemExceptThisApp).toDto(),
+        const CaptureSourceDto.systemExcludingSelf(),
+      );
+      const app = CaptureAppDto(pid: 42, name: 'Player');
+      const choice = SourceChoice(SourceKind.app, app: app);
+      expect(choice.toDto(), const CaptureSourceDto.process(pid: 42));
+      expect(choice.label, 'Player');
+      expect(
+        const SourceChoice(SourceKind.deviceAudio).toDto(),
+        const CaptureSourceDto.external_(
+          feedId: androidFeedId,
+          sampleRate: 48000,
+          channels: 2,
+        ),
+      );
+      expect(
+        const SourceChoice(SourceKind.tone).toDto(),
+        const CaptureSourceDto.tone(freqHz: 440),
+      );
+    });
+
+    test('an app choice without an app is incomplete', () {
+      expect(const SourceChoice(SourceKind.app).isComplete, isFalse);
+      expect(const SourceChoice(SourceKind.system).isComplete, isTrue);
+    });
+  });
+
+  group('HubTarget', () {
+    const hub = HubInfoDto(
+      deviceId: 'abcd',
+      name: 'Desk',
+      addrs: ['10.0.0.2', 'fe80::2'],
+      port: 47810,
+      platform: 'linux',
+      trusted: false,
+    );
+
+    test(
+      'discovered hubs dial the first address and need a PIN if untrusted',
+      () {
+        final t = HubTarget.discovered(hub);
+        expect(t.host, '10.0.0.2');
+        expect(t.needsPin, isTrue);
+        expect(t.withPin('123456').needsPin, isFalse);
+        final request = t
+            .withPin(' 123456 ')
+            .toRequest(const CaptureSourceDto.system(), label: 'x');
+        expect(request.hubHost, '10.0.0.2');
+        expect(request.hubPort, 47810);
+        expect(request.hubDeviceId, 'abcd');
+        expect(request.hubKey, isNull);
+        expect(request.pairingSecret, '123456');
+        expect(request.label, 'x');
+      },
+    );
+
+    test('paired peers are found by id (empty host)', () {
+      final t = HubTarget.paired(
+        const TrustedPeerDto(
+          deviceId: 'ef01',
+          name: 'Old',
+          pairedAtUnix: 0,
+          pairedAsHub: true,
+          pairedAsSender: true,
+        ),
+      );
+      expect(t.host, isEmpty);
+      expect(t.needsPin, isFalse);
+      expect(t.toRequest(const CaptureSourceDto.system()).hubDeviceId, 'ef01');
+    });
+
+    test('pairing links carry key and token', () {
+      final t = HubTarget.fromPairingUri(
+        const PairingUriDto(
+          host: 'fe80::5',
+          port: 47811,
+          hubId: 'KEY',
+          hubDeviceId: 'dev',
+          token: 'TOKEN',
+          name: 'Hub',
+        ),
+      );
+      final r = t.toRequest(const CaptureSourceDto.system());
+      expect(r.hubKey, 'KEY');
+      expect(r.pairingSecret, 'TOKEN');
+      expect(t.address, '[fe80::5]:47811');
+      expect(t.needsPin, isFalse);
+    });
+
+    test('manual targets keep an optional PIN', () {
+      expect(HubTarget.manual(host: 'h').pairingSecret, isNull);
+      expect(HubTarget.manual(host: 'h', pin: ' ').pairingSecret, isNull);
+      expect(
+        HubTarget.manual(host: 'h', pin: '000111').pairingSecret,
+        '000111',
+      );
+      expect(HubTarget.manual(host: 'h', port: 9).address, 'h:9');
+    });
+
+    test('isValidPin', () {
+      expect(isValidPin('123456'), isTrue);
+      expect(isValidPin(' 123456 '), isTrue);
+      expect(isValidPin('12345'), isFalse);
+      expect(isValidPin('12345a'), isFalse);
+    });
+  });
+
+  group('format', () {
+    test('levels, gains and times', () {
+      expect(formatDb(-120), 'silent');
+      expect(formatDb(-17.6), '-18 dB');
+      expect(formatGain(1.25), '125%');
+      expect(formatBitrate(128000), '128 kbit/s');
+      expect(formatBitrate(0), '—');
+      expect(formatCountdown(299), '4:59');
+      expect(formatCountdown(-5), '0:00');
+      expect(formatPin('482913'), '482 913');
+      expect(formatPercent(0.44), '0.4%');
+      expect(senderStateLabel('streaming'), 'Streaming');
+    });
+
+    test('meter fraction', () {
+      expect(LevelMeter.fraction(-120), 0);
+      expect(LevelMeter.fraction(-30), closeTo(0.5, 1e-9));
+      expect(LevelMeter.fraction(3), 1);
+      expect(LevelMeter.fraction(double.nan), 0);
+    });
+  });
+
+  test('describeError extracts the core message', () {
+    expect(describeError(const HfaApiException('boom')), 'boom');
+    expect(describeError(StateError('bad')), 'bad');
+    expect(
+      describeError(AnyhowException('the hub is not running\n\nStack:\n0: x')),
+      'the hub is not running',
+    );
+    expect(
+      describeError(PanicException('todo: engineBacktrace [{ fn: "x" }]')),
+      'Internal error: todo: engine',
+    );
+    // Native channel errors: the message, never Flutter's debug format.
+    expect(
+      describeError(
+        PlatformException(
+          code: 'serviceFailed',
+          message: 'The hub service could not start: not allowed',
+        ),
+      ),
+      'The hub service could not start: not allowed',
+    );
+    expect(
+      describeError(PlatformException(code: 'NO_APP_GROUP')),
+      contains('app group'),
+    );
+    expect(
+      describeError(PlatformException(code: 'WEIRD', message: ' ')),
+      'Platform error (WEIRD)',
+    );
+  });
+
+  test('the selected hub follows discovery and the trust store', () {
+    const hub = HubInfoDto(
+      deviceId: 'hub1',
+      name: 'Desk',
+      addrs: ['192.168.1.20'],
+      port: 47810,
+      platform: 'windows',
+      trusted: false,
+    );
+    const peer = TrustedPeerDto(
+      deviceId: 'hub1',
+      name: 'Desk',
+      pairedAtUnix: 1,
+      pairedAsHub: true,
+      pairedAsSender: true,
+    );
+    final selected = HubTarget.discovered(hub).withPin('123456');
+
+    // The hub restarted on another port and got another address.
+    const moved = HubInfoDto(
+      deviceId: 'hub1',
+      name: 'Desk',
+      addrs: ['192.168.1.77'],
+      port: 50000,
+      platform: 'windows',
+      trusted: false,
+    );
+    var fresh = currentHubTarget(
+      selected,
+      discovered: {'hub1': moved},
+      peers: const [],
+    );
+    expect(fresh.host, '192.168.1.77');
+    expect(fresh.port, 50000);
+    expect(fresh.pairingSecret, '123456');
+
+    // Paired from elsewhere meanwhile: no PIN needed any more.
+    fresh = currentHubTarget(
+      HubTarget.discovered(hub),
+      discovered: {'hub1': hub},
+      peers: const [peer],
+    );
+    expect(fresh.trusted, isTrue);
+    expect(fresh.needsPin, isFalse);
+
+    // No longer announced: the paired entry, at its last address if known.
+    fresh = currentHubTarget(
+      HubTarget.discovered(hub),
+      discovered: const {},
+      peers: const [peer],
+      addresses: const {'hub1': HubAddress('192.168.1.20', 47810)},
+    );
+    expect(fresh.origin, HubOrigin.paired);
+    expect(fresh.address, '192.168.1.20:47810');
+
+    // Not announced and no book address (desktop, Android): a discovered
+    // target is looked up by id, since its announced address may be stale...
+    fresh = currentHubTarget(
+      HubTarget.discovered(hub),
+      discovered: const {},
+      peers: const [peer],
+    );
+    expect(fresh.host, isEmpty);
+    // ...but a remembered paired hub (added by address, not advertised)
+    // keeps its own address and key, so "Send to" still reaches it.
+    const remembered = HubTarget(
+      name: 'Desk',
+      origin: HubOrigin.paired,
+      host: '192.168.1.44',
+      port: 47810,
+      deviceId: 'hub1',
+      hubKey: 'a2V5',
+      trusted: true,
+    );
+    fresh = currentHubTarget(
+      remembered,
+      discovered: const {},
+      peers: const [peer],
+    );
+    expect(fresh.origin, HubOrigin.paired);
+    expect((fresh.host, fresh.port), ('192.168.1.44', 47810));
+    expect(fresh.hubKey, 'a2V5');
+    expect(fresh.trusted, isTrue);
+    expect(
+      fresh.toRequest(const CaptureSourceDto.system()).hubHost,
+      '192.168.1.44',
+    );
+    // A newer book address wins over the remembered one.
+    fresh = currentHubTarget(
+      remembered,
+      discovered: const {},
+      peers: const [peer],
+      addresses: const {'hub1': HubAddress('192.168.1.45', 47811)},
+    );
+    expect(fresh.address, '192.168.1.45:47811');
+
+    // Typed-in and scanned targets are what the user entered.
+    final manual = HubTarget.manual(host: '10.0.0.2');
+    expect(
+      currentHubTarget(manual, discovered: {'hub1': hub}, peers: const [peer]),
+      same(manual),
+    );
+  });
+
+  test('a typed hub address is split into host and port', () {
+    ({String host, int? port}) hp(String host, [int? port]) =>
+        (host: host, port: port);
+    expect(splitHostPort('192.168.1.20:47810'), hp('192.168.1.20', 47810));
+    expect(splitHostPort(' [fd00::20]:47810 '), hp('fd00::20', 47810));
+    expect(splitHostPort('[fd00::20]'), hp('fd00::20'));
+    expect(splitHostPort('fd00::20'), hp('fd00::20'));
+    expect(splitHostPort('fe80::1%eth0'), hp('fe80::1%eth0'));
+    expect(splitHostPort('desk-pc.local'), hp('desk-pc.local'));
+    expect(splitHostPort('desk-pc.local:5000'), hp('desk-pc.local', 5000));
+    expect(splitHostPort('10.0.0.9'), hp('10.0.0.9'));
+    for (final bad in [
+      '',
+      '  ',
+      ':47810',
+      '10.0.0.9:',
+      '10.0.0.9:0',
+      '10.0.0.9:65536',
+      '10.0.0.9:port',
+      '[fd00::20',
+      '[]:1',
+      '[fd00::20]47810',
+      '[fd00::20]:',
+      'fd00::20]:1',
+      'desk pc',
+    ]) {
+      expect(splitHostPort(bad), isNull, reason: bad);
+    }
+  });
+
+  test('the hub address is read from a pairing URI', () {
+    expect(
+      pairingUriAddress('hfa://pair?v=0&h=192.168.1.5&p=47810&id=x&t=y&n=D'),
+      '192.168.1.5:47810',
+    );
+    expect(
+      pairingUriAddress('hfa://pair?v=0&h=fe80::1&p=1&id=x'),
+      '[fe80::1]:1',
+    );
+    expect(pairingUriAddress('hfa://pair?v=0&id=x'), isNull);
+  });
+}

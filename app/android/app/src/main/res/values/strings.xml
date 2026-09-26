@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Headphone for All</string>
+
+    <!-- Notification channels -->
+    <string name="channel_capture_name">Audio streaming</string>
+    <string name="channel_capture_description">Shown while this device streams its audio to a hub.</string>
+    <string name="channel_hub_name">Hub</string>
+    <string name="channel_hub_description">Shown while this device mixes and plays the audio of other devices.</string>
+
+    <!-- Capture service -->
+    <string name="capture_notification_title">Streaming device audio</string>
+    <string name="capture_notification_text">Audio played on this device is sent to your headphone hub.</string>
+    <string name="action_stop">Stop</string>
+    <string name="capture_stopped_by_user">Stopped from the notification</string>
+    <string name="capture_stopped_by_system">Audio capture was ended by the system</string>
+    <string name="capture_stopped_by_system_or_lock">Android stopped the audio capture (the screen was locked, or the capture was ended from the status bar). Unlock the phone and tap Start again.</string>
+    <string name="capture_stopped_no_sender">No sender is streaming this audio any more</string>
+    <string name="capture_error_permission">Capturing this device\'s audio needs the audio recording permission. Tap Start again and allow it, or turn it on in App info &gt; Permissions.</string>
+    <string name="capture_error_foreground">The capture service could not start: %1$s</string>
+    <string name="capture_error_projection">Screen capture permission is not usable: %1$s</string>
+    <string name="capture_error_record">Audio capture failed: %1$s</string>
+
+    <!-- Audio recording permission denied for good -->
+    <string name="permission_record_title">Audio recording permission needed</string>
+    <string name="permission_record_settings">Android no longer asks for this permission. To stream this device\'s audio, open App info, then Permissions, and allow Microphone (it is used only to record the audio other apps play).</string>
+    <string name="action_open_settings">Open App info</string>
+
+    <!-- Hub service -->
+    <string name="hub_notification_title">Hub is running</string>
+    <string name="hub_notification_text">Mixing the audio of your devices into this headphone.</string>
+</resources>

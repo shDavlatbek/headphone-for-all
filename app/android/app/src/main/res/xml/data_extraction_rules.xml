@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ (API 31+): what cloud backup and device-to-device transfer may copy.
+     filesDir/hfa holds the device's Noise private key (identity.json), its pairings
+     (trusted.json) and settings. They must stay on this device: a restored copy would give a
+     second phone the same device id and the same pairings (docs/CONTRACTS.md §8.8.1). -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="hfa" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="hfa" />
+    </device-transfer>
+</data-extraction-rules>

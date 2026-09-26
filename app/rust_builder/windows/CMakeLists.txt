@@ -1,0 +1,23 @@
+# The Flutter tooling requires that developers have a version of Visual Studio
+# installed that includes CMake 3.14 or later. You should not increase this
+# version, as doing so will cause the plugin to fail to compile for some
+# customers of the plugin.
+cmake_minimum_required(VERSION 3.14)
+
+# Project-level configuration.
+set(PROJECT_NAME "rust_lib_headphone_for_all")
+project(${PROJECT_NAME} LANGUAGES CXX)
+
+include("../cargokit/cmake/cargokit.cmake")
+# The Rust crate is core/hfa-ffi (library `hfa_ffi`). The path is relative to
+# windows/flutter/ephemeral/.plugin_symlinks/rust_lib_headphone_for_all/windows (Windows does
+# not resolve the plugin symlink): 6 levels up is app/, 7 levels up the repository root.
+apply_cargokit(${PROJECT_NAME} ../../../../../../../core/hfa-ffi hfa_ffi "")
+
+# List of absolute paths to libraries that should be bundled with the plugin.
+# This list could contain prebuilt libraries, or libraries created by an
+# external build triggered from this build file.
+set(rust_lib_headphone_for_all_bundled_libraries
+  "${${PROJECT_NAME}_cargokit_lib}"
+  PARENT_SCOPE
+)

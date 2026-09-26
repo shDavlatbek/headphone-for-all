@@ -1,0 +1,44 @@
+name: App compatibility report (Android)
+description: Report whether an Android app's audio is captured by the Android sender.
+title: "App compatibility: <app name>"
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! Reports fill in docs/ANDROID_APPS.md. Please test with the app playing normally
+        (not a call) while the Android sender is streaming to a hub.
+  - type: input
+    id: app
+    attributes:
+      label: App name and version
+      placeholder: "Spotify 9.0.12.345"
+    validations:
+      required: true
+  - type: input
+    id: android
+    attributes:
+      label: Android version and device
+      placeholder: "Android 15, Pixel 8"
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result
+      options:
+        - Captured (heard on the hub)
+        - Silent (nothing on the hub)
+        - Partly (some content silent)
+    validations:
+      required: true
+  - type: input
+    id: hfa
+    attributes:
+      label: Headphone for All version
+      placeholder: "1.0.0 (or CI run / commit)"
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: What you played, whether a workaround (e.g. the website in Chrome) worked.

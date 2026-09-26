@@ -1,0 +1,35 @@
+[package]
+name = "hfa-cli"
+description = "headphone-for-all headless command-line hub/sender and selftest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hfa"
+path = "src/main.rs"
+
+[features]
+default = ["bundled-opus"]
+# Build libopus from bundled source (static). Disable to link the system libopus.
+bundled-opus = ["hfa-core/bundled-opus"]
+
+[dependencies]
+hfa-proto = { workspace = true }
+hfa-audio = { workspace = true }
+hfa-capture = { workspace = true }
+hfa-core = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+qrcode = { workspace = true }
+# Lock of the data dir (running hub/sender vs. `hfa trust remove`).
+fs4 = { workspace = true }
+# Streaming read of the selftest's output WAV (left channel only).
+hound = { workspace = true }
+# Temporary data dirs and WAV of `hfa selftest`.
+tempfile = { workspace = true }
