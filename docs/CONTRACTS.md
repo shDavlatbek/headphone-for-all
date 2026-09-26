@@ -1978,7 +1978,9 @@ platform hook (§6.4) through a small C ABI in `hfa-ffi`:
   control port just to learn its address) and `NetService` (deprecated). Advertise = `DNSServiceRegister` on
   the hub's existing port (`NWListener` would bind its own). One serial queue, dns_sd references scheduled
   and deallocated on it; failures retried after 1 s doubling to 30 s. Info.plist: `NSLocalNetworkUsageDescription`,
-  `NSBonjourServices = [_hfa._tcp]` (checked by an XCTest).
+  `NSBonjourServices = [_hfa._tcp]` (an XCTest checks that the built plist **contains** `_hfa._tcp`: Flutter's
+  Xcode build phase adds `_dartVmService._tcp` to Debug and Profile builds, so nothing may assume the list has
+  exactly one entry).
 - **Still true:** the broadcast extension cannot discover (no backend there); `writeBroadcastConfig` still
   requires `hubHost` and the app passes the address it knows (a discovered hub's first address).
 

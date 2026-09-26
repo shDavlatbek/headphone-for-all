@@ -419,9 +419,19 @@ final class BonjourCodecTests: XCTestCase {
     }
   }
 
-  func testServiceTypeIsDeclaredInInfoPlist() {
-    let services = Bundle.main.object(forInfoDictionaryKey: "NSBonjourServices") as? [String]
-    XCTAssertEqual(services, [HfaBonjourCodec.serviceType])
+  func testServiceTypeIsDeclaredInInfoPlist() throws {
+    // The built Info.plist must list our service type, but not necessarily only ours: in Debug
+    // and Profile builds Flutter's Xcode build phase (flutter_tools/bin/xcode_backend.dart,
+    // `addVmServiceBonjourService`) inserts `_dartVmService._tcp` at the front of
+    // NSBonjourServices so that `flutter attach` can find the Dart VM service. The XCTests run
+    // a Debug build, where the array is ["_dartVmService._tcp", "_hfa._tcp"]; a Release build
+    // has only ours. So check membership, not equality.
+    let services = try XCTUnwrap(
+      Bundle.main.object(forInfoDictionaryKey: "NSBonjourServices") as? [String],
+      "NSBonjourServices is missing or not a list of strings")
+    XCTAssertTrue(
+      services.contains(HfaBonjourCodec.serviceType),
+      "NSBonjourServices \(services) lacks \(HfaBonjourCodec.serviceType)")
     XCTAssertNotNil(Bundle.main.object(forInfoDictionaryKey: "NSLocalNetworkUsageDescription"))
   }
 }
