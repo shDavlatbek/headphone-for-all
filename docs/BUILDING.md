@@ -428,7 +428,8 @@ python3 -c "import yaml,glob; [yaml.safe_load(open(f)) for f in glob.glob('.gith
    host's libpipewire-0.3, i.e. a 2024+ distribution), `windows-x86_64` (MSVC) and `macos-universal` (lipo of both Mac
    architectures), each archived with the licence files.
 4. **Publish** (tags only): a GitHub release with generated notes (a tag with a `-`, e.g. `v1.2.0-beta.1`,
-   becomes a pre-release), the files below and `SHA256SUMS`.
+   and every `0.x` version become pre-releases); the notes are the version's section of `CHANGELOG.md` (the
+   release fails without one), followed by the generated list of merged pull requests, the files below and `SHA256SUMS`.
 
 | File | Signed when |
 |---|---|

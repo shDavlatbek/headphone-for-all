@@ -26,10 +26,11 @@ The headphone sees one normal source, so no firmware hacks and no special headph
 
 ## Status
 
-🧪 **Pre-release.** The Rust core, the headless `hfa` CLI and the Flutter app are implemented for all
-five platforms (roadmap milestones M0–M4; M5 polish and distribution is in progress), with installers
-and CI builds. Nothing has been released yet, and the builds have not been through the long-run
-exit tests of the roadmap on real hardware. Expect rough edges.
+🧪 **Pre-release — [v0.1.0](https://github.com/shDavlatbek/headphone-for-all/releases/tag/v0.1.0).** The Rust
+core, the headless `hfa` CLI and the Flutter app are implemented for all five platforms (roadmap milestones
+M0–M4; M5 polish and distribution is in progress), with installers and CI builds. The builds are unsigned and
+have not been through the long-run exit tests of the roadmap on real hardware yet. Expect rough edges, and
+please report what works on your devices. What changed in each version: [CHANGELOG.md](CHANGELOG.md).
 
 What has been exercised where:
 

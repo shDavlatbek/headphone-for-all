@@ -72,9 +72,10 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
-    <release version="1.0.0" date="2026-09-25">
+    <release version="0.1.0" date="2026-09-26" type="development">
       <description>
-        <p>First release.</p>
+        <p>First public pre-release: mix the audio of several devices into one headphone over the local
+          network. Not yet tested on real hardware; see the release notes for known limitations.</p>
       </description>
     </release>
   </releases>

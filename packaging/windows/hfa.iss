@@ -3,8 +3,8 @@
 ; Inno Setup script for the Headphone for All Windows installer.
 ;
 ; Build with packaging/windows/build-installer.ps1 (CI), or by hand:
-;   ISCC.exe /DAppVersion=1.0.0 /DSourceDir=<release dir> packaging\windows\hfa.iss
-; (for a pre-release also /DAppVersionNumeric=1.0.0 with /DAppVersion=1.0.0-rc.1)
+;   ISCC.exe /DAppVersion=0.1.0 /DSourceDir=<release dir> packaging\windows\hfa.iss
+; (for a pre-release also /DAppVersionNumeric=0.1.0 with /DAppVersion=0.1.0-rc.1)
 ; SourceDir defaults to the Flutter release output
 ; app\build\windows\x64\runner\Release (the script adds the MSVC runtime DLLs
 ; to a staged copy of it). Requires Inno Setup 6.3 or newer.
@@ -20,7 +20,7 @@
 ;   AppUserModelID of the shortcuts = the runner's explicit AppUserModelID.
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "0.1.0"
 #endif
 ; Version resource of the setup .exe: numbers only, so a pre-release
 ; AppVersion (1.2.3-beta.1) needs the numeric part here (the build script

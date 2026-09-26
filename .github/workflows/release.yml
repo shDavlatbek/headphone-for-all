@@ -156,6 +156,26 @@ jobs:
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+      # The release notes are this version's CHANGELOG.md section (from its "## [x.y.z]" heading to
+      # the next one); GitHub's generated notes (merged PRs) are appended after them.
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on && /^\[[^]]*\]: / { next }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md"; then
+            echo "::error::CHANGELOG.md has no section for $VERSION"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/release-notes.md"
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -185,6 +205,8 @@ jobs:
         with:
           files: dist/*
           name: Headphone for All ${{ env.VERSION }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # A pre-release: a tag with a suffix (v1.2.0-beta.1) and every 0.x version.
+          prerelease: ${{ contains(github.ref_name, '-') || startsWith(github.ref_name, 'v0.') }}
+          body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
           fail_on_unmatched_files: true
