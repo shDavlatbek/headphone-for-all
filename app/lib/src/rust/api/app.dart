@@ -44,6 +44,12 @@ Future<List<TrustedPeerDto>> trustedPeers() =>
 Future<void> forgetPeer({required String deviceId}) =>
     RustLib.instance.api.crateApiAppForgetPeer(deviceId: deviceId);
 
+/// The device id (fingerprint, `ab12-cd34-ef56-7890`) of a static key given as base64url
+/// (padded or not, e.g. `PairingUriDto.hub_id`), to look the key's device up in
+/// `trusted_peers`. Fails for text that is not a 32-byte base64url key.
+Future<String> fingerprintOfKey({required String keyB64}) =>
+    RustLib.instance.api.crateApiAppFingerprintOfKey(keyB64: keyB64);
+
 /// Parses a pairing URI scanned from a QR code.
 Future<PairingUriDto> parsePairingUri({required String uri}) =>
     RustLib.instance.api.crateApiAppParsePairingUri(uri: uri);
@@ -254,6 +260,11 @@ class SettingsDto {
 }
 
 /// A paired device.
+///
+/// Pairing grants trust in one direction (CONTRACTS §6.4 refinements): this device streams
+/// only to peers it paired with as a sender (`paired_as_hub`), and its hub accepts only
+/// peers that paired with it (`paired_as_sender`). Entries from before roles existed have
+/// both.
 class TrustedPeerDto {
   /// Device id (fingerprint).
   final String deviceId;
@@ -264,14 +275,27 @@ class TrustedPeerDto {
   /// Unix time (seconds) of pairing.
   final PlatformInt64 pairedAtUnix;
 
+  /// Trusted as a hub: this device paired with it and may stream to it without a PIN.
+  final bool pairedAsHub;
+
+  /// Trusted as a sender: it paired with this device's hub and may stream into it.
+  final bool pairedAsSender;
+
   const TrustedPeerDto({
     required this.deviceId,
     required this.name,
     required this.pairedAtUnix,
+    required this.pairedAsHub,
+    required this.pairedAsSender,
   });
 
   @override
-  int get hashCode => deviceId.hashCode ^ name.hashCode ^ pairedAtUnix.hashCode;
+  int get hashCode =>
+      deviceId.hashCode ^
+      name.hashCode ^
+      pairedAtUnix.hashCode ^
+      pairedAsHub.hashCode ^
+      pairedAsSender.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -280,5 +304,7 @@ class TrustedPeerDto {
           runtimeType == other.runtimeType &&
           deviceId == other.deviceId &&
           name == other.name &&
-          pairedAtUnix == other.pairedAtUnix;
+          pairedAtUnix == other.pairedAtUnix &&
+          pairedAsHub == other.pairedAsHub &&
+          pairedAsSender == other.pairedAsSender;
 }

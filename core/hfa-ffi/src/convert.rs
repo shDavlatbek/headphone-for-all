@@ -109,6 +109,8 @@ pub(crate) fn apply_settings(current: &Settings, dto: &SettingsDto) -> Result<Se
         jitter_min_ms: dto.jitter_min_ms,
         jitter_max_ms: dto.jitter_max_ms,
         output,
+        // Not a settings-screen field: `hub_set_master_gain` owns it.
+        master_gain: current.master_gain,
         data_dir: current.data_dir.clone(),
     })
 }
@@ -119,7 +121,17 @@ pub(crate) fn trusted_peer_dto(p: &TrustedPeer) -> TrustedPeerDto {
         device_id: p.device_id.clone(),
         name: p.name.clone(),
         paired_at_unix: unix_i64(p.paired_at),
+        paired_as_hub: p.roles.hub,
+        paired_as_sender: p.roles.sender,
     }
+}
+
+/// The addresses a sender can type to reach a hub on `port`: `ip:port`, IPv6 as
+/// `[ip]:port`, in the order of `ips` (see `hfa_core::pairing::lan_addresses`).
+pub(crate) fn hub_addresses(ips: &[std::net::IpAddr], port: u16) -> Vec<String> {
+    ips.iter()
+        .map(|ip| std::net::SocketAddr::new(*ip, port).to_string())
+        .collect()
 }
 
 /// [`hfa_proto::PairingUri`] → [`PairingUriDto`].
@@ -236,7 +248,7 @@ pub(crate) fn sender_status_dto(s: &SenderStatus, meta: &SenderMeta) -> SenderSt
 }
 
 /// The hub status while no hub runs.
-pub(crate) fn stopped_hub_status(device_name: String) -> HubStatusDto {
+pub(crate) fn stopped_hub_status(device_name: String, master_gain: f32) -> HubStatusDto {
     HubStatusDto {
         running: false,
         port: 0,
@@ -244,6 +256,8 @@ pub(crate) fn stopped_hub_status(device_name: String) -> HubStatusDto {
         source_count: 0,
         advertised: false,
         advertise_error: None,
+        master_gain,
+        addresses: Vec::new(),
     }
 }
 
@@ -330,6 +344,7 @@ mod tests {
             jitter_min_ms: 20,
             jitter_max_ms: 150,
             output: OutputTarget::Device("USB Headset".into()),
+            master_gain: 0.5,
             data_dir: PathBuf::from("/data/hfa"),
         }
     }
@@ -676,9 +691,40 @@ mod tests {
             TrustedPeerDto {
                 device_id: "id".into(),
                 name: "Phone".into(),
-                paired_at_unix: 1_700_000_000
+                paired_at_unix: 1_700_000_000,
+                paired_as_hub: true,
+                paired_as_sender: true,
             }
         );
+        for (role, hub, sender) in [
+            (hfa_core::PeerRole::Hub, true, false),
+            (hfa_core::PeerRole::Sender, false, true),
+        ] {
+            let dto = trusted_peer_dto(&TrustedPeer {
+                roles: hfa_core::PeerRoles::only(role),
+                ..peer.clone()
+            });
+            assert_eq!((dto.paired_as_hub, dto.paired_as_sender), (hub, sender));
+        }
+    }
+
+    #[test]
+    fn hub_addresses_are_typable() {
+        let ips: Vec<IpAddr> = vec![
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x20)),
+        ];
+        assert_eq!(
+            hub_addresses(&ips, 47810),
+            vec![
+                "192.168.1.20:47810".to_owned(),
+                "[fd00::20]:47810".to_owned()
+            ]
+        );
+        assert!(hub_addresses(&[], 47810).is_empty());
+        let stopped = stopped_hub_status("Desk".into(), 0.25);
+        assert!(!stopped.running && stopped.addresses.is_empty());
+        assert!((stopped.master_gain - 0.25).abs() < f32::EPSILON);
     }
 
     #[test]

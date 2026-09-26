@@ -31,6 +31,9 @@ void main() {
     await native.writeBroadcastConfig(
       const BroadcastConfig(hubHost: 'h', hubPort: 1, label: 'l'),
     );
+    expect(await native.getBroadcastStatus(), isNull);
+    await native.beginStreaming();
+    await native.endStreaming();
     expect(await native.captureSupport(), isNull);
     expect(await native.isAvailable(), isFalse);
     // Never listens to the missing event channel.
@@ -138,6 +141,121 @@ void main() {
       NativeEvent.fromMap({'type': 'other'}).type,
       NativeEventType.unknown,
     );
+  });
+
+  group('iOS broadcast status', () {
+    test('getBroadcastStatus reads the contract keys', () async {
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        expect(call.method, 'getBroadcastStatus');
+        return {
+          'state': 'reconnecting',
+          'message': 'Wi-Fi changed',
+          'hubName': 'Desk PC',
+          'updatedAtMs': 1767225600123,
+        };
+      });
+      final status = await NativeChannel(eventsSupported: false)
+          .getBroadcastStatus();
+      expect(
+        status,
+        BroadcastStatus(
+          state: BroadcastState.reconnecting,
+          message: 'Wi-Fi changed',
+          hubName: 'Desk PC',
+          updatedAt: DateTime.fromMillisecondsSinceEpoch(1767225600123),
+        ),
+      );
+      expect(status!.state.isRunning, isTrue);
+    });
+
+    test('the legacy shape {broadcasting, state, message, timestamp} still '
+        'parses', () {
+      // The extension's broadcast_status.json states, timestamp in seconds.
+      final running = BroadcastStatus.fromMap({
+        'broadcasting': true,
+        'state': 'started',
+        'timestamp': 1767225600.5,
+      });
+      expect(running.state, BroadcastState.streaming);
+      expect(
+        running.updatedAt,
+        DateTime.fromMillisecondsSinceEpoch(1767225600500),
+      );
+      final finished = BroadcastStatus.fromMap({
+        'broadcasting': false,
+        'state': 'finished',
+        'message': 'The broadcast stopped unexpectedly.',
+      });
+      expect(finished.state, BroadcastState.stopped);
+      expect(finished.message, 'The broadcast stopped unexpectedly.');
+      // Not broadcasting although the last status said it ran.
+      expect(
+        BroadcastStatus.fromMap({'broadcasting': false, 'state': 'streaming'})
+            .state,
+        BroadcastState.stopped,
+      );
+      expect(
+        BroadcastStatus.fromMap({'broadcasting': false}).state,
+        BroadcastState.idle,
+      );
+      expect(
+        BroadcastStatus.fromMap({'broadcasting': true}).state,
+        BroadcastState.streaming,
+      );
+    });
+
+    test('unknown states and junk fields are idle / ignored', () {
+      final status = BroadcastStatus.fromMap({
+        'state': 'teleporting',
+        'message': '  ',
+        'hubName': 42,
+        'updatedAtMs': 'soon',
+      });
+      expect(status, BroadcastStatus.idle);
+    });
+
+    test('a broadcastStatus event carries the status', () {
+      final event = NativeEvent.fromMap({
+        'type': 'broadcastStatus',
+        'state': 'failed',
+        'message': 'The hub refused the connection',
+        'hubName': 'Desk PC',
+        'updatedAtMs': 1000,
+      });
+      expect(event.type, NativeEventType.broadcastStatus);
+      expect(event.broadcast?.state, BroadcastState.failed);
+      expect(event.broadcast?.hubName, 'Desk PC');
+      expect(event.message, 'The hub refused the connection');
+      // Other events carry none.
+      expect(
+        NativeEvent.fromMap({'type': 'broadcastStarted'}).broadcast,
+        isNull,
+      );
+    });
+
+    test('platforms without it answer null and stay available', () async {
+      final methods = <String>[];
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        methods.add(call.method);
+        return switch (call.method) {
+          'getDataDir' => '/data/hfa',
+          // Android: result.notImplemented().
+          _ => throw MissingPluginException(),
+        };
+      });
+      final native = NativeChannel(eventsSupported: false);
+      expect(await native.getBroadcastStatus(), isNull);
+      await native.beginStreaming();
+      await native.endStreaming();
+      // "Not implemented" for one method says nothing about the channel.
+      expect(await native.isAvailable(), isTrue);
+      expect(methods, [
+        'getBroadcastStatus',
+        'beginStreaming',
+        'endStreaming',
+        'getDataDir',
+      ]);
+    });
   });
 
   test('initCore prefers the native data directory', () async {

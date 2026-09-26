@@ -4,13 +4,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/core_providers.dart';
 import '../util/format.dart';
+import '../util/links.dart';
 import '../widgets/dialogs.dart';
 
-/// Project home page.
-const projectUrl = 'https://github.com/shDavlatbek/headphone-for-all';
-
-/// Where to report problems.
-const issuesUrl = '$projectUrl/issues';
+export '../util/links.dart' show issuesUrl, projectUrl, userGuideUrl;
 
 /// Version, device identity, licences and links.
 class AboutScreen extends ConsumerWidget {
@@ -75,12 +72,19 @@ class AboutScreen extends ConsumerWidget {
                 title: const Text('Platform'),
                 subtitle: Text(platformName(info.platform)),
               ),
-              _LinkTile(
+              const _LinkTile(
+                key: Key('help-guide'),
+                icon: Icons.help_outline,
+                title: 'Help & user guide',
+                subtitle: 'Setting up, pairing, troubleshooting',
+                url: userGuideUrl,
+              ),
+              const _LinkTile(
                 icon: Icons.code,
                 title: 'Source code',
                 url: projectUrl,
               ),
-              _LinkTile(
+              const _LinkTile(
                 icon: Icons.bug_report_outlined,
                 title: 'Report a problem',
                 url: issuesUrl,
@@ -108,25 +112,37 @@ class AboutScreen extends ConsumerWidget {
   }
 }
 
-/// A link: tapping copies it (the app ships no browser launcher).
-class _LinkTile extends StatelessWidget {
-  const _LinkTile({required this.icon, required this.title, required this.url});
+/// A link: tapping opens it in the browser (copied where that fails), the
+/// copy button copies it.
+class _LinkTile extends ConsumerWidget {
+  const _LinkTile({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.url,
+    this.subtitle,
+  });
 
   final IconData icon;
   final String title;
   final String url;
+  final String? subtitle;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return ListTile(
       leading: Icon(icon),
       title: Text(title),
-      subtitle: Text(url),
-      trailing: const Icon(Icons.copy, size: 18),
-      onTap: () async {
-        await Clipboard.setData(ClipboardData(text: url));
-        if (context.mounted) showMessage(context, 'Link copied');
-      },
+      subtitle: Text(subtitle ?? url),
+      trailing: IconButton(
+        tooltip: 'Copy link',
+        icon: const Icon(Icons.copy, size: 18),
+        onPressed: () async {
+          await Clipboard.setData(ClipboardData(text: url));
+          if (context.mounted) showMessage(context, 'Link copied');
+        },
+      ),
+      onTap: () => openLink(context, ref, url),
     );
   }
 }

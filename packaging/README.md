@@ -61,8 +61,8 @@ first page offers "install for all users"). It installs the whole Flutter releas
 plugin DLLs and `data\`) plus the MSVC runtime DLLs, and creates a Start-menu shortcut (optional desktop
 shortcut and "start in the notification area when I sign in"), all carrying the app's AppUserModelID. The
 sign-in shortcut passes `--autostart`, so the app starts hidden in the tray instead of opening its window
-at every sign-in. It only starts the app: the hub is not switched on by itself (there is no "start the hub
-at launch" setting yet), which is why the task says "switch the hub on from there". With an all-users
+at every sign-in. It only starts the app: the hub starts too when the app's Settings → "Start the hub
+when the app opens" is on (otherwise switch it on from the tray, as the task's wording says). With an all-users
 install it can add an inbound Windows Firewall rule for the program on **private** networks, which a hub
 needs.
 

@@ -5,6 +5,8 @@ import 'package:headphone_for_all/src/state/hub_controller.dart';
 import 'package:headphone_for_all/src/state/navigation.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
+import 'package:flutter/services.dart';
+
 import 'helpers.dart';
 
 FakeHfaApi fakeWithSources() => FakeHfaApi()
@@ -283,6 +285,72 @@ void main() {
     await startHub(tester);
     expect(find.text('Hub is on'), findsOneWidget);
     expect(find.byKey(const Key('hub-error')), findsNothing);
+    await unmount(tester);
+  });
+
+  testWidgets('the header lists the addresses to type into a sender', (
+    tester,
+  ) async {
+    final fake = FakeHfaApi();
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map)['text'] as String?;
+        }
+        return null;
+      },
+    );
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      ),
+    );
+    await pumpApp(tester, fake, section: AppSection.hub);
+    expect(find.byKey(const Key('hub-address-0')), findsNothing);
+    await startHub(tester);
+    expect(find.text('192.168.1.10:47810'), findsOneWidget);
+    expect(find.text('[fd00::10]:47810'), findsOneWidget);
+    expect(find.byKey(const Key('not-discoverable')), findsNothing);
+    await tester.tap(find.byKey(const Key('copy-hub-address-1')));
+    await tester.pumpAndSettle();
+    expect(copied, '[fd00::10]:47810');
+    expect(find.text('Copied [fd00::10]:47810'), findsOneWidget);
+    await unmount(tester);
+  });
+
+  testWidgets('a hub that cannot be announced says why', (tester) async {
+    final fake = FakeHfaApi()
+      ..advertiseError = 'multicast is not available on this network';
+    await pumpApp(tester, fake, section: AppSection.hub);
+    await startHub(tester);
+    expect(find.byKey(const Key('not-discoverable')), findsOneWidget);
+    expect(
+      find.text('Not discoverable — senders must add this hub by address'),
+      findsOneWidget,
+    );
+    expect(
+      find.text('Reason: multicast is not available on this network'),
+      findsOneWidget,
+    );
+    // The addresses to add it by are right there.
+    expect(find.byKey(const Key('hub-address-0')), findsOneWidget);
+    await unmount(tester);
+  });
+
+  testWidgets('the master slider shows the gain the core saved', (
+    tester,
+  ) async {
+    final fake = FakeHfaApi()..masterGain = 0.5;
+    await pumpApp(tester, fake, section: AppSection.hub);
+    // Before any start (the core applies it when the hub starts).
+    expect(find.text('50%'), findsOneWidget);
+    final slider = tester.widget<Slider>(find.byKey(const Key('master-gain')));
+    expect(slider.value, 0.5);
+    await startHub(tester);
+    expect(find.text('50%'), findsOneWidget);
     await unmount(tester);
   });
 }

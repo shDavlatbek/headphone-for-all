@@ -71,6 +71,8 @@ Any device can be the hub.
   addresses only. Guest networks and access points with client isolation block it: use "Add by address"
   or a network without isolation.
 - The CLI and the app keep separate identities and pairings (different data directories).
+- Starting at sign-in: the app switches it itself only on Linux (Settings); on Windows it is the
+  installer's option, on macOS add the app under System Settings → Login Items.
 - No store releases, no crash reporting yet.
 
 ## Install

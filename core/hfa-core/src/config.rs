@@ -33,6 +33,11 @@ pub struct Settings {
     pub jitter_max_ms: u32,
     /// Where the hub plays the mix.
     pub output: OutputTarget,
+    /// The hub's master linear gain, [`MIN_MASTER_GAIN`]`..=`[`MAX_MASTER_GAIN`] (1.0 =
+    /// unchanged). `HubEngine::start` applies it, so the listener's volume survives hub and
+    /// app restarts; the app saves it whenever the master slider moves (a missing field in
+    /// older files means 1.0).
+    pub master_gain: f32,
     /// Directory holding settings, identity and trust store. Not serialized: it is where the
     /// file was loaded from.
     #[serde(skip)]
@@ -40,8 +45,8 @@ pub struct Settings {
 }
 
 impl Default for Settings {
-    /// Port 47810, 128 kbit/s, 10 ms, FEC on, jitter 20..=150 ms, default output,
-    /// device name from the host name, data dir = [`default_data_dir`] (or `.` if unknown).
+    /// Port 47810, 128 kbit/s, 10 ms, FEC on, jitter 20..=150 ms, default output, master
+    /// gain 1.0, device name from the host name, data dir = [`default_data_dir`] (or `.` if unknown).
     fn default() -> Self {
         Self {
             device_name: default_device_name(),
@@ -52,6 +57,7 @@ impl Default for Settings {
             jitter_min_ms: 20,
             jitter_max_ms: 150,
             output: OutputTarget::Default,
+            master_gain: 1.0,
             data_dir: default_data_dir().unwrap_or_else(|| PathBuf::from(".")),
         }
     }
@@ -65,6 +71,10 @@ pub const MAX_BITRATE: u32 = 510_000;
 pub const FRAME_MS_CHOICES: [u32; 2] = [10, 20];
 /// Upper bound for the jitter-buffer targets (ms).
 pub const MAX_JITTER_MS: u32 = 2_000;
+/// Smallest accepted master gain (silence).
+pub const MIN_MASTER_GAIN: f32 = 0.0;
+/// Largest accepted master gain (+12 dB, the mixer's `MAX_GAIN`).
+pub const MAX_MASTER_GAIN: f32 = hfa_audio::mixer::MAX_GAIN;
 /// Longest accepted device name in bytes (same limit as the pairing URI's `n` parameter).
 pub const MAX_DEVICE_NAME_LEN: usize = hfa_proto::uri::MAX_NAME_LEN;
 
@@ -107,7 +117,8 @@ impl Settings {
     /// - `device_name`: not blank, at most [`MAX_DEVICE_NAME_LEN`] bytes, no control characters;
     /// - `frame_ms` ∈ [`FRAME_MS_CHOICES`] (10 or 20);
     /// - `bitrate` in [`MIN_BITRATE`]`..=`[`MAX_BITRATE`];
-    /// - `1 <= jitter_min_ms <= jitter_max_ms <=` [`MAX_JITTER_MS`].
+    /// - `1 <= jitter_min_ms <= jitter_max_ms <=` [`MAX_JITTER_MS`];
+    /// - `master_gain` finite and in [`MIN_MASTER_GAIN`]`..=`[`MAX_MASTER_GAIN`].
     ///
     /// Every `port` is valid: `0` lets the hub bind any free port (see `HubHandle::local_port`).
     ///
@@ -148,6 +159,14 @@ impl Settings {
             return Err(config_err(format!(
                 "jitter_max_ms must be at most {MAX_JITTER_MS}, got {}",
                 self.jitter_max_ms
+            )));
+        }
+        if !self.master_gain.is_finite()
+            || !(MIN_MASTER_GAIN..=MAX_MASTER_GAIN).contains(&self.master_gain)
+        {
+            return Err(config_err(format!(
+                "master_gain must be in {MIN_MASTER_GAIN}..={MAX_MASTER_GAIN}, got {}",
+                self.master_gain
             )));
         }
         Ok(())
@@ -347,5 +366,36 @@ mod tests {
         assert_eq!(s.port, 5000);
         assert_eq!(s.bitrate, Settings::default().bitrate);
         assert_eq!(s.output, OutputTarget::Default);
+        // Files written before the master gain was persisted mean unity gain.
+        assert!((s.master_gain - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn master_gain_round_trips_and_is_validated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = Settings::load_or_default(dir.path()).expect("defaults");
+        assert!((s.master_gain - 1.0).abs() < f32::EPSILON);
+        s.master_gain = 0.35;
+        s.save().expect("save");
+        let loaded = Settings::load_or_default(dir.path()).expect("load");
+        assert!((loaded.master_gain - 0.35).abs() < 1e-6);
+
+        for bad in [-0.1, MAX_MASTER_GAIN + 0.1, f32::NAN, f32::INFINITY] {
+            let mut invalid = loaded.clone();
+            invalid.master_gain = bad;
+            assert!(
+                matches!(invalid.validate(), Err(CoreError::Config(_))),
+                "{bad}"
+            );
+            assert!(invalid.save().is_err(), "{bad} must not be saved");
+        }
+        // The rejected saves left the file alone.
+        let again = Settings::load_or_default(dir.path()).expect("load");
+        assert!((again.master_gain - 0.35).abs() < 1e-6);
+        for ok in [MIN_MASTER_GAIN, 1.0, MAX_MASTER_GAIN] {
+            let mut valid = again.clone();
+            valid.master_gain = ok;
+            valid.validate().expect("valid gain");
+        }
     }
 }

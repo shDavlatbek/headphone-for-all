@@ -9,7 +9,7 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'package:freezed_annotation/freezed_annotation.dart' hide protected;
 part 'hub.freezed.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_receiver_is_total_eq`, `clone`, `clone`, `clone`, `clone`, `eq`, `eq`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `fmt`
 
 /// Starts the hub (output from the settings, mDNS advertising on). Idempotent: returns the
 /// status of the running hub. A failure to advertise does not fail the start: it shows in
@@ -44,7 +44,9 @@ Future<void> hubSetPriority({required int streamId, required bool priority}) =>
       priority: priority,
     );
 
-/// Sets the master linear gain (0.0..=4.0).
+/// Sets and saves the master linear gain (0.0..=4.0): applied at once while the hub runs,
+/// and by every later hub start (it survives hub and app restarts). Allowed while the hub is
+/// stopped.
 Future<void> hubSetMasterGain({required double gain}) =>
     RustLib.instance.api.crateApiHubHubSetMasterGain(gain: gain);
 
@@ -128,6 +130,15 @@ class HubStatusDto {
   /// Why advertising failed (e.g. no multicast on iOS without the entitlement), if it did.
   final String? advertiseError;
 
+  /// The master linear gain (0.0..=4.0): the saved value (`hub_set_master_gain`), which a
+  /// starting hub applies. Also reported while stopped.
+  final double masterGain;
+
+  /// Where senders can reach the hub, to type into "Add by address": `ip:port` for each
+  /// LAN address, IPv4 first, then IPv6 as `[addr]:port` (see
+  /// `hfa_core::pairing::lan_addresses`). Empty while stopped or without a network.
+  final List<String> addresses;
+
   const HubStatusDto({
     required this.running,
     required this.port,
@@ -135,6 +146,8 @@ class HubStatusDto {
     required this.sourceCount,
     required this.advertised,
     this.advertiseError,
+    required this.masterGain,
+    required this.addresses,
   });
 
   @override
@@ -144,7 +157,9 @@ class HubStatusDto {
       deviceName.hashCode ^
       sourceCount.hashCode ^
       advertised.hashCode ^
-      advertiseError.hashCode;
+      advertiseError.hashCode ^
+      masterGain.hashCode ^
+      addresses.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -156,7 +171,9 @@ class HubStatusDto {
           deviceName == other.deviceName &&
           sourceCount == other.sourceCount &&
           advertised == other.advertised &&
-          advertiseError == other.advertiseError;
+          advertiseError == other.advertiseError &&
+          masterGain == other.masterGain &&
+          addresses == other.addresses;
 }
 
 /// An open pairing window. Show `pin` and a QR code of `uri`.

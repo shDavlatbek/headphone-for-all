@@ -18,6 +18,25 @@ constexpr int kInitialHeight = 680;
 constexpr int kMinimumWidth = 380;
 constexpr int kMinimumHeight = 520;
 
+// The argument that starts the app hidden in the tray (the autostart entry
+// written by the app's "Start at sign-in" switch passes it; see
+// lib/src/platform/sign_in_launcher.dart and docs/CONTRACTS.md §8.10).
+constexpr char kAutostartArgument[] = "--autostart";
+
+// Whether `arguments` (NULL-terminated, without the program name) contain
+// kAutostartArgument.
+bool has_autostart_argument(char** arguments) {
+  if (arguments == nullptr) {
+    return false;
+  }
+  for (char** arg = arguments; *arg != nullptr; ++arg) {
+    if (g_strcmp0(*arg, kAutostartArgument) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Window icon sizes installed into the bundle (data/icons/hicolor, see
 // linux/CMakeLists.txt and packaging/icon/generate.py).
 constexpr int kIconSizes[] = {16, 24, 32, 48, 64, 128, 256};
@@ -60,12 +79,20 @@ struct _MyApplication {
   // The main window once it was created (owned by GTK; cleared when it is
   // destroyed).
   GtkWindow* window;
+  // Started with --autostart: the first frame does not show the window; it
+  // stays hidden until the tray (windowManager.show()) or a second launch
+  // shows it.
+  gboolean start_hidden;
 };
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
 
 // Called when first Flutter frame received.
 static void first_frame_cb(MyApplication* self, FlView* view) {
+  if (self->start_hidden) {
+    self->start_hidden = FALSE;
+    return;
+  }
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
 }
 
@@ -153,6 +180,8 @@ static gboolean my_application_local_command_line(GApplication* application,
   MyApplication* self = MY_APPLICATION(application);
   // Strip out the first argument as it is the binary name.
   self->dart_entrypoint_arguments = g_strdupv(*arguments + 1);
+  const gboolean autostart =
+      has_autostart_argument(self->dart_entrypoint_arguments);
 
   g_autoptr(GError) error = nullptr;
   if (!g_application_register(application, nullptr, &error)) {
@@ -161,8 +190,14 @@ static gboolean my_application_local_command_line(GApplication* application,
     return TRUE;
   }
 
-  g_application_activate(application);
   *exit_status = 0;
+  // An autostart while the app already runs (e.g. started by hand before
+  // the session's autostart ran) leaves the running instance alone.
+  if (autostart && g_application_get_is_remote(application)) {
+    return TRUE;
+  }
+  self->start_hidden = autostart;
+  g_application_activate(application);
 
   return TRUE;
 }
@@ -206,7 +241,10 @@ static void my_application_class_init(MyApplicationClass* klass) {
   G_OBJECT_CLASS(klass)->dispose = my_application_dispose;
 }
 
-static void my_application_init(MyApplication* self) {}
+static void my_application_init(MyApplication* self) {
+  self->window = nullptr;
+  self->start_hidden = FALSE;
+}
 
 MyApplication* my_application_new() {
   // Set the program name to the application ID, which helps various systems

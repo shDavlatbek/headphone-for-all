@@ -4,7 +4,7 @@ use crate::frb_generated::StreamSink;
 use crate::manager::manager;
 
 /// Hub state for the UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HubStatusDto {
     /// The hub is running.
     pub running: bool,
@@ -20,6 +20,13 @@ pub struct HubStatusDto {
     pub advertised: bool,
     /// Why advertising failed (e.g. no multicast on iOS without the entitlement), if it did.
     pub advertise_error: Option<String>,
+    /// The master linear gain (0.0..=4.0): the saved value (`hub_set_master_gain`), which a
+    /// starting hub applies. Also reported while stopped.
+    pub master_gain: f32,
+    /// Where senders can reach the hub, to type into "Add by address": `ip:port` for each
+    /// LAN address, IPv4 first, then IPv6 as `[addr]:port` (see
+    /// `hfa_core::pairing::lan_addresses`). Empty while stopped or without a network.
+    pub addresses: Vec<String>,
 }
 
 /// One incoming stream.
@@ -115,7 +122,7 @@ pub fn hub_stop() -> anyhow::Result<()> {
 pub fn hub_status() -> HubStatusDto {
     manager()
         .map(|m| m.hub_status())
-        .unwrap_or_else(|_| crate::convert::stopped_hub_status(String::new()))
+        .unwrap_or_else(|_| crate::convert::stopped_hub_status(String::new(), 1.0))
 }
 
 /// Current streams (empty when the hub is stopped).
@@ -138,7 +145,9 @@ pub fn hub_set_priority(stream_id: u32, priority: bool) -> anyhow::Result<()> {
     Ok(manager()?.hub_set_priority(stream_id, priority)?)
 }
 
-/// Sets the master linear gain (0.0..=4.0).
+/// Sets and saves the master linear gain (0.0..=4.0): applied at once while the hub runs,
+/// and by every later hub start (it survives hub and app restarts). Allowed while the hub is
+/// stopped.
 pub fn hub_set_master_gain(gain: f32) -> anyhow::Result<()> {
     Ok(manager()?.hub_set_master_gain(gain)?)
 }

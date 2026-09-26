@@ -80,11 +80,15 @@ class FakeHfaApi implements HfaApi {
           deviceId: 'a1b2-c3d4-e5f6-0001',
           name: 'Living-room PC',
           pairedAtUnix: 1767225600,
+          pairedAsHub: true,
+          pairedAsSender: false,
         ),
         const TrustedPeerDto(
           deviceId: 'a1b2-c3d4-e5f6-0009',
           name: 'Old tablet',
           pairedAtUnix: 1735689600,
+          pairedAsHub: false,
+          pairedAsSender: true,
         ),
       ],
       captureApps = const [
@@ -183,8 +187,15 @@ class FakeHfaApi implements HfaApi {
   /// The request of the last [senderStart] call.
   SenderStartDto? lastSenderStart;
 
-  /// The last master gain set.
+  /// The saved master gain (kept while the hub is stopped, like the core).
   double masterGain = 1;
+
+  /// Why mDNS advertising fails, if it should: a running hub then reports
+  /// `advertised: false` with this reason.
+  String? advertiseError;
+
+  /// The LAN addresses a running hub reports (the port is appended).
+  List<String> lanAddresses = ['192.168.1.10', '[fd00::10]'];
 
   /// The open pairing window, if any.
   PairingInfoDto? pairing;
@@ -262,13 +273,7 @@ class FakeHfaApi implements HfaApi {
   /// Simulates a sender pairing through the open pairing window.
   void completePairing({required String deviceId, required String name}) {
     pairing = null;
-    trusted.add(
-      TrustedPeerDto(
-        deviceId: deviceId,
-        name: name,
-        pairedAtUnix: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      ),
-    );
+    _trust(deviceId, name, asSender: true);
     _hubEvents.add(
       HubEventDto.pairingCompleted(deviceId: deviceId, name: name),
     );
@@ -301,6 +306,62 @@ class FakeHfaApi implements HfaApi {
       bufferMs: 40,
       latencyMs: 55,
       levelDb: levelDb,
+    );
+  }
+
+  /// A trusted peer with sensible defaults, for tests. [asHub]: this device
+  /// paired with it as a sender (it may stream to it without a PIN);
+  /// [asSender]: it paired with this device's hub.
+  static TrustedPeerDto peer({
+    required String deviceId,
+    String name = 'Peer',
+    int pairedAtUnix = 1767225600,
+    bool asHub = true,
+    bool asSender = false,
+  }) {
+    return TrustedPeerDto(
+      deviceId: deviceId,
+      name: name,
+      pairedAtUnix: pairedAtUnix,
+      pairedAsHub: asHub,
+      pairedAsSender: asSender,
+    );
+  }
+
+  /// The fake's device id of a base64url key (what [fingerprintOfKey] and
+  /// [parsePairingUri] report; not the real fingerprint).
+  static String fingerprintFor(String keyB64) =>
+      'f00d-${(keyB64.hashCode & 0xffff).toRadixString(16).padLeft(4, '0')}';
+
+  /// Adds [deviceId] to the trust store in a direction, or adds the
+  /// direction to an existing entry (the core merges roles the same way).
+  void _trust(
+    String deviceId,
+    String name, {
+    bool asHub = false,
+    bool asSender = false,
+  }) {
+    final index = trusted.indexWhere((p) => p.deviceId == deviceId);
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    if (index < 0) {
+      trusted.add(
+        TrustedPeerDto(
+          deviceId: deviceId,
+          name: name,
+          pairedAtUnix: now,
+          pairedAsHub: asHub,
+          pairedAsSender: asSender,
+        ),
+      );
+      return;
+    }
+    final old = trusted[index];
+    trusted[index] = TrustedPeerDto(
+      deviceId: deviceId,
+      name: name,
+      pairedAtUnix: now,
+      pairedAsHub: old.pairedAsHub || asHub,
+      pairedAsSender: old.pairedAsSender || asSender,
     );
   }
 
@@ -440,10 +501,20 @@ class FakeHfaApi implements HfaApi {
       host: host,
       port: int.tryParse(q['p'] ?? '') ?? 47810,
       hubId: id,
-      hubDeviceId: 'f00d-${id.hashCode.toRadixString(16).padLeft(4, '0')}',
+      hubDeviceId: fingerprintFor(id),
       token: token,
       name: q['n'] ?? 'Hub',
     );
+  }
+
+  @override
+  Future<String> fingerprintOfKey(String keyB64) async {
+    calls.add('fingerprintOfKey');
+    final key = keyB64.trim();
+    if (key.isEmpty || !RegExp(r'^[A-Za-z0-9_\-]+=*$').hasMatch(key)) {
+      throw const HfaApiException('hub key is not base64url');
+    }
+    return fingerprintFor(key);
   }
 
   // -------------------------------------------------------------------- hub
@@ -453,7 +524,12 @@ class FakeHfaApi implements HfaApi {
     port: _hubRunning ? settings.port : 0,
     deviceName: appInfo.deviceName,
     sourceCount: _hubRunning ? _sources.length : 0,
-    advertised: _hubRunning,
+    advertised: _hubRunning && advertiseError == null,
+    advertiseError: _hubRunning ? advertiseError : null,
+    masterGain: masterGain,
+    addresses: _hubRunning
+        ? [for (final a in lanAddresses) '$a:${settings.port}']
+        : const [],
   );
 
   @override
@@ -509,7 +585,6 @@ class FakeHfaApi implements HfaApi {
   @override
   Future<void> hubSetMasterGain(double gain) async {
     calls.add('hubSetMasterGain');
-    _requireHub();
     _checkGain(gain);
     masterGain = gain;
   }
@@ -620,10 +695,14 @@ class FakeHfaApi implements HfaApi {
       throw const HfaApiException('a sender is already running');
     }
     lastSenderStart = request;
-    final hubId = request.hubDeviceId;
+    final key = request.hubKey;
+    // Like the core: a pinned key is not trust; only a hub this device paired
+    // with as a sender streams without a PIN.
+    final hubId =
+        request.hubDeviceId ?? (key == null ? null : fingerprintFor(key));
     final known =
-        request.hubKey != null ||
-        (hubId != null && trusted.any((p) => p.deviceId == hubId));
+        hubId != null &&
+        trusted.any((p) => p.deviceId == hubId && p.pairedAsHub);
     final secret = request.pairingSecret?.trim() ?? '';
     final hubName =
         discoverableHubs
@@ -662,13 +741,7 @@ class FakeHfaApi implements HfaApi {
     if (!connectAutomatically) return;
     if (!known) {
       // Paired with the PIN/token: the core saves the hub as trusted.
-      trusted.add(
-        TrustedPeerDto(
-          deviceId: hubId ?? 'hub-${request.hubHost}',
-          name: hubName,
-          pairedAtUnix: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-        ),
-      );
+      _trust(hubId ?? 'hub-${request.hubHost}', hubName, asHub: true);
     }
     emitSenderStatus(
       SenderStatusDto(

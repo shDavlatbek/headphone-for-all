@@ -2,11 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/hfa_api.dart';
+import '../models/source_choice.dart';
+import '../state/app_prefs.dart';
 import '../state/core_providers.dart';
 import '../state/hub_controller.dart';
 import '../state/navigation.dart';
 import '../state/sender_controller.dart';
 import '../util/format.dart';
+import 'sender_screen.dart';
 
 /// Role choice ("Hub" or "Sender"), this device's name and what it can do.
 class HomeScreen extends ConsumerWidget {
@@ -82,9 +85,69 @@ class HomeScreen extends ConsumerWidget {
             );
           },
         ),
+        const _SendAgain(),
         const SizedBox(height: 16),
         _DeviceCard(info: info),
       ],
+    );
+  }
+}
+
+/// "Send to `last hub`": starts sending to the hub (and with the source)
+/// this device last sent with, then shows the sender screen.
+class _SendAgain extends ConsumerWidget {
+  const _SendAgain();
+
+  Future<void> _send(BuildContext context, WidgetRef ref) async {
+    final section = ref.read(sectionProvider.notifier);
+    if (!await ref.read(senderControllerProvider.notifier).useRemembered()) {
+      return;
+    }
+    if (!context.mounted) return;
+    final source = ref.read(senderControllerProvider).source;
+    // An app that does not run now, or the iOS broadcast (which needs the
+    // picker on the sender screen): the sender screen takes it from here.
+    if (source != null &&
+        source.isComplete &&
+        source.kind != SourceKind.broadcast) {
+      await startSending(context, ref);
+    }
+    section.select(AppSection.sender);
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final last = ref.watch(appPrefsProvider.select((p) => p.lastHub));
+    final sender = ref.watch(senderControllerProvider);
+    final info = ref.watch(appInfoProvider);
+    if (last == null || sender.isLive || last.deviceId == info.deviceId) {
+      return const SizedBox.shrink();
+    }
+    final source = ref.watch(appPrefsProvider.select((p) => p.lastSource));
+    final what = source == null
+        ? null
+        : source.kind == SourceKind.app && source.appName != null
+        ? source.appName
+        : sourceTitle(source.kind);
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: FilledButton.tonalIcon(
+          key: const Key('send-to-last-hub'),
+          icon: sender.busy
+              ? const SizedBox.square(
+                  dimension: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.play_arrow),
+          label: Text(
+            'Send to ${last.name}${what == null ? '' : ' · $what'}',
+            overflow: TextOverflow.ellipsis,
+          ),
+          onPressed: sender.busy ? null : () => _send(context, ref),
+        ),
+      ),
     );
   }
 }

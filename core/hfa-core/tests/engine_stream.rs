@@ -6,7 +6,7 @@ mod engine_common;
 use std::time::Duration;
 
 use engine_common::*;
-use hfa_core::{HubEvent, SenderEvent, SenderState};
+use hfa_core::{HubEvent, SenderEvent, SenderState, Settings};
 
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -72,6 +72,43 @@ async fn paired_tone_sender_reaches_the_wav() {
     assert!(a1000 < 0.01, "1000 Hz amplitude {a1000}");
     let dropout = longest_dropout_ms(seg, 0.02);
     assert!(dropout < 60.0, "dropout of {dropout} ms");
+}
+
+/// The saved master gain (`Settings::master_gain`) applies from the hub's start: at 0 the
+/// tone arrives (the source plays at full level) but the mix stays silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_saved_master_gain_applies_at_start() {
+    let _serial = serial().await;
+    let hub_dev = Device::new("Hub");
+    let wav = hub_dev.path().join("mix.wav");
+    let settings = Settings {
+        master_gain: 0.0,
+        ..hub_dev.settings(0)
+    };
+    let mut hub = start_hub_with(settings, Out::Wav(wav.clone())).await;
+    let pin = hub.hub.start_pairing().pin;
+    let sender_dev = Device::new("Laptop");
+    let mut sender = start_sender(&sender_dev, hub.hub.local_port(), 440.0, Some(pin)).await;
+    wait_source_added(&mut hub, START_TIMEOUT).await;
+    wait_state(&mut sender, START_TIMEOUT, SenderState::Streaming).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let sources = hub.hub.sources();
+    assert_eq!(sources.len(), 1);
+    assert!(sources[0].stats.level_db > -20.0, "{:?}", sources[0].stats);
+    sender.sender.stop().await;
+    hub.hub.stop().await;
+
+    let left = read_left(&wav);
+    assert!(
+        left.len() > at(1.5),
+        "WAV too short: {} samples",
+        left.len()
+    );
+    assert_eq!(
+        first_sound(&left, 0.001),
+        None,
+        "master gain 0 must mute the mix"
+    );
 }
 
 /// Two senders at once (10 ms and 20 ms frames): both tones are in the mix.

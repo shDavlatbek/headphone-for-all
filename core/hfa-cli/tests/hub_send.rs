@@ -218,8 +218,8 @@ fn pairing_streaming_and_graceful_stop() {
     assert_eq!(code, Some(0), "hub exit code; output {rest:#?}");
     assert!(rest.iter().any(|l| l == "Hub stopped."), "{rest:#?}");
 
-    // Both sides remember the pairing.
-    for dir in [hub_dir.path(), sender_dir.path()] {
+    // Both sides remember the pairing, each in its own direction (ROLES column).
+    for (dir, role) in [(hub_dir.path(), "sender"), (sender_dir.path(), "hub")] {
         let out = hfa(dir)
             .args(["trust", "list"])
             .output()
@@ -228,6 +228,12 @@ fn pairing_streaming_and_graceful_stop() {
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.starts_with("DEVICE ID"), "{text}");
         assert_eq!(text.lines().count(), 2, "{text}");
+        let header = text.lines().next().unwrap_or_default();
+        let (Some(from), Some(to)) = (header.find("ROLES"), header.find("PAIRED AT")) else {
+            panic!("no ROLES column: {text}");
+        };
+        let row = text.lines().nth(1).unwrap_or_default();
+        assert_eq!(row.get(from..to).map(str::trim), Some(role), "{text}");
     }
     // Forgetting the hub works once.
     let list = hfa(sender_dir.path())
