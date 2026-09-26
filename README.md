@@ -58,8 +58,10 @@ screen-off timeout. Keep the phone unlocked while it streams; after a lock, unlo
 Any device can be the hub.
 
 **Known limitations**
-- **iOS has no network discovery yet:** an iPhone or iPad does not list hubs and is not found as a hub;
-  connect with the hub's QR code, pairing link or address.
+- **iOS discovery is native Bonjour, not yet tested between real devices:** an iPhone or iPad lists hubs and
+  is found as a hub once Local Network access is allowed. The broadcast extension cannot look the hub up
+  itself: it streams to the address the app knew when the broadcast started (start it again if the hub's
+  address changes).
 - **The sender keeps playing out loud** on Windows, Linux and Android (only macOS mutes the original
   output while it captures). Turning the sender's own volume down or muting it is safe: the capture
   does not depend on it.

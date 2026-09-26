@@ -36,8 +36,9 @@ class SenderScreen extends ConsumerWidget {
   }
 }
 
-/// Last known addresses of paired hubs, used where mDNS cannot find them
-/// (iOS, §8.9); empty elsewhere (the core finds a paired hub by id).
+/// Last known addresses of paired hubs, used on iOS for hubs its Bonjour
+/// browse does not see right now (the broadcast extension cannot look a hub
+/// up by id, §8.9); empty elsewhere (the core finds a paired hub by id).
 Map<String, HubAddress> _pairedAddresses(WidgetRef ref, AppInfo info) =>
     info.isIos ? ref.watch(hubAddressBookProvider) : const {};
 
@@ -391,17 +392,14 @@ class _HubPicker extends ConsumerWidget {
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text(
-                        info.isIos
-                            // No mDNS without the multicast entitlement.
-                            ? 'This device cannot look for hubs on the '
-                                  'network. Start the hub on the device your '
-                                  'headphone is connected to, then scan its '
-                                  'QR code (Pair a device) or add it by '
-                                  'address.'
-                            : discovery.error ??
-                                  'Looking for hubs on this network… Start '
-                                      'the hub on the device your headphone '
-                                      'is connected to.',
+                        [
+                          discovery.error ??
+                              'Looking for hubs on this network… Start the '
+                                  'hub on the device your headphone is '
+                                  'connected to.',
+                          // iOS browses only with the Local Network permission.
+                          if (info.isIos) iosLocalNetworkHint,
+                        ].join(' '),
                       ),
                     ),
                   ],
@@ -413,7 +411,7 @@ class _HubPicker extends ConsumerWidget {
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
                 child: Text(
-                  info.isIos ? 'Paired hubs' : 'Paired, not seen right now',
+                  'Paired, not seen right now',
                   style: theme.textTheme.labelLarge,
                 ),
               ),

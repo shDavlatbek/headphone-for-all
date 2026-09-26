@@ -38,7 +38,7 @@ SENDER                                                   HUB
 | Real-time buffers | `rtrb` (lock-free SPSC) |
 | Networking | `tokio` + UDP (media); TCP with Noise for control |
 | Serialization (control) | Protobuf (`prost`), so versions can evolve |
-| Discovery | `mdns-sd` (desktop, Android); on iOS a native Bonjour backend (`NWBrowser`/`NWListener`) plugs into `hfa-core`'s platform-backend hook (planned: the Swift side is not written yet, so discovery does not work on iOS today; pairing URIs / direct addresses do) |
+| Discovery | `mdns-sd` (desktop, Android); on iOS a native Bonjour backend (`NWBrowser` + dns_sd resolve, `DNSServiceRegister`; `app/ios/Runner/HfaBonjourDiscovery.swift`) plugs into `hfa-core`'s platform-backend hook through `hfa-ffi`'s C ABI `include/hfa_discovery.h` |
 | Security | `snow` (Noise XX), `spake2` (PIN/QR-token pairing), ChaCha20-Poly1305 for media |
 | UI | **Flutter** (desktop + mobile) through **`flutter_rust_bridge` v2** |
 

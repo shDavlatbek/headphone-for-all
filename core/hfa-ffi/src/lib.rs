@@ -8,6 +8,10 @@
 //!   per-directory `TrustStore`).
 //! - [`c_api`]: a small C ABI for the iOS ReplayKit broadcast extension (sender only; no
 //!   Flutter in the extension). Header: `include/hfa_ext.h`.
+//! - [`native_discovery`]: a C ABI through which the iOS app's Bonjour code (NWBrowser +
+//!   dns_sd) becomes hfa-core's platform discovery backend (`mdns-sd` needs the restricted
+//!   multicast entitlement there). Header: `include/hfa_discovery.h`; the symbols are exported
+//!   on iOS only.
 //! - `android` (Android only): JNI exports for the Kotlin capture service, pushing PCM into an
 //!   [`hfa_capture::ExternalFeed`].
 //!
@@ -31,6 +35,7 @@ mod hub_target;
 mod logging;
 #[cfg(feature = "flutter")]
 mod manager;
+pub mod native_discovery;
 pub mod pcm;
 mod runtime;
 mod sender_meta;

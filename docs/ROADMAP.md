@@ -13,7 +13,7 @@ platforms one at a time, and do the mobile hub last.
 | M0 Core engine + CLI | ✅ implemented | the 1-hour real-hardware exit test |
 | M1 Desktop MVP | ✅ implemented | exit test with three desktops; pairing-time measurement |
 | M2 Android sender | ✅ implemented | the compatibility list ([ANDROID_APPS.md](ANDROID_APPS.md)) has no tested entries yet |
-| M3 iOS sender | ✅ implemented | iOS discovery (mDNS needs the multicast entitlement or a native `NWBrowser` port); UI copy about the red recording indicator; the 1-hour / memory exit test |
+| M3 iOS sender | ✅ implemented | a real-device test of the native Bonjour discovery; UI copy about the red recording indicator; the 1-hour / memory exit test |
 | M4 Mobile hub | ✅ implemented | the 2-hour screen-off exit test; battery measurements |
 | M5 Polish and release | 🚧 in progress | see below |
 

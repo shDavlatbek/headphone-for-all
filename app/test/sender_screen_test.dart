@@ -366,12 +366,13 @@ void main() {
     await unmount(tester);
   });
 
-  testWidgets('iOS explains that hubs must be scanned or typed in', (
+  testWidgets('iOS looks for hubs and asks for an address it lacks', (
     tester,
   ) async {
     final fake = senderFake(platform: 'ios')..discoverableHubs.clear();
     await pumpApp(tester, fake, section: AppSection.sender);
-    expect(find.text('Paired hubs'), findsOneWidget);
+    expect(find.text('Paired, not seen right now'), findsOneWidget);
+    expect(find.text('Paired hubs'), findsNothing);
     expect(
       find.text('address unknown: add it by address · paired'),
       findsNWidgets(2),
@@ -380,17 +381,26 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('sender-start')));
     await tester.pumpAndSettle();
-    expect(find.textContaining('cannot look for hubs'), findsOneWidget);
+    expect(
+      find.textContaining("The hub's address is not known yet"),
+      findsOneWidget,
+    );
+    expect(find.textContaining('cannot look for hubs'), findsNothing);
 
-    // No paired hub at all: guidance instead of "Looking for hubs…".
+    // No paired hub at all: iOS browses like every platform, with a hint
+    // about the Local Network permission (USER_GUIDE §5).
     fake.trusted.clear();
     await unmount(tester);
     await pumpApp(tester, fake, section: AppSection.sender);
-    expect(find.textContaining('Looking for hubs'), findsNothing);
     expect(
-      find.textContaining('scan its QR code (Pair a device) or add it by'),
+      find.textContaining('Looking for hubs on this network'),
       findsOneWidget,
     );
+    expect(
+      find.textContaining('allow Local Network access for Headphone'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('cannot look for hubs'), findsNothing);
     await unmount(tester);
   });
 }
